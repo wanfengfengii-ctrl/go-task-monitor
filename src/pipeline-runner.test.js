@@ -2727,10 +2727,13 @@ test('current workflow uses four Bug partitions and incrementally fills injectio
   assert.match(pipeline, /4 个互补分区/);
   assert.match(pipeline, /runBoundedSettled\(NATURAL_BUG_SEARCH_PARTITIONS, finderConcurrency/);
   assert.match(pipeline, /GO_PIPELINE_INJECTION_PLAN_BATCH_SIZE \|\| 4/);
-  assert.match(pipeline, /GO_PIPELINE_INJECTION_PLAN_TIMEOUT_MS \|\| 20 \* 60_000/);
-  assert.match(pipeline, /GO_PIPELINE_INJECTION_PLAN_IDLE_TIMEOUT_MS \|\| 10 \* 60_000/);
+  assert.match(pipeline, /GO_PIPELINE_INJECTION_PLAN_TIMEOUT_MS \|\| 15 \* 60_000/);
+  assert.match(pipeline, /GO_PIPELINE_INJECTION_PLAN_IDLE_TIMEOUT_MS \|\| 6 \* 60_000/);
   assert.match(pipeline, /timeoutMs: INJECTION_PLAN_TIMEOUT_MS/);
   assert.match(pipeline, /idleTimeoutMs: INJECTION_PLAN_IDLE_TIMEOUT_MS/);
+  assert.match(pipeline, /acquireStageResourceSlot\(jobFile, 'codex_injection_plan'/);
+  assert.match(pipeline, /streamRecoveryWindowMs: STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS/);
+  assert.match(pipeline, /reasoningEffort: 'medium',[\s\S]{0,120}ignoreUserConfig: true,[\s\S]{0,80}ephemeral: true/);
   assert.match(pipeline, /Math\.ceil\(bugIndexes\.length \/ INJECTION_PLAN_BATCH_SIZE\)/);
   assert.match(pipeline, /reusableCodexJson\(jobFile, attemptName\)/);
   assert.match(pipeline, /从 \$\{planningSessionIds\.length\} 个已落盘规划批次恢复/);
@@ -2854,7 +2857,7 @@ test('project planning is bounded independently from deep Bug analysis', async (
   const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
   const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
   assert.match(pipeline, /GO_PIPELINE_PROJECT_PLAN_STREAM_RECOVERY_WINDOW_MS \|\| 2 \* 60_000/);
-  assert.match(pipeline, /GO_PIPELINE_PROJECT_PLAN_TIMEOUT_MS \|\| 20 \* 60_000/);
+  assert.match(pipeline, /GO_PIPELINE_PROJECT_PLAN_TIMEOUT_MS \|\| 15 \* 60_000/);
   assert.match(pipeline, /Previous project titles to avoid duplicating/);
   assert.doesNotMatch(pipeline, /previous\.project\.overview/);
   assert.match(pipeline, /name: 'project-plan',[\s\S]{0,400}reasoningEffort: 'low'/);
@@ -2865,6 +2868,28 @@ test('project planning is bounded independently from deep Bug analysis', async (
   assert.match(pipeline, /overview: \{ type: 'string', minLength: 30, maxLength: 700 \}/);
   assert.doesNotMatch(server, /autoRetryCount = MAX_PIPELINE_AUTO_RETRIES - 1/);
   assert.match(server, /已达到 \$\{MAX_PIPELINE_AUTO_RETRIES\} 次自动重试上限，不再重复加入队列/);
+});
+
+test('structured Codex calls use clean sessions, real health probes, and shared limits', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  const operations = await readFile(path.resolve(import.meta.dirname, './pipeline-operations.js'), 'utf8');
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  for (const name of ['post-claude-verification-test', 'diagnosis-verification-test']) {
+    const end = pipeline.indexOf(`name: \`bug\${bugIndex}-${name}\``);
+    const call = pipeline.slice(end, end + 500);
+    assert.match(call, /timeoutMs: STRUCTURED_CODEX_TIMEOUT_MS/);
+    assert.match(call, /streamRecoveryWindowMs: STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS/);
+    assert.match(call, /reasoningEffort: 'medium'/);
+    assert.match(call, /ignoreUserConfig: true/);
+    assert.match(call, /ephemeral: true/);
+  }
+  assert.match(operations, /stage === 'project_plan' \|\| stage === 'codex_injection_plan' \|\| stage\.endsWith\('_test_author'\)/);
+  assert.match(operations, /return \{ pool: 'codex-structured', limit: 2, weight: 1 \}/);
+  assert.match(operations, /loadRatio >= 1\.2 \? 1 : limit/);
+  assert.match(server, /GO_PIPELINE_CODEX_INFERENCE_PROBE_INTERVAL_MS \|\| 5 \* 60_000/);
+  assert.match(server, /'exec', '--ephemeral', '--ignore-user-config'/);
+  assert.match(server, /'--output-schema', schemaPath, '-o', outputPath/);
+  assert.match(server, /inferenceStatus: 'degraded'/);
 });
 
 test('injection candidate failures stay slot-scoped and preserve prepared BUG_BASE slots', () => {

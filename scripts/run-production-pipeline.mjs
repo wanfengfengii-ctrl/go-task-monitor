@@ -45,7 +45,7 @@ import {
   upgradeUnfinishedPipelineBugQuota,
 } from '../src/pipeline-rules.js';
 import { beginBugAttempt, finishBugAttempt, nextIncompleteBugIndex, normalizeBugExecution, takeBugRetryQueue } from '../src/bug-workbench.js';
-import { nextPipelineStage, pipelineResourcePolicy, pipelineStageHealthBlockers, pipelineStageRequiredServices, pipelineStageResourceProfile } from '../src/pipeline-operations.js';
+import { nextPipelineStage, pipelineResourcePolicy, pipelineStageHealthBlockers, pipelineStageRequiredServices, pipelineStageResourceProfile, pipelineStructuredCodexLimit } from '../src/pipeline-operations.js';
 import { assertProtectedSnapshotPath, claudeGenerationSandbox, criticalSnapshotTarOptions } from '../src/data-protection.js';
 import { assessProjectComplexity, PROJECT_COMPLEXITY_LIMITS } from '../src/project-complexity.js';
 import {
@@ -230,10 +230,19 @@ const PROJECT_PLAN_STREAM_RECOVERY_WINDOW_MS = Number.isFinite(configuredProject
   && configuredProjectPlanStreamRecoveryWindowMs > 0
   ? Math.max(30_000, configuredProjectPlanStreamRecoveryWindowMs)
   : 2 * 60_000;
-const configuredProjectPlanTimeoutMs = Number(process.env.GO_PIPELINE_PROJECT_PLAN_TIMEOUT_MS || 20 * 60_000);
+const configuredProjectPlanTimeoutMs = Number(process.env.GO_PIPELINE_PROJECT_PLAN_TIMEOUT_MS || 15 * 60_000);
 const PROJECT_PLAN_TIMEOUT_MS = Number.isFinite(configuredProjectPlanTimeoutMs) && configuredProjectPlanTimeoutMs > 0
   ? Math.max(5 * 60_000, configuredProjectPlanTimeoutMs)
-  : 20 * 60_000;
+  : 15 * 60_000;
+const configuredStructuredCodexTimeoutMs = Number(process.env.GO_PIPELINE_STRUCTURED_CODEX_TIMEOUT_MS || 15 * 60_000);
+const STRUCTURED_CODEX_TIMEOUT_MS = Number.isFinite(configuredStructuredCodexTimeoutMs) && configuredStructuredCodexTimeoutMs > 0
+  ? Math.max(5 * 60_000, configuredStructuredCodexTimeoutMs)
+  : 15 * 60_000;
+const configuredStructuredCodexStreamRecoveryWindowMs = Number(process.env.GO_PIPELINE_STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS || 2 * 60_000);
+const STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS = Number.isFinite(configuredStructuredCodexStreamRecoveryWindowMs)
+  && configuredStructuredCodexStreamRecoveryWindowMs > 0
+  ? Math.max(30_000, configuredStructuredCodexStreamRecoveryWindowMs)
+  : 2 * 60_000;
 
 export function codexStreamRecoveryConfigArgs(streamRecoveryWindowMs, providerId = process.env.GO_PIPELINE_CODEX_MODEL_PROVIDER) {
   const recoveryWindowMs = Number(streamRecoveryWindowMs || 0);
@@ -749,16 +758,16 @@ const INJECTION_PLAN_BATCH_SIZE = Number.isFinite(configuredInjectionPlanBatchSi
   ? Math.max(1, Math.min(10, Math.floor(configuredInjectionPlanBatchSize)))
   : 4;
 const INJECTION_PLAN_RETRY_ALLOWANCE = 3;
-const configuredInjectionPlanTimeoutMs = Number(process.env.GO_PIPELINE_INJECTION_PLAN_TIMEOUT_MS || 20 * 60_000);
+const configuredInjectionPlanTimeoutMs = Number(process.env.GO_PIPELINE_INJECTION_PLAN_TIMEOUT_MS || 15 * 60_000);
 const INJECTION_PLAN_TIMEOUT_MS = Number.isFinite(configuredInjectionPlanTimeoutMs)
   && configuredInjectionPlanTimeoutMs > 0
-  ? Math.max(12 * 60_000, configuredInjectionPlanTimeoutMs)
-  : 20 * 60_000;
-const configuredInjectionPlanIdleTimeoutMs = Number(process.env.GO_PIPELINE_INJECTION_PLAN_IDLE_TIMEOUT_MS || 10 * 60_000);
+  ? Math.max(8 * 60_000, configuredInjectionPlanTimeoutMs)
+  : 15 * 60_000;
+const configuredInjectionPlanIdleTimeoutMs = Number(process.env.GO_PIPELINE_INJECTION_PLAN_IDLE_TIMEOUT_MS || 6 * 60_000);
 const INJECTION_PLAN_IDLE_TIMEOUT_MS = Number.isFinite(configuredInjectionPlanIdleTimeoutMs)
   && configuredInjectionPlanIdleTimeoutMs > 0
   ? Math.max(2 * 60_000, Math.min(INJECTION_PLAN_TIMEOUT_MS - 60_000, configuredInjectionPlanIdleTimeoutMs))
-  : 10 * 60_000;
+  : 6 * 60_000;
 
 export function bugCandidatePoolSchema(version = 0, maxCandidates = 10) {
   return {
@@ -1896,7 +1905,11 @@ async function clearSchedulerAdmission(jobFile, stageId, { release = false } = {
   });
 }
 
-async function acquireStageResourceSlot(jobFile, stageId, { waitForCapacity = false, optional = false } = {}) {
+async function acquireStageResourceSlot(jobFile, stageId, {
+  waitForCapacity = false,
+  optional = false,
+  preserveJobCursor = false,
+} = {}) {
   const profile = pipelineStageResourceProfile(stageId);
   if (!profile.pool || !profile.limit) return async () => {};
   const jobsRoot = path.dirname(path.dirname(path.resolve(jobFile)));
@@ -1906,7 +1919,10 @@ async function acquireStageResourceSlot(jobFile, stageId, { waitForCapacity = fa
   let transientAcquireRetries = 0;
   let waitLoggedAt = 0;
   while (true) {
-  for (let slot = 1; slot <= profile.limit; slot += 1) {
+  const effectiveSlotLimit = profile.pool === 'codex-structured'
+    ? pipelineStructuredCodexLimit({ configuredLimit: profile.limit })
+    : profile.limit;
+  for (let slot = 1; slot <= effectiveSlotLimit; slot += 1) {
     const slotDir = path.join(poolRoot, `slot-${slot}`);
     const ownerPath = path.join(slotDir, 'owner.json');
     try {
@@ -1948,30 +1964,32 @@ async function acquireStageResourceSlot(jobFile, stageId, { waitForCapacity = fa
   if (waitForCapacity) {
     if (Date.now() - waitLoggedAt >= 60_000) {
       waitLoggedAt = Date.now();
-      await updateJob(jobFile, (current) => {
-        const stageBugIndex = Number(String(stageId).match(/^bug(\d+)_/)?.[1]);
-        const bug = Number.isInteger(stageBugIndex)
-          ? (current.bugs || []).find((item) => Number(item.bugIndex) === stageBugIndex)
-          : null;
-        if (bug) bug.workerExecution = {
-          ...(bug.workerExecution || {}),
-          status: 'fast_lane_queued',
-          currentStage: stageId,
-          startedAt: null,
-          updatedAt: now(),
-          blockedReason: `等待 ${profile.pool} 内部资源`,
-        };
-        const execution = normalizeBugExecution(current.bugExecution);
-        if (stageBugIndex === execution.selectedBugIndex) current.bugExecution = {
-          ...execution,
-          status: 'fast_lane_queued',
-          startedAt: null,
-          currentStage: stageId,
-          updatedAt: now(),
-          blockedReason: `等待 ${profile.pool} 内部资源`,
-        };
-        current.currentStage = stageId;
-      });
+      if (!preserveJobCursor) {
+        await updateJob(jobFile, (current) => {
+          const stageBugIndex = Number(String(stageId).match(/^bug(\d+)_/)?.[1]);
+          const bug = Number.isInteger(stageBugIndex)
+            ? (current.bugs || []).find((item) => Number(item.bugIndex) === stageBugIndex)
+            : null;
+          if (bug) bug.workerExecution = {
+            ...(bug.workerExecution || {}),
+            status: 'fast_lane_queued',
+            currentStage: stageId,
+            startedAt: null,
+            updatedAt: now(),
+            blockedReason: `等待 ${profile.pool} 内部资源`,
+          };
+          const execution = normalizeBugExecution(current.bugExecution);
+          if (stageBugIndex === execution.selectedBugIndex) current.bugExecution = {
+            ...execution,
+            status: 'fast_lane_queued',
+            startedAt: null,
+            currentStage: stageId,
+            updatedAt: now(),
+            blockedReason: `等待 ${profile.pool} 内部资源`,
+          };
+          current.currentStage = stageId;
+        });
+      }
       await appendLog(jobFile, 'info', `${currentStageLabel(stageId)}等待 ${profile.pool} 内部资源；同项目其他 Bug 继续运行`, stageId);
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -1983,6 +2001,7 @@ async function acquireStageResourceSlot(jobFile, stageId, { waitForCapacity = fa
 }
 
 function currentStageLabel(stageId) {
+  if (stageId === 'codex_injection_plan') return '增量注入规划';
   if (stageId === 'project_plan') return '项目规划';
   if (stageId === 'project_generate') return '项目生成';
   if (stageId === 'project_validate') return 'Docker 验证';
@@ -3188,7 +3207,12 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
     schema: postClaudeVerificationTestSchema,
     name: `bug${bugIndex}-post-claude-verification-test`,
     sandbox: 'workspace-write',
-    timeoutMs: 40 * 60 * 1000,
+    timeoutMs: STRUCTURED_CODEX_TIMEOUT_MS,
+    idleTimeoutMs: CODEX_JSON_IDLE_TIMEOUT_MS,
+    streamRecoveryWindowMs: STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS,
+    reasoningEffort: 'medium',
+    ignoreUserConfig: true,
+    ephemeral: true,
   });
   const descriptor = result.output || {};
   if (!safeVerificationTestPath(descriptor.test_file) || !String(descriptor.test_name || '').startsWith('TestModel_')) {
@@ -3450,7 +3474,12 @@ export async function prepareDiagnosisVerificationTest(jobFile, bugIndex, bugBas
     schema: postClaudeVerificationTestSchema,
     name: `bug${bugIndex}-diagnosis-verification-test`,
     sandbox: 'workspace-write',
-    timeoutMs: 40 * 60 * 1000,
+    timeoutMs: STRUCTURED_CODEX_TIMEOUT_MS,
+    idleTimeoutMs: CODEX_JSON_IDLE_TIMEOUT_MS,
+    streamRecoveryWindowMs: STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS,
+    reasoningEffort: 'medium',
+    ignoreUserConfig: true,
+    ephemeral: true,
   });
   const descriptor = result.output || {};
   if (!safeVerificationTestPath(descriptor.test_file) || !String(descriptor.test_name || '').startsWith('TestModel_')) {
@@ -5622,7 +5651,12 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
         ? `The previous planning response had rejected records. Do not repeat their IDs, fingerprints, mechanisms, or equivalent mutations:\n${JSON.stringify(lastRejected, null, 2)}`
         : '',
     ].filter(Boolean).join('\n\n');
+    let releaseStructuredCodex = async () => {};
     try {
+      releaseStructuredCodex = await acquireStageResourceSlot(jobFile, 'codex_injection_plan', {
+        waitForCapacity: true,
+        preserveJobCursor: true,
+      });
       result = await runCodexJson({
         jobFile,
         stageId,
@@ -5633,11 +5667,17 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
         sandbox: 'read-only',
         timeoutMs: INJECTION_PLAN_TIMEOUT_MS,
         idleTimeoutMs: INJECTION_PLAN_IDLE_TIMEOUT_MS,
+        streamRecoveryWindowMs: STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS,
+        reasoningEffort: 'medium',
+        ignoreUserConfig: true,
+        ephemeral: true,
       });
     } catch (error) {
       if (planningAttempt >= maxPlanningAttempts) throw error;
       await appendLog(jobFile, 'warn', `增量注入规划第 ${planningAttempt} 批失败，已保留 ${accepted.length}/${bugIndexes.length} 个候选，仅重试当前小批次：${error.message}`, stageId);
       continue;
+    } finally {
+      await releaseStructuredCodex().catch(() => {});
     }
     planningSessionIds.push(result.sessionId);
     lastSessionId = result.sessionId;

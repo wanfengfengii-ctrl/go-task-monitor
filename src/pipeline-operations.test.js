@@ -26,6 +26,7 @@ import {
   pipelineStageStartCapacity,
   pipelineStageUsesDocker,
   pipelineStageWeight,
+  pipelineStructuredCodexLimit,
   selectPipelineDisplayStage,
   shouldQueuePipelineRetry,
   triageActionPlan,
@@ -36,6 +37,12 @@ test('repair concurrency defaults to two workers and supports an eight-worker sp
   assert.equal(pipelineRepairWorkerLimit({ GO_PIPELINE_REPAIR_WORKER_LIMIT: '8' }), 8);
   assert.equal(pipelineRepairWorkerLimit({ GO_PIPELINE_REPAIR_WORKER_LIMIT: '99' }), 8);
   assert.equal(pipelineRepairWorkerLimit({ GO_PIPELINE_REPAIR_WORKER_LIMIT: 'invalid' }), 2);
+});
+
+test('structured Codex work uses two slots and contracts to one under host load', () => {
+  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 2, loadAverage: 8, cpuCount: 10 }), 2);
+  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 2, loadAverage: 12, cpuCount: 10 }), 1);
+  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 2, loadAverage: 30, cpuCount: 10 }), 1);
 });
 
 test('pipeline display ignores a stale completed discovery cursor', () => {
@@ -322,12 +329,13 @@ test('daily project and trajectory counters are unlimited by default', () => {
 });
 
 test('pipeline stages reserve capacity according to their resource cost', () => {
-  assert.deepEqual(pipelineStageResourceProfile('project_plan'), { pool: 'project-planning', limit: 4, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('project_plan'), { pool: 'codex-structured', limit: 2, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('codex_injection_plan'), { pool: 'codex-structured', limit: 2, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('project_generate'), { pool: 'project-generation', limit: 4, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('bug1_bug_discovery'), { pool: 'compute-analysis', limit: 4, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('bug1_bug_source_prepare'), { pool: 'compute-analysis', limit: 4, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('bug1_claude_fix'), { pool: 'compute-repair', limit: 2, weight: 1 });
-  assert.deepEqual(pipelineStageResourceProfile('bug1_test_author'), { pool: 'compute-test-author', limit: 4, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('bug1_test_author'), { pool: 'codex-structured', limit: 2, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('bug1_red_green'), { pool: 'compute-docker', limit: 2, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('bug1_docker_validation'), { pool: 'compute-docker', limit: 2, weight: 1 });
   assert.equal(pipelineStageWeight('bug1_pre_verify'), 1);
@@ -356,8 +364,8 @@ test('two legacy Gold-heavy jobs still leave two global runner slots for project
     { status: 'running', currentStage: 'bug2_gold_fix' },
   ];
   const pools = pipelineResourcePoolState(jobs, 4);
-  assert.deepEqual(pools['project-planning'], {
-    pool: 'project-planning', limit: 4, occupied: 0, available: 4,
+  assert.deepEqual(pools['codex-structured'], {
+    pool: 'codex-structured', limit: 2, occupied: 0, available: 2,
   });
   assert.deepEqual(pools['compute-heavy'], {
     pool: 'compute-heavy', limit: 2, occupied: 2, available: 0,
@@ -442,8 +450,8 @@ test('stopped workbench cursors do not reserve the Claude repair pool', () => {
   assert.deepEqual(pools['compute-repair'], {
     pool: 'compute-repair', limit: 2, occupied: 0, available: 2,
   });
-  assert.deepEqual(pools['compute-test-author'], {
-    pool: 'compute-test-author', limit: 4, occupied: 1, available: 3,
+  assert.deepEqual(pools['codex-structured'], {
+    pool: 'codex-structured', limit: 2, occupied: 1, available: 1,
   });
 });
 
@@ -466,8 +474,8 @@ test('queued Bug workers do not reserve test-author capacity before they run', (
       },
     ],
   }], 2);
-  assert.deepEqual(pools['compute-test-author'], {
-    pool: 'compute-test-author', limit: 4, occupied: 1, available: 3,
+  assert.deepEqual(pools['codex-structured'], {
+    pool: 'codex-structured', limit: 2, occupied: 1, available: 1,
   });
 });
 
@@ -514,8 +522,8 @@ test('project pools cannot bypass the global dynamic limit', () => {
   }));
   assert.equal(pipelineStageStartCapacity(jobs, 'project_plan', 4).allowed, false);
   assert.equal(pipelineStageStartCapacity(jobs, 'project_generate', 4).allowed, false);
-  assert.deepEqual(pipelineResourcePoolState(jobs, 2)['project-planning'], {
-    pool: 'project-planning', limit: 2, occupied: 2, available: 0, waiting: 2,
+  assert.deepEqual(pipelineResourcePoolState(jobs, 2)['codex-structured'], {
+    pool: 'codex-structured', limit: 2, occupied: 2, available: 0, waiting: 2,
   });
 });
 

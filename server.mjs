@@ -156,6 +156,21 @@ const codexCliPath = resolveCliPath(process.env.GO_PIPELINE_CODEX_BIN, 'codex', 
   '/Applications/ChatGPT.app/Contents/Resources/codex',
   path.join(os.homedir(), '.local/bin/codex'),
 ]);
+const configuredCodexInferenceProbeIntervalMs = Number(process.env.GO_PIPELINE_CODEX_INFERENCE_PROBE_INTERVAL_MS || 5 * 60_000);
+const CODEX_INFERENCE_PROBE_INTERVAL_MS = Number.isFinite(configuredCodexInferenceProbeIntervalMs)
+  && configuredCodexInferenceProbeIntervalMs > 0
+  ? Math.max(60_000, configuredCodexInferenceProbeIntervalMs)
+  : 5 * 60_000;
+const configuredCodexInferenceProbeCooldownMs = Number(process.env.GO_PIPELINE_CODEX_INFERENCE_PROBE_COOLDOWN_MS || 2 * 60_000);
+const CODEX_INFERENCE_PROBE_COOLDOWN_MS = Number.isFinite(configuredCodexInferenceProbeCooldownMs)
+  && configuredCodexInferenceProbeCooldownMs > 0
+  ? Math.max(30_000, configuredCodexInferenceProbeCooldownMs)
+  : 2 * 60_000;
+const configuredCodexInferenceProbeTimeoutMs = Number(process.env.GO_PIPELINE_CODEX_INFERENCE_PROBE_TIMEOUT_MS || 45_000);
+const CODEX_INFERENCE_PROBE_TIMEOUT_MS = Number.isFinite(configuredCodexInferenceProbeTimeoutMs)
+  && configuredCodexInferenceProbeTimeoutMs > 0
+  ? Math.max(15_000, configuredCodexInferenceProbeTimeoutMs)
+  : 45_000;
 const claudeCliPath = resolveCliPath(process.env.GO_TASK_MONITOR_CLAUDE_BIN, 'claude', [
   path.join(os.homedir(), '.npm-global/bin/claude'),
   path.join(os.homedir(), '.local/bin/claude'),
@@ -309,6 +324,7 @@ let pipelineWatchdogRunning = false;
 let pipelineCodexTriageRunning = false;
 let pipelineHealthCheckRunning = false;
 let pipelineHealthState = { updatedAt: null, services: {} };
+let codexInferenceProbeHealth = null;
 let pipelineAlertTail = Promise.resolve();
 let pipelineResourceMaintenanceRunning = false;
 let dockerGraderCpuGuardRunning = false;
@@ -511,11 +527,10 @@ async function activePipelineResourceSlotSnapshot() {
   const slotsRoot = path.join(pipelineRefillRoot, 'resource-slots');
   const pools = await fsp.readdir(slotsRoot, { withFileTypes: true }).catch(() => []);
   const counts = Object.fromEntries([
-    'project-planning',
+    'codex-structured',
     'project-generation',
     'compute-analysis',
     'compute-repair',
-    'compute-test-author',
     'compute-proof',
     'compute-docker',
     'compute-heavy',
@@ -542,6 +557,11 @@ async function activePipelineResourceSlotSnapshot() {
       }
     }
   }
+  // Runners started before the shared structured-Codex pool was introduced
+  // may still hold one of the two legacy leases. Count them during the rolling
+  // reload so a new planner cannot overbook the same upstream capacity.
+  counts['codex-structured'] += Number(counts['project-planning'] || 0)
+    + Number(counts['compute-test-author'] || 0);
   return { counts, jobIds };
 }
 
@@ -1139,7 +1159,8 @@ async function runCodexPipelineRefillPlan(batchId, jobs, {
     '仅返回符合指定 schema 的 JSON。',
   ].join('\n\n');
   const result = await runCapturedCommand(codexCliPath, [
-    'exec', '--skip-git-repo-check', '-C', batchDir, '-s', 'read-only', '--json',
+    'exec', '--ephemeral', '--ignore-user-config', '-c', 'model_reasoning_effort="low"',
+    '--skip-git-repo-check', '-C', batchDir, '-s', 'read-only', '--json',
     '--output-schema', schemaPath, '-o', outputPath, prompt,
   ], { cwd: batchDir, timeoutMs: 60 * 60 * 1000 });
   await fsp.writeFile(eventsPath, result.stdout || '', 'utf8');
@@ -1287,7 +1308,8 @@ async function runCodexWatchdogTriage(incident) {
     '返回符合 schema 的中文 JSON 结论。',
   ].join('\n\n');
   const result = await runCapturedCommand(codexCliPath, [
-    'exec', '--skip-git-repo-check', '-C', triageDir, '-s', 'read-only', '--json',
+    'exec', '--ephemeral', '--ignore-user-config', '-c', 'model_reasoning_effort="low"',
+    '--skip-git-repo-check', '-C', triageDir, '-s', 'read-only', '--json',
     '--output-schema', schemaPath, '-o', outputPath, prompt,
   ], { cwd: triageDir, timeoutMs: 30 * 60 * 1000 });
   await fsp.writeFile(eventsPath, result.stdout || '', 'utf8');
@@ -1637,6 +1659,81 @@ async function checkCommandHealth(name, command, args) {
   return commandHealth(name, await runCapturedCommand(command, args, { cwd: import.meta.dirname, timeoutMs: 15_000 }));
 }
 
+async function runCodexInferenceProbe() {
+  const probeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-task-codex-health-'));
+  const schemaPath = path.join(probeDir, 'schema.json');
+  const outputPath = path.join(probeDir, 'result.json');
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['status'],
+    properties: { status: { type: 'string', enum: ['ok'] } },
+  };
+  try {
+    await fsp.writeFile(schemaPath, `${JSON.stringify(schema)}\n`, 'utf8');
+    const result = await runCapturedCommand(codexCliPath, [
+      'exec', '--ephemeral', '--ignore-user-config',
+      '-c', 'model_reasoning_effort="low"',
+      '--skip-git-repo-check', '-C', probeDir, '-s', 'read-only', '--json',
+      '--output-schema', schemaPath, '-o', outputPath,
+      'Return only the requested JSON object with status set to ok. Do not use tools.',
+    ], { cwd: probeDir, timeoutMs: CODEX_INFERENCE_PROBE_TIMEOUT_MS });
+    let validOutput = false;
+    if (result.exitCode === 0) {
+      const output = await fsp.readFile(outputPath, 'utf8').then((value) => JSON.parse(value)).catch(() => null);
+      validOutput = output?.status === 'ok';
+    }
+    const probeCheckedAt = new Date().toISOString();
+    if (result.exitCode === 0 && validOutput) {
+      return {
+        name: 'Codex CLI',
+        status: 'online',
+        authStatus: 'online',
+        inferenceStatus: 'online',
+        probeCheckedAt,
+        checkedAt: probeCheckedAt,
+        latencyMs: result.durationMs,
+        detail: '认证有效，结构化推理在线',
+      };
+    }
+    const detail = sanitizeMonitorText(compactCapturedOutput(result)).slice(-240)
+      || (result.exitCode === 0 ? '结构化输出无效' : `exit=${result.exitCode ?? 'none'}`);
+    return {
+      name: 'Codex CLI',
+      status: 'degraded',
+      authStatus: 'online',
+      inferenceStatus: 'degraded',
+      probeCheckedAt,
+      checkedAt: probeCheckedAt,
+      latencyMs: result.durationMs,
+      detail: `认证有效，但结构化推理探针失败：${detail}`,
+    };
+  } finally {
+    await fsp.rm(probeDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function checkCodexHealth(authResult) {
+  const auth = authenticatedCommandHealth('Codex CLI', authResult, '认证有效');
+  if (auth.status !== 'online') {
+    codexInferenceProbeHealth = null;
+    return { ...auth, authStatus: 'offline', inferenceStatus: 'unknown' };
+  }
+  const previousCheckedAt = Date.parse(codexInferenceProbeHealth?.probeCheckedAt || '');
+  const probeIntervalMs = codexInferenceProbeHealth?.status === 'online'
+    ? CODEX_INFERENCE_PROBE_INTERVAL_MS
+    : CODEX_INFERENCE_PROBE_COOLDOWN_MS;
+  if (Number.isFinite(previousCheckedAt) && Date.now() - previousCheckedAt < probeIntervalMs) {
+    return {
+      ...codexInferenceProbeHealth,
+      checkedAt: new Date().toISOString(),
+      latencyMs: authResult.durationMs,
+    };
+  }
+  codexInferenceProbeHealth = await runCodexInferenceProbe();
+  return codexInferenceProbeHealth;
+}
+
 async function checkGitHubHealth() {
   const startedAt = Date.now();
   const authResult = await runCapturedCommand(githubCliPath, [
@@ -1784,7 +1881,7 @@ async function runSystemHealthChecks() {
       ...claudeAuth,
       exitCode: claudeAuth.exitCode === 0 && claudeLoggedIn ? 0 : claudeAuth.exitCode || 1,
     }, '认证有效');
-    const codex = authenticatedCommandHealth('Codex CLI', codexAuth, '认证有效');
+    const codex = await checkCodexHealth(codexAuth);
     const memoryPercentMatch = memoryPressure.stdout?.match(/memory free percentage:\s*(\d+)%/i);
     const dockerSystemReclaimableBytes = await readDockerReclaimableBytes(dockerDisk);
     const dockerBuilderReclaimableBytes = dockerBuilderDisk.exitCode === 0
