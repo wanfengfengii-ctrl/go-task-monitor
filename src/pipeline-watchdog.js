@@ -101,7 +101,7 @@ export function pipelineWatchdogObservation(job, { nowMs = Date.now(), heartbeat
       failureCategory,
       fingerprint: pipelineErrorFingerprint(job),
       message: String(job.error || stageError || '流水线失败').slice(0, 2000),
-      codexTriage: true,
+      codexTriage: failureCategory !== 'submission_platform',
       // Used to reopen the same incident after an automatic retry writes a
       // newer failure. Without this marker a stable fingerprint would leave
       // the incident in `triaged` forever and suppress the next Codex pass.

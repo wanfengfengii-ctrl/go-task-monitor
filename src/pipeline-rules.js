@@ -22,6 +22,7 @@ export const PARALLEL_BUG_WORKFLOW_VERSION = 2;
 export const CURRENT_WORKFLOW_VERSION = 3;
 export const CURRENT_WORKFLOW_POLICY_VERSION = 4;
 export const CURRENT_VERIFICATION_POLICY_VERSION = 5;
+export const CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION = 1;
 export const CURRENT_BUG_POLICY_VERSION = BUG_POLICY_VERSION;
 export const PIPELINE_PROJECT_STAGES = [
   ['project_plan', 'Sol 规划并扩写项目文档'],
@@ -514,6 +515,7 @@ const INDEPENDENT_TEST_DEPENDENT_STAGES = new Set([
   'verification_coverage',
   'cloud_upload',
   'verification_finalize',
+  'platform_submit',
   'delivery_ready',
 ]);
 
@@ -638,7 +640,7 @@ export function rewindPipelineBugAfterMissingTrajectory(job, bugIndex, at = new 
 
   const resetSuffixes = new Set([
     'claude_fix', 'trajectory_validate', 'test_author', 'pre_verify',
-    'cloud_upload', 'verification_finalize', 'delivery_ready',
+    'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready',
   ]);
   for (const stage of job.stages || []) {
     if (Number(stage.bugIndex) !== normalizedIndex) continue;
@@ -776,7 +778,14 @@ export function upgradeUnfinishedPipelineBugQuota(job) {
   }
 
   const existingStages = new Map((job.stages || []).map((stage) => [stage.id, stage]));
-  const stages = createPipelineStages(quota, workflowVersion, job.verificationPolicyVersion, job.request?.taskType, job.workflowPolicyVersion)
+  const stages = createPipelineStages(
+    quota,
+    workflowVersion,
+    job.verificationPolicyVersion,
+    job.request?.taskType,
+    job.workflowPolicyVersion,
+    job.submissionPlatformPolicyVersion,
+  )
     .map((stage) => ({ ...stage, ...(existingStages.get(stage.id) || {}) }));
   const mainPublish = stages.find((stage) => stage.id === 'main_publish');
   if (mainPublish) {
@@ -808,7 +817,7 @@ export function upgradeUnfinishedPipelineBugQuota(job) {
   return { changed: true, job: updated, previousBugCount, bugCount: quota, addedBugSlots };
 }
 
-export function createPipelineStages(bugCount, workflowVersion = 1, verificationPolicyVersion = 0, taskType = 'bugfix', workflowPolicyVersion = 0) {
+export function createPipelineStages(bugCount, workflowVersion = 1, verificationPolicyVersion = 0, taskType = 'bugfix', workflowPolicyVersion = 0, submissionPlatformPolicyVersion = 0) {
   if (Number(workflowVersion) >= PARALLEL_BUG_WORKFLOW_VERSION) {
     const stages = PIPELINE_V2_PROJECT_PREPARE_STAGES.map(([id, label]) => ({ id, label, scope: 'project', status: 'pending' }));
     const selectionStages = Number(workflowVersion) >= CURRENT_WORKFLOW_VERSION
@@ -823,11 +832,16 @@ export function createPipelineStages(bugCount, workflowVersion = 1, verification
     // private-fixture flow.  Existing private-fixture tasks remain readable by
     // their persisted metadata, but all newly materialized V3 stages use the
     // frozen-test -> red -> Claude -> integrity -> green order.
-    const deliveryStages = Number(workflowVersion) >= CURRENT_WORKFLOW_VERSION
+    const baseDeliveryStages = Number(workflowVersion) >= CURRENT_WORKFLOW_VERSION
       ? taskType === 'diagnosis' ? PIPELINE_V3_DIAGNOSIS_DELIVERY_STAGES : PIPELINE_V3_COMPAT_BUG_DELIVERY_STAGES
       : Number(verificationPolicyVersion) >= CURRENT_VERIFICATION_POLICY_VERSION
         ? taskType === 'diagnosis' ? PIPELINE_V5_DIAGNOSIS_DELIVERY_STAGES : PIPELINE_V5_BUG_DELIVERY_STAGES
       : PIPELINE_V2_BUG_DELIVERY_STAGES;
+    const deliveryStages = Number(submissionPlatformPolicyVersion) >= CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION
+      ? baseDeliveryStages.flatMap(([stage, label]) => stage === 'delivery_ready'
+        ? [['platform_submit', '提交质检平台'], [stage, label]]
+        : [[stage, label]])
+      : baseDeliveryStages;
     for (let index = 1; index <= bugCount; index += 1) {
       for (const [stage, label] of deliveryStages) stages.push({ id: `bug${index}_${stage}`, stage, label, scope: 'bug', phase: 'delivery', bugIndex: index, status: 'pending' });
     }
@@ -852,9 +866,51 @@ export function pipelineStageLayoutMatches(job = {}) {
     Number(job?.verificationPolicyVersion || 0),
     job?.request?.taskType || 'bugfix',
     Number(job?.workflowPolicyVersion || 0),
+    Number(job?.submissionPlatformPolicyVersion || 0),
   );
   const actual = Array.isArray(job?.stages) ? job.stages : [];
   return expected.length === actual.length && expected.every((stage, index) => actual[index]?.id === stage.id);
+}
+
+export function upgradeSubmissionPlatformStageLayout(job = {}) {
+  if (Number(job?.submissionPlatformPolicyVersion || 0) < CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION
+    || !Array.isArray(job?.stages)) {
+    return { changed: false, job, addedStageIds: [] };
+  }
+  const expected = createPipelineStages(
+    Number(job?.request?.bugCount || job?.bugs?.length || DEFAULT_BUG_COUNT),
+    Number(job?.workflowVersion || 1),
+    Number(job?.verificationPolicyVersion || 0),
+    job?.request?.taskType || 'bugfix',
+    Number(job?.workflowPolicyVersion || 0),
+    Number(job?.submissionPlatformPolicyVersion || 0),
+  );
+  const actualIds = new Set(job.stages.map((stage) => stage.id));
+  const missingStages = expected.filter((stage) => stage.stage === 'platform_submit' && !actualIds.has(stage.id));
+  if (!missingStages.length) return { changed: false, job, addedStageIds: [] };
+
+  const missingByDeliveryStage = new Map(missingStages.map((stage) => [
+    `bug${stage.bugIndex}_delivery_ready`,
+    stage,
+  ]));
+  const stages = [];
+  const addedStageIds = [];
+  for (const stage of job.stages) {
+    const missing = missingByDeliveryStage.get(stage.id);
+    if (missing) {
+      stages.push({ ...missing });
+      addedStageIds.push(missing.id);
+    }
+    stages.push(stage);
+  }
+  if (addedStageIds.length !== missingStages.length) {
+    return { changed: false, job, addedStageIds: [] };
+  }
+  return {
+    changed: true,
+    job: { ...job, stages },
+    addedStageIds,
+  };
 }
 
 export function publicPipelineJob(job) {

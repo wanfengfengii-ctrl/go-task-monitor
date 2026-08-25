@@ -113,7 +113,7 @@ function reopenBug(job, bugIndex, at, acceptanceFailures = []) {
   for (const stage of job.stages || []) {
     if (Number(stage.bugIndex) !== bugIndex) continue;
     const suffix = String(stage.id || '').replace(`bug${bugIndex}_`, '');
-    if (['claude_fix', 'trajectory_validate', 'sol_quality', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'delivery_ready'].includes(suffix)) {
+    if (['claude_fix', 'trajectory_validate', 'sol_quality', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready'].includes(suffix)) {
       resetStage(stage, 'pending', at);
     } else if (suffix === 'post_verify') {
       resetStage(stage, 'skipped', at);

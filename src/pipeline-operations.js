@@ -109,10 +109,24 @@ export function pipelineRepairWorkerLimit(environment = globalThis.process?.env 
   return Math.max(1, Math.min(8, Number.isFinite(configured) ? configured : 2));
 }
 
+export function pipelineStructuredCodexLimit({
+  configuredLimit = 2,
+  loadAverage = os.loadavg()[0],
+  cpuCount = os.cpus().length,
+} = {}) {
+  const limit = Math.max(1, Math.min(2, Number(configuredLimit) || 2));
+  const normalizedCpuCount = Math.max(1, Number(cpuCount) || 1);
+  const loadRatio = Number(loadAverage || 0) / normalizedCpuCount;
+  return loadRatio >= 1.2 ? 1 : limit;
+}
+
 export function pipelineStageResourceProfile(stageId = '') {
   const stage = String(stageId || '');
   if (stage.endsWith('_user_query_review')) return { pool: '', limit: 0, weight: 0 };
-  if (stage === 'project_plan') return { pool: 'project-planning', limit: 4, weight: 1 };
+  if (stage === 'project_plan' || stage === 'codex_injection_plan' || stage === 'codex_injection'
+    || stage.endsWith('_test_author')) {
+    return { pool: 'codex-structured', limit: 2, weight: 1 };
+  }
   if (stage === 'project_generate') return { pool: 'project-generation', limit: 4, weight: 1 };
   // Bug discovery/source preparation can use four lightweight analysis slots.
   // Each Runner dynamically reduces its internal fan-out when projects compete,
@@ -124,9 +138,6 @@ export function pipelineStageResourceProfile(stageId = '') {
   if (stage.endsWith('_claude_fix')) {
     return { pool: 'compute-repair', limit: pipelineRepairWorkerLimit(), weight: 1 };
   }
-  // The independent public-test author runs after the immutable repair
-  // checkpoint and must not keep a scarce production-repair slot occupied.
-  if (stage.endsWith('_test_author')) return { pool: 'compute-test-author', limit: 4, weight: 1 };
   // Direct proof sessions have isolated source/output directories and can use
   // all four Bug workers. Docker-backed validation remains separately bounded
   // because its builds and cross-platform containers are host-heavy.
@@ -172,11 +183,10 @@ export function pipelineOccupiedWeight(jobs = []) {
 export function pipelineResourcePoolState(jobs = [], effectiveMaxConcurrency = 4, activeLeaseCounts = null) {
   const effectiveMax = Math.max(0, Number(effectiveMaxConcurrency) || 0);
   const definitions = [
-    ['project-planning', 'project_plan'],
+    ['codex-structured', 'project_plan'],
     ['project-generation', 'project_generate'],
     ['compute-analysis', 'bug1_bug_discovery'],
     ['compute-repair', 'bug1_claude_fix'],
-    ['compute-test-author', 'bug1_test_author'],
     ['compute-proof', 'bug1_pre_verify'],
     ['compute-docker', 'project_validate'],
     ['compute-heavy', 'bug1_gold_fix'],
@@ -186,7 +196,7 @@ export function pipelineResourcePoolState(jobs = [], effectiveMaxConcurrency = 4
     // The global limit counts project runners, while compute pools count Bug
     // workers inside those runners. Preserve internal capacity once a project
     // is admitted; project bootstrap pools still follow the project limit.
-    const projectBootstrapPool = pool === 'project-planning' || pool === 'project-generation';
+    const projectBootstrapPool = pool === 'codex-structured' || pool === 'project-generation';
     const limit = effectiveMax === 0
       ? 0
       : projectBootstrapPool

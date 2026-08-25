@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   createPipelineStages,
   CURRENT_BUG_POLICY_VERSION,
+  CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION,
   CURRENT_VERIFICATION_POLICY_VERSION,
   CURRENT_WORKFLOW_POLICY_VERSION,
   CURRENT_WORKFLOW_VERSION,
@@ -26,6 +27,7 @@ import {
   queuePipelineBugStageRetry,
   queuePipelineGoldContractRetry,
   remainingBugTrajectoryAttempts,
+  upgradeSubmissionPlatformStageLayout,
   upgradeUnfinishedPipelineBugQuota,
   validatePipelineRequest,
   invalidatePipelineVerificationAfterMissingTestAuthor,
@@ -375,6 +377,78 @@ test('V5 adds independent pre/post verification stages without changing legacy j
   assert.ok(names.indexOf('post_verify') > names.indexOf('trajectory_validate'));
   assert.ok(names.indexOf('verification_coverage') < names.indexOf('cloud_upload'));
   assert.ok(names.indexOf('verification_finalize') < names.indexOf('delivery_ready'));
+});
+
+test('submission platform checkpoint is enabled only for jobs carrying the new policy', () => {
+  const existing = createPipelineStages(
+    1,
+    CURRENT_WORKFLOW_VERSION,
+    CURRENT_VERIFICATION_POLICY_VERSION,
+    'bugfix',
+    CURRENT_WORKFLOW_POLICY_VERSION,
+  );
+  assert.equal(existing.some((stage) => stage.stage === 'platform_submit'), false);
+
+  const future = createPipelineStages(
+    1,
+    CURRENT_WORKFLOW_VERSION,
+    CURRENT_VERIFICATION_POLICY_VERSION,
+    'bugfix',
+    CURRENT_WORKFLOW_POLICY_VERSION,
+    CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION,
+  );
+  const names = future.filter((stage) => stage.scope === 'bug').map((stage) => stage.stage);
+  assert.ok(names.indexOf('verification_finalize') < names.indexOf('platform_submit'));
+  assert.ok(names.indexOf('platform_submit') < names.indexOf('delivery_ready'));
+  assert.equal(pipelineStageLayoutMatches({
+    workflowVersion: CURRENT_WORKFLOW_VERSION,
+    workflowPolicyVersion: CURRENT_WORKFLOW_POLICY_VERSION,
+    verificationPolicyVersion: CURRENT_VERIFICATION_POLICY_VERSION,
+    submissionPlatformPolicyVersion: CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION,
+    request: { bugCount: 1, taskType: 'bugfix' },
+    stages: future,
+  }), true);
+});
+
+test('submission platform stage migration inserts only missing checkpoints and preserves progress', () => {
+  const legacyStages = createPipelineStages(
+    2,
+    CURRENT_WORKFLOW_VERSION,
+    CURRENT_VERIFICATION_POLICY_VERSION,
+    'bugfix',
+    CURRENT_WORKFLOW_POLICY_VERSION,
+  );
+  legacyStages.find((stage) => stage.id === 'bug1_verification_finalize').status = 'passed';
+  legacyStages.find((stage) => stage.id === 'bug2_cloud_upload').status = 'running';
+  const originalDelivery = legacyStages.find((stage) => stage.id === 'bug1_delivery_ready');
+  const result = upgradeSubmissionPlatformStageLayout({
+    workflowVersion: CURRENT_WORKFLOW_VERSION,
+    workflowPolicyVersion: CURRENT_WORKFLOW_POLICY_VERSION,
+    verificationPolicyVersion: CURRENT_VERIFICATION_POLICY_VERSION,
+    submissionPlatformPolicyVersion: CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION,
+    request: { bugCount: 2, taskType: 'bugfix' },
+    stages: legacyStages,
+  });
+
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.addedStageIds, ['bug1_platform_submit', 'bug2_platform_submit']);
+  assert.equal(result.job.stages.find((stage) => stage.id === 'bug1_verification_finalize').status, 'passed');
+  assert.equal(result.job.stages.find((stage) => stage.id === 'bug2_cloud_upload').status, 'running');
+  assert.equal(result.job.stages.find((stage) => stage.id === 'bug1_delivery_ready'), originalDelivery);
+  assert.ok(result.job.stages.findIndex((stage) => stage.id === 'bug1_platform_submit')
+    < result.job.stages.findIndex((stage) => stage.id === 'bug1_delivery_ready'));
+});
+
+test('submission platform stage migration leaves legacy-policy jobs unchanged', () => {
+  const job = {
+    workflowVersion: CURRENT_WORKFLOW_VERSION,
+    submissionPlatformPolicyVersion: 0,
+    request: { bugCount: 1, taskType: 'bugfix' },
+    stages: createPipelineStages(1, CURRENT_WORKFLOW_VERSION),
+  };
+  const result = upgradeSubmissionPlatformStageLayout(job);
+  assert.equal(result.changed, false);
+  assert.equal(result.job, job);
 });
 
 test('V3 diagnosis runs its single pre-fix proof after the read-only model session', () => {

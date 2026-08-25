@@ -180,6 +180,16 @@ prune_forbidden_material() {
   find "$root" -maxdepth 1 -type f \( \
     -iname 'BUG_REPRO*' -o -name 'verify_cmds' -o -name 'verify_cmds.sh' \
   \) -delete
+  local declared_task_type verification_overlay
+  declared_task_type="$(jq -r '.task_type // empty' "$task_dir/public.json" 2>/dev/null || true)"
+  verification_overlay="$(jq -r '.verification_test_overlay // "none"' "$task_dir/public.json" 2>/dev/null || printf 'none')"
+  # A diagnosis may intentionally point at an ordinary test that was already
+  # part of the submitted repository. It is public source context, not a
+  # system-authored answer fixture, and removing it would make the immutable
+  # workspace guard report a false model mutation.
+  if [[ "$declared_task_type" == "diagnosis" && "$verification_overlay" == "repository-tests" ]]; then
+    return 0
+  fi
   # Codex freezes the acceptance test before this Session, but the repair
   # workspace must not contain it. Remove only the exact declared paths so
   # legitimate domain files such as answer.go or patcher.go survive.
@@ -371,14 +381,19 @@ record_stream_activity() {
     ([if ($content | type) == "array" then $content[]? else empty end]
       | map(select(.type == "tool_result" and .is_error == true and ((.content // "") | tostring | test("diagnosis 任务禁止"))))
       | length > 0) as $hook_mutation_denied |
+    ([if ($content | type) == "array" then $content[]? else empty end]
+      | map(select(.type == "tool_result" and .is_error != true))
+      | length > 0) as $successful_tool_result |
     if $tools > 0 or (($type == "system") and ($subtype == "init" or $subtype == "api_retry" or $subtype == "permission_denied")) or ($type == "result")
-    then [$type, $subtype, (if $hook_mutation_denied then "mutation" else "none" end)] | join("\u001e") else "" end
+    then [$type, $subtype, (if $hook_mutation_denied then "mutation" else "none" end), (if $successful_tool_result then "success" else "none" end)] | join("\u001e") else "" end
   ' <<<"$line" 2>/dev/null || true)"
   [[ -n "$activity" ]] || return 0
   local event_type="${activity%%$'\x1e'*}"
   local activity_tail="${activity#*$'\x1e'}"
   local event_subtype="${activity_tail%%$'\x1e'*}"
-  local denial_kind="${activity_tail#*$'\x1e'}"
+  local activity_flags="${activity_tail#*$'\x1e'}"
+  local denial_kind="${activity_flags%%$'\x1e'*}"
+  local tool_result_kind="${activity_flags#*$'\x1e'}"
   if [[ "$event_type" == "system" && "$event_subtype" == "permission_denied" ]]; then
     permission_denied_count=$((permission_denied_count + 1))
     if [[ "$task_type" == "diagnosis" ]]; then
@@ -391,6 +406,11 @@ record_stream_activity() {
   elif [[ "$task_type" == "diagnosis" && "$denial_kind" == "mutation" ]]; then
     permission_denied_count=$((permission_denied_count + 1))
     diagnosis_mutation_denied_count=$((diagnosis_mutation_denied_count + 1))
+  elif [[ "$tool_result_kind" == "success" ]]; then
+    # Count only an uninterrupted denial loop. Once Claude follows the policy
+    # and completes an allowed command, earlier denials must not kill a valid
+    # repair later in the same Session.
+    permission_denied_count=0
   fi
   write_activity_state "$event_type" "$event_subtype" "$permission_denied_count" "$diagnosis_mutation_denied_count"
   if (( permission_denied_count >= permission_denied_limit )); then

@@ -112,6 +112,9 @@ test('watchdog flags stalled non-generation jobs and sends cloud waits to Codex 
   const cloud = pipelineWatchdogObservation({ id: 'cloud', status: 'failed', currentStage: 'bug1_cloud_upload', error: '请先连接轨迹云盘' }, { nowMs });
   assert.equal(cloud.codexTriage, true);
   assert.equal(cloud.failureCategory, 'cloud_upload');
+  const platform = pipelineWatchdogObservation({ id: 'platform', status: 'failed', currentStage: 'bug1_platform_submit', error: '提交平台返回 HTTP 503' }, { nowMs });
+  assert.equal(platform.codexTriage, false);
+  assert.equal(platform.failureCategory, 'submission_platform');
 });
 
 test('new failures receive a stable redacted fingerprint for Codex triage', () => {

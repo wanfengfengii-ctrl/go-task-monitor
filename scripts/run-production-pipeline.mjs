@@ -45,7 +45,7 @@ import {
   upgradeUnfinishedPipelineBugQuota,
 } from '../src/pipeline-rules.js';
 import { beginBugAttempt, finishBugAttempt, nextIncompleteBugIndex, normalizeBugExecution, takeBugRetryQueue } from '../src/bug-workbench.js';
-import { nextPipelineStage, pipelineResourcePolicy, pipelineStageHealthBlockers, pipelineStageRequiredServices, pipelineStageResourceProfile } from '../src/pipeline-operations.js';
+import { nextPipelineStage, pipelineResourcePolicy, pipelineStageHealthBlockers, pipelineStageRequiredServices, pipelineStageResourceProfile, pipelineStructuredCodexLimit } from '../src/pipeline-operations.js';
 import { assertProtectedSnapshotPath, claudeGenerationSandbox, criticalSnapshotTarOptions } from '../src/data-protection.js';
 import { assessProjectComplexity, PROJECT_COMPLEXITY_LIMITS } from '../src/project-complexity.js';
 import {
@@ -230,10 +230,19 @@ const PROJECT_PLAN_STREAM_RECOVERY_WINDOW_MS = Number.isFinite(configuredProject
   && configuredProjectPlanStreamRecoveryWindowMs > 0
   ? Math.max(30_000, configuredProjectPlanStreamRecoveryWindowMs)
   : 2 * 60_000;
-const configuredProjectPlanTimeoutMs = Number(process.env.GO_PIPELINE_PROJECT_PLAN_TIMEOUT_MS || 20 * 60_000);
+const configuredProjectPlanTimeoutMs = Number(process.env.GO_PIPELINE_PROJECT_PLAN_TIMEOUT_MS || 15 * 60_000);
 const PROJECT_PLAN_TIMEOUT_MS = Number.isFinite(configuredProjectPlanTimeoutMs) && configuredProjectPlanTimeoutMs > 0
   ? Math.max(5 * 60_000, configuredProjectPlanTimeoutMs)
-  : 20 * 60_000;
+  : 15 * 60_000;
+const configuredStructuredCodexTimeoutMs = Number(process.env.GO_PIPELINE_STRUCTURED_CODEX_TIMEOUT_MS || 15 * 60_000);
+const STRUCTURED_CODEX_TIMEOUT_MS = Number.isFinite(configuredStructuredCodexTimeoutMs) && configuredStructuredCodexTimeoutMs > 0
+  ? Math.max(5 * 60_000, configuredStructuredCodexTimeoutMs)
+  : 15 * 60_000;
+const configuredStructuredCodexStreamRecoveryWindowMs = Number(process.env.GO_PIPELINE_STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS || 2 * 60_000);
+const STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS = Number.isFinite(configuredStructuredCodexStreamRecoveryWindowMs)
+  && configuredStructuredCodexStreamRecoveryWindowMs > 0
+  ? Math.max(30_000, configuredStructuredCodexStreamRecoveryWindowMs)
+  : 2 * 60_000;
 
 export function codexStreamRecoveryConfigArgs(streamRecoveryWindowMs, providerId = process.env.GO_PIPELINE_CODEX_MODEL_PROVIDER) {
   const recoveryWindowMs = Number(streamRecoveryWindowMs || 0);
@@ -749,16 +758,16 @@ const INJECTION_PLAN_BATCH_SIZE = Number.isFinite(configuredInjectionPlanBatchSi
   ? Math.max(1, Math.min(10, Math.floor(configuredInjectionPlanBatchSize)))
   : 4;
 const INJECTION_PLAN_RETRY_ALLOWANCE = 3;
-const configuredInjectionPlanTimeoutMs = Number(process.env.GO_PIPELINE_INJECTION_PLAN_TIMEOUT_MS || 20 * 60_000);
+const configuredInjectionPlanTimeoutMs = Number(process.env.GO_PIPELINE_INJECTION_PLAN_TIMEOUT_MS || 15 * 60_000);
 const INJECTION_PLAN_TIMEOUT_MS = Number.isFinite(configuredInjectionPlanTimeoutMs)
   && configuredInjectionPlanTimeoutMs > 0
-  ? Math.max(12 * 60_000, configuredInjectionPlanTimeoutMs)
-  : 20 * 60_000;
-const configuredInjectionPlanIdleTimeoutMs = Number(process.env.GO_PIPELINE_INJECTION_PLAN_IDLE_TIMEOUT_MS || 10 * 60_000);
+  ? Math.max(8 * 60_000, configuredInjectionPlanTimeoutMs)
+  : 15 * 60_000;
+const configuredInjectionPlanIdleTimeoutMs = Number(process.env.GO_PIPELINE_INJECTION_PLAN_IDLE_TIMEOUT_MS || 6 * 60_000);
 const INJECTION_PLAN_IDLE_TIMEOUT_MS = Number.isFinite(configuredInjectionPlanIdleTimeoutMs)
   && configuredInjectionPlanIdleTimeoutMs > 0
   ? Math.max(2 * 60_000, Math.min(INJECTION_PLAN_TIMEOUT_MS - 60_000, configuredInjectionPlanIdleTimeoutMs))
-  : 10 * 60_000;
+  : 6 * 60_000;
 
 export function bugCandidatePoolSchema(version = 0, maxCandidates = 10) {
   return {
@@ -867,6 +876,26 @@ function semanticTextSimilarity(left, right) {
   if (!leftParts.size || !rightParts.size) return 0;
   const intersection = [...leftParts].filter((value) => rightParts.has(value)).length;
   return intersection / (leftParts.size + rightParts.size - intersection);
+}
+
+function candidateSetsEqual(left, right) {
+  const leftSet = normalizedCandidateSet(left);
+  const rightSet = normalizedCandidateSet(right);
+  return leftSet.size === rightSet.size && [...leftSet].every((value) => rightSet.has(value));
+}
+
+export function approvedInjectionCandidateMismatch(expected = {}, actual = {}) {
+  const differences = [];
+  if (String(actual.bug_id || '') !== String(expected.bug_id || '')) differences.push('编号');
+  if (!candidateSetsEqual(actual.target_files, expected.target_files)) differences.push('目标文件');
+  if (!candidateSetsEqual(actual.symbols, expected.symbols)) differences.push('目标符号');
+  if (!candidateSetsEqual(actual.runtime_mechanisms, expected.runtime_mechanisms)) differences.push('运行机制');
+
+  const mechanismSimilarity = semanticTextSimilarity(actual.failure_mechanism, expected.failure_mechanism);
+  const stateImpactSimilarity = semanticTextSimilarity(actual.state_or_resource_impact, expected.state_or_resource_impact);
+  if (mechanismSimilarity < 0.72) differences.push(`失效机制相似度 ${mechanismSimilarity.toFixed(2)}`);
+  if (stateImpactSimilarity < 0.72) differences.push(`状态影响相似度 ${stateImpactSimilarity.toFixed(2)}`);
+  return differences.join('、');
 }
 
 function bugCandidatesLikelyDuplicate(left = {}, right = {}) {
@@ -1014,7 +1043,7 @@ export function applyInjectionInfrastructureFailures(job, failures, retriedAt = 
     };
     source.reason = infrastructureAttempts >= MAX_INJECTION_SLOT_ATTEMPTS
       ? `注入准备基础设施连续失败 ${infrastructureAttempts} 次，等待人工处理`
-      : `第 ${infrastructureAttempts}/${MAX_INJECTION_SLOT_ATTEMPTS} 次注入准备基础设施失败，仅重新规划 Bug ${bugIndex}`;
+      : `第 ${infrastructureAttempts}/${MAX_INJECTION_SLOT_ATTEMPTS} 次注入准备基础设施失败，保留原候选并仅重试 Bug ${bugIndex}`;
     if (infrastructureAttempts >= MAX_INJECTION_SLOT_ATTEMPTS) {
       exhaustedBugIndexes.push(bugIndex);
     } else {
@@ -1032,7 +1061,6 @@ export function applyInjectionInfrastructureFailures(job, failures, retriedAt = 
     }
     failedBugIndexes.push(bugIndex);
   }
-  delete job.injectionPlan;
   return { failedBugIndexes, exhaustedBugIndexes };
 }
 
@@ -1896,7 +1924,11 @@ async function clearSchedulerAdmission(jobFile, stageId, { release = false } = {
   });
 }
 
-async function acquireStageResourceSlot(jobFile, stageId, { waitForCapacity = false, optional = false } = {}) {
+async function acquireStageResourceSlot(jobFile, stageId, {
+  waitForCapacity = false,
+  optional = false,
+  preserveJobCursor = false,
+} = {}) {
   const profile = pipelineStageResourceProfile(stageId);
   if (!profile.pool || !profile.limit) return async () => {};
   const jobsRoot = path.dirname(path.dirname(path.resolve(jobFile)));
@@ -1906,7 +1938,10 @@ async function acquireStageResourceSlot(jobFile, stageId, { waitForCapacity = fa
   let transientAcquireRetries = 0;
   let waitLoggedAt = 0;
   while (true) {
-  for (let slot = 1; slot <= profile.limit; slot += 1) {
+  const effectiveSlotLimit = profile.pool === 'codex-structured'
+    ? pipelineStructuredCodexLimit({ configuredLimit: profile.limit })
+    : profile.limit;
+  for (let slot = 1; slot <= effectiveSlotLimit; slot += 1) {
     const slotDir = path.join(poolRoot, `slot-${slot}`);
     const ownerPath = path.join(slotDir, 'owner.json');
     try {
@@ -1948,30 +1983,32 @@ async function acquireStageResourceSlot(jobFile, stageId, { waitForCapacity = fa
   if (waitForCapacity) {
     if (Date.now() - waitLoggedAt >= 60_000) {
       waitLoggedAt = Date.now();
-      await updateJob(jobFile, (current) => {
-        const stageBugIndex = Number(String(stageId).match(/^bug(\d+)_/)?.[1]);
-        const bug = Number.isInteger(stageBugIndex)
-          ? (current.bugs || []).find((item) => Number(item.bugIndex) === stageBugIndex)
-          : null;
-        if (bug) bug.workerExecution = {
-          ...(bug.workerExecution || {}),
-          status: 'fast_lane_queued',
-          currentStage: stageId,
-          startedAt: null,
-          updatedAt: now(),
-          blockedReason: `等待 ${profile.pool} 内部资源`,
-        };
-        const execution = normalizeBugExecution(current.bugExecution);
-        if (stageBugIndex === execution.selectedBugIndex) current.bugExecution = {
-          ...execution,
-          status: 'fast_lane_queued',
-          startedAt: null,
-          currentStage: stageId,
-          updatedAt: now(),
-          blockedReason: `等待 ${profile.pool} 内部资源`,
-        };
-        current.currentStage = stageId;
-      });
+      if (!preserveJobCursor) {
+        await updateJob(jobFile, (current) => {
+          const stageBugIndex = Number(String(stageId).match(/^bug(\d+)_/)?.[1]);
+          const bug = Number.isInteger(stageBugIndex)
+            ? (current.bugs || []).find((item) => Number(item.bugIndex) === stageBugIndex)
+            : null;
+          if (bug) bug.workerExecution = {
+            ...(bug.workerExecution || {}),
+            status: 'fast_lane_queued',
+            currentStage: stageId,
+            startedAt: null,
+            updatedAt: now(),
+            blockedReason: `等待 ${profile.pool} 内部资源`,
+          };
+          const execution = normalizeBugExecution(current.bugExecution);
+          if (stageBugIndex === execution.selectedBugIndex) current.bugExecution = {
+            ...execution,
+            status: 'fast_lane_queued',
+            startedAt: null,
+            currentStage: stageId,
+            updatedAt: now(),
+            blockedReason: `等待 ${profile.pool} 内部资源`,
+          };
+          current.currentStage = stageId;
+        });
+      }
       await appendLog(jobFile, 'info', `${currentStageLabel(stageId)}等待 ${profile.pool} 内部资源；同项目其他 Bug 继续运行`, stageId);
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -1983,6 +2020,8 @@ async function acquireStageResourceSlot(jobFile, stageId, { waitForCapacity = fa
 }
 
 function currentStageLabel(stageId) {
+  if (stageId === 'codex_injection_plan') return '增量注入规划';
+  if (stageId === 'codex_injection') return '注入执行与复核';
   if (stageId === 'project_plan') return '项目规划';
   if (stageId === 'project_generate') return '项目生成';
   if (stageId === 'project_validate') return 'Docker 验证';
@@ -2748,6 +2787,26 @@ async function runCodexJson({
   return { output, sessionId: extractSessionId(events), outputPath, eventsPath };
 }
 
+async function runInjectionCodexJson(options) {
+  const releaseStructuredCodex = await acquireStageResourceSlot(options.jobFile, 'codex_injection', {
+    waitForCapacity: true,
+    preserveJobCursor: true,
+  });
+  try {
+    return await runCodexJson({
+      ...options,
+      timeoutMs: options.timeoutMs || STRUCTURED_CODEX_TIMEOUT_MS,
+      idleTimeoutMs: options.idleTimeoutMs || CODEX_JSON_IDLE_TIMEOUT_MS,
+      streamRecoveryWindowMs: options.streamRecoveryWindowMs || STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS,
+      reasoningEffort: options.reasoningEffort || 'medium',
+      ignoreUserConfig: true,
+      ephemeral: true,
+    });
+  } finally {
+    await releaseStructuredCodex().catch(() => {});
+  }
+}
+
 async function reusableCodexJson(jobFile, name) {
   const artifactDir = path.join(path.dirname(jobFile), 'artifacts');
   const outputPath = path.join(artifactDir, `${name}.json`);
@@ -3188,7 +3247,12 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
     schema: postClaudeVerificationTestSchema,
     name: `bug${bugIndex}-post-claude-verification-test`,
     sandbox: 'workspace-write',
-    timeoutMs: 40 * 60 * 1000,
+    timeoutMs: STRUCTURED_CODEX_TIMEOUT_MS,
+    idleTimeoutMs: CODEX_JSON_IDLE_TIMEOUT_MS,
+    streamRecoveryWindowMs: STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS,
+    reasoningEffort: 'medium',
+    ignoreUserConfig: true,
+    ephemeral: true,
   });
   const descriptor = result.output || {};
   if (!safeVerificationTestPath(descriptor.test_file) || !String(descriptor.test_name || '').startsWith('TestModel_')) {
@@ -3450,7 +3514,12 @@ export async function prepareDiagnosisVerificationTest(jobFile, bugIndex, bugBas
     schema: postClaudeVerificationTestSchema,
     name: `bug${bugIndex}-diagnosis-verification-test`,
     sandbox: 'workspace-write',
-    timeoutMs: 40 * 60 * 1000,
+    timeoutMs: STRUCTURED_CODEX_TIMEOUT_MS,
+    idleTimeoutMs: CODEX_JSON_IDLE_TIMEOUT_MS,
+    streamRecoveryWindowMs: STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS,
+    reasoningEffort: 'medium',
+    ignoreUserConfig: true,
+    ephemeral: true,
   });
   const descriptor = result.output || {};
   if (!safeVerificationTestPath(descriptor.test_file) || !String(descriptor.test_name || '').startsWith('TestModel_')) {
@@ -4987,7 +5056,7 @@ async function reviewBroadInjectedBug(jobFile, stageId, cwd, baseCommit, bug, in
     `Selected bug record:\n${JSON.stringify(bug, null, 2)}`,
     'Return JSON matching the supplied schema and cite concrete diff evidence for each issue.',
   ].join('\n\n');
-  const review = await runCodexJson({
+  const review = await runInjectionCodexJson({
     jobFile,
     stageId,
     cwd,
@@ -5540,6 +5609,17 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
   if (!bugIndexes.length) return null;
   const previousBugs = (job.bugs || []).filter((item) => item.discovery?.found === true);
   const key = injectionPlanKey(job, bugIndexes, previousBugs);
+  const existingPlanDetail = job.injectionPlan?.artifact
+    ? await readJson(path.join(path.dirname(jobFile), 'artifacts', job.injectionPlan.artifact), null)
+    : null;
+  const existingPlannedIndexes = new Set((existingPlanDetail?.assignments || []).map((item) => Number(item.bugIndex)));
+  if (job.injectionPlan?.version === INJECTION_PLAN_VERSION
+    && existingPlanDetail?.version === INJECTION_PLAN_VERSION
+    && existingPlanDetail?.mainCommit === job.mainCommit
+    && bugIndexes.every((bugIndex) => existingPlannedIndexes.has(bugIndex))) {
+    await appendLog(jobFile, 'info', `复用既有注入规划中的剩余槽位：${bugIndexes.join(', ')}，不重复调用 Codex`, `bug${bugIndexes[0]}_bug_source_prepare`);
+    return job.injectionPlan;
+  }
   if (job.injectionPlan?.version === INJECTION_PLAN_VERSION
     && job.injectionPlan?.key === key
     && Array.isArray(job.injectionPlan.assignments)
@@ -5552,6 +5632,7 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
   const filePolicy = validateRootCauseFileConcentration(previousBugs, { totalBugCount: job.request.bugCount });
   const rejectedCandidates = rejectedInjectionCandidates(job, bugIndexes);
   const basePrompt = [
+    'This repository is a local synthetic application used only for software-quality regression benchmarks. Limit the work to ordinary correctness, state management, persistence, concurrency, transaction, and resource-lifecycle defects. Exclude security vulnerabilities, exploitation, authentication bypass, secrets, malware, and network intrusion.',
     'Plan the complete remaining controlled Bug injection batch for this generated Go project in one read-only repository inspection. Do not edit files, run Git, create commits, or inspect solution artifacts.',
     'This is controlled mutation planning, not natural Bug discovery. For every candidate, inspect the exact target symbol and establish a two-state proof: the untouched main currently enforces the retained correct invariant, and the proposed concrete edit changes those source lines to introduce new faulty behavior. Reject and replace a candidate when the described faulty behavior, weakened invariant, or equivalent mutation is already present in main; an existing defect is never a successful injection candidate.',
     'For each record, identify the exact reachable production file and symbol, the precise mutation to be applied later in an isolated workspace, a real public observable reproduction, the three-link internal propagation mechanism, affected runtime state, retained behavior, and difficulty evidence. The later writer must be able to apply the record without scanning for a different Bug.',
@@ -5622,7 +5703,12 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
         ? `The previous planning response had rejected records. Do not repeat their IDs, fingerprints, mechanisms, or equivalent mutations:\n${JSON.stringify(lastRejected, null, 2)}`
         : '',
     ].filter(Boolean).join('\n\n');
+    let releaseStructuredCodex = async () => {};
     try {
+      releaseStructuredCodex = await acquireStageResourceSlot(jobFile, 'codex_injection_plan', {
+        waitForCapacity: true,
+        preserveJobCursor: true,
+      });
       result = await runCodexJson({
         jobFile,
         stageId,
@@ -5633,11 +5719,17 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
         sandbox: 'read-only',
         timeoutMs: INJECTION_PLAN_TIMEOUT_MS,
         idleTimeoutMs: INJECTION_PLAN_IDLE_TIMEOUT_MS,
+        streamRecoveryWindowMs: STRUCTURED_CODEX_STREAM_RECOVERY_WINDOW_MS,
+        reasoningEffort: 'medium',
+        ignoreUserConfig: true,
+        ephemeral: true,
       });
     } catch (error) {
       if (planningAttempt >= maxPlanningAttempts) throw error;
       await appendLog(jobFile, 'warn', `增量注入规划第 ${planningAttempt} 批失败，已保留 ${accepted.length}/${bugIndexes.length} 个候选，仅重试当前小批次：${error.message}`, stageId);
       continue;
+    } finally {
+      await releaseStructuredCodex().catch(() => {});
     }
     planningSessionIds.push(result.sessionId);
     lastSessionId = result.sessionId;
@@ -7652,6 +7744,19 @@ async function uploadQualifiedTrajectory(taskName, { pipelineJobId = '', bugInde
   return { taskId, signedUrl, skipped: Boolean(uploaded.skipped) };
 }
 
+async function submitQualifiedTaskToPlatform(taskName, { pipelineJobId, bugIndex }) {
+  const taskId = managedTaskId(taskName);
+  const response = await fetch(`${monitorApiUrl}/api/submission-platform/submit`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ taskId, pipelineJobId, bugIndex }),
+    signal: AbortSignal.timeout(3 * 60 * 1000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.message || `提交质检平台失败（HTTP ${response.status}）`);
+  return payload.submission || {};
+}
+
 async function runVerificationProof(jobFile, bugIndex, phase, sourceDir) {
   const job = await readJson(jobFile);
   const bug = job.bugs.find((item) => item.bugIndex === bugIndex);
@@ -8210,7 +8315,7 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
         failedStage,
       );
       await prepareTrajectoryRetry(latest, task, reusableCheckpointSignal(feedback));
-      for (const suffix of ['pre_verify', 'claude_fix', 'trajectory_validate', 'sol_quality', 'post_verify', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'delivery_ready']) {
+      for (const suffix of ['pre_verify', 'claude_fix', 'trajectory_validate', 'sol_quality', 'post_verify', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready']) {
         const stageId = `bug${bugIndex}_${suffix}`;
         if (await pipelineHasStage(jobFile, stageId)) {
           await setStage(jobFile, stageId, 'pending', { error: '', attempt: attempt + 1 });
@@ -8756,7 +8861,7 @@ async function prepareV2BugSourcesPass(jobFile, projectDir) {
         `Approved project-level injection record (must remain the same Bug):\n${JSON.stringify(planned.candidate, null, 2)}`,
         'Return only the requested structured Bug record after modifying and validating the workspace.',
       ].join('\n\n');
-      const result = await runCodexJson({ jobFile, stageId: sourceStage, cwd: bugBaseDir, prompt, schema: bugSchemaForPolicy(sourceJob.request.bugPolicyVersion), name: `bug${bugIndex}-injection`, sandbox: 'workspace-write' });
+      const result = await runInjectionCodexJson({ jobFile, stageId: sourceStage, cwd: bugBaseDir, prompt, schema: bugSchemaForPolicy(sourceJob.request.bugPolicyVersion), name: `bug${bugIndex}-injection`, sandbox: 'workspace-write' });
       if (result.output?.found !== true) {
         const reason = String(result.output?.reason || '').trim();
         throw new Error(`Bug ${bugIndex} 受控注入候选不可用：基线已存在候选缺陷或写入器无法形成新的生产改动${reason ? `：${reason}` : ''}`);
@@ -8765,9 +8870,9 @@ async function prepareV2BugSourcesPass(jobFile, projectDir) {
         ...sourceJob.request,
         previousUserQueries: previousBugs.map((item) => item.discovery?.user_query).filter(Boolean),
       })) throw new Error('Bug injection stage must return found=true');
-      if (result.output.bug_id !== planned.candidate.bug_id
-        || bugCandidateFingerprint(result.output) !== bugCandidateFingerprint(planned.candidate)) {
-        throw new Error(`Bug ${bugIndex} 注入结果偏离项目级批准规划：期望 ${planned.candidate.bug_id}，实际 ${result.output.bug_id || 'unknown'}`);
+      const approvedCandidateMismatch = approvedInjectionCandidateMismatch(planned.candidate, result.output);
+      if (approvedCandidateMismatch) {
+        throw new Error(`Bug ${bugIndex} 注入结果偏离项目级批准规划（${approvedCandidateMismatch}）：期望 ${planned.candidate.bug_id}，实际 ${result.output.bug_id || 'unknown'}`);
       }
       assertDistinctBugSelection(sourceJob, bugIndex, result.output);
       if (Number(sourceJob.request.bugPolicyVersion || 0) >= BUG_TAXONOMY_POLICY_VERSION) {
@@ -8979,7 +9084,14 @@ async function runPipeline(jobFile) {
   const runnerStartedAt = now();
   await updateJob(jobFile, (current) => {
     const existingStages = new Map((current.stages || []).map((stage) => [stage.id, stage]));
-    current.stages = createPipelineStages(current.request.bugCount, workflowVersion, current.verificationPolicyVersion, current.request.taskType, current.workflowPolicyVersion).map((stage) => ({ ...stage, ...(existingStages.get(stage.id) || {}) }));
+    current.stages = createPipelineStages(
+      current.request.bugCount,
+      workflowVersion,
+      current.verificationPolicyVersion,
+      current.request.taskType,
+      current.workflowPolicyVersion,
+      current.submissionPlatformPolicyVersion,
+    ).map((stage) => ({ ...stage, ...(existingStages.get(stage.id) || {}) }));
     current.jobDir = jobDir;
     current.tasksRoot = tasksRoot;
     current.status = 'running';
@@ -9721,11 +9833,22 @@ async function runPipeline(jobFile) {
         const deliveredTaskDir = preparedBug?.task?.taskDir || path.join(job.tasksRoot, verifiedTask.taskName);
         await cleanupVerificationCache(deliveredTaskDir);
       }
+      let platformSubmission = null;
+      if (await pipelineHasStage(jobFile, `bug${bugIndex}_platform_submit`)) {
+        platformSubmission = await runStage(jobFile, `bug${bugIndex}_platform_submit`, async () => {
+          const latest = await readJson(jobFile);
+          return submitQualifiedTaskToPlatform(verifiedTask.taskName, {
+            pipelineJobId: latest.id,
+            bugIndex,
+          });
+        });
+      }
       await setStage(jobFile, `bug${bugIndex}_delivery_ready`, 'passed', {
         taskId: verifiedTask.taskId,
         sessionId: verifiedTask.sessionId || null,
         trajectoryUrl: mainCloudResult.signedUrl,
         verificationResult,
+        platformSubmission,
       });
       // A previous infrastructure failure may have marked this Bug as
       // auto-continued while its proofs were still being recovered. Once the
@@ -9740,7 +9863,7 @@ async function runPipeline(jobFile) {
         deliveredBug.lastAction = 'delivery_completed';
       });
       await appendLog(jobFile, 'success', usesVerificationEvidence
-        ? `Bug ${bugIndex} 已完成主轨迹、独立红绿证明、云盘上传和 Excel 回填`
+        ? `Bug ${bugIndex} 已完成主轨迹、独立红绿证明、云盘上传、Excel 回填${platformSubmission ? '和质检平台提交' : ''}`
         : `Bug ${bugIndex} 已完成轨迹采集登记、云盘上传和 Excel 链接回填`, `bug${bugIndex}_delivery_ready`);
       if (workflowVersion >= CURRENT_WORKFLOW_VERSION) {
         await updateJob(jobFile, (current) => {
@@ -9820,7 +9943,7 @@ async function runPipeline(jobFile) {
         const retryStage = `bug${bugIndex}_claude_fix`;
         await updateJob(jobFile, (current) => {
           const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
-          for (const suffix of ['claude_fix', 'trajectory_validate', 'sol_quality', 'test_author', 'pre_verify', 'docker_validation', 'post_verify', 'git_publication', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'delivery_ready']) {
+          for (const suffix of ['claude_fix', 'trajectory_validate', 'sol_quality', 'test_author', 'pre_verify', 'docker_validation', 'post_verify', 'git_publication', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready']) {
             const stage = current.stages.find((item) => item.id === `bug${bugIndex}_${suffix}`);
             if (!stage) continue;
             stage.status = 'pending';
@@ -10006,7 +10129,7 @@ async function runPipeline(jobFile) {
               currentBug.coverageRepairAttempts = coverageRepairAttempt;
               currentBug.coverageRepairLastError = error.message;
             }
-            for (const suffix of ['claude_fix', 'trajectory_validate', 'sol_quality', 'test_author', 'pre_verify', 'docker_validation', 'post_verify', 'git_publication', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'delivery_ready']) {
+            for (const suffix of ['claude_fix', 'trajectory_validate', 'sol_quality', 'test_author', 'pre_verify', 'docker_validation', 'post_verify', 'git_publication', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready']) {
               const stage = current.stages.find((item) => item.id === `bug${bugIndex}_${suffix}`);
               if (!stage) continue;
               stage.status = 'pending';

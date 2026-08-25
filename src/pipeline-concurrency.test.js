@@ -426,6 +426,11 @@ test('pipeline retry state distinguishes automatic retries, exhaustion, and clou
   assert.equal(cloud.waitingForCloud, true);
   assert.equal(cloud.exhausted, false);
   assert.equal(cloud.automaticRetryPending, false);
+  const platform = pipelineRetryState({ status: 'failed', currentStage: 'bug1_platform_submit', error: '请在任务系统中连接一次提交平台以启用自动登录', autoRetryCount: 2 });
+  assert.equal(platform.waitingForPlatform, true);
+  assert.equal(platform.exhausted, false);
+  assert.equal(platform.automaticRetryPending, false);
+  assert.equal(classifyPipelineFailure({ status: 'failed', currentStage: 'bug1_platform_submit', error: '提交质检平台失败' }), 'submission_platform');
   const baseline = pipelineRetryState({ status: 'failed', error: '已发布 main 基线不合格，停止自动重试' });
   assert.equal(baseline.nonRetryable, true);
   assert.equal(baseline.automaticRetryPending, false);
@@ -440,6 +445,8 @@ test('terminal failures are abandoned and replaced exactly once', () => {
   assert.equal(pipelineAbandonmentState({ status: 'failed', autoRetryCount: MAX_PIPELINE_AUTO_RETRIES, abandonmentApprovedAt: '2026-08-15T12:00:00Z' }).shouldAbandon, true);
   assert.equal(pipelineAbandonmentState({ status: 'failed', error: '已发布 main 基线不合格，停止自动重试' }).reason, 'non_retryable');
   assert.equal(pipelineAbandonmentState({ status: 'failed', currentStage: 'bug1_cloud_upload', error: '请先连接轨迹云盘', autoRetryCount: 9 }).shouldAbandon, false);
+  assert.equal(pipelineAbandonmentState({ status: 'failed', currentStage: 'bug1_platform_submit', error: '请在任务系统中连接一次提交平台以启用自动登录', autoRetryCount: 9 }).shouldAbandon, false);
+  assert.equal(pipelineAbandonmentState({ status: 'failed', currentStage: 'bug1_platform_submit', error: '提交平台返回 HTTP 503', autoRetryCount: 9 }).awaitingCodexTriage, false);
   const jobs = [
     { id: 'needs-replacement', status: 'abandoned' },
     { id: 'linked-source', status: 'abandoned', replacementJobId: 'replacement-a' },

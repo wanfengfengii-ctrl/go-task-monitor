@@ -337,15 +337,17 @@ export function pipelineSupplySnapshot(jobs, currentWorkflowVersion, currentVeri
   const managedJobs = allJobs.filter((job) => isPipelineAutofillEligible(job, currentWorkflowVersion, currentVerificationPolicyVersion));
   const runnable = selectPipelineAutofillCandidates(managedJobs, occupiedJobIds, PIPELINE_REFILL_BATCH_SIZE);
   const waitingForCloud = managedJobs.filter((job) => pipelineRetryState(job).waitingForCloud);
+  const waitingForPlatform = managedJobs.filter((job) => pipelineRetryState(job).waitingForPlatform);
   const replacementSources = pendingPipelineReplacementSources(allJobs).slice(0, PIPELINE_REFILL_BATCH_SIZE);
   return {
     occupiedCount: occupiedJobIds.size,
     runnableCount: runnable.length,
     waitingForCloudCount: waitingForCloud.length,
+    waitingForPlatformCount: waitingForPlatform.length,
     replacementCount: replacementSources.length,
     replacementSourceJobIds: replacementSources.map((job) => job.id),
-    idle: occupiedJobIds.size === 0 && runnable.length === 0 && waitingForCloud.length === 0,
-    depleted: runnable.length === 0 && waitingForCloud.length === 0,
+    idle: occupiedJobIds.size === 0 && runnable.length === 0 && waitingForCloud.length === 0 && waitingForPlatform.length === 0,
+    depleted: runnable.length === 0 && waitingForCloud.length === 0 && waitingForPlatform.length === 0,
   };
 }
 

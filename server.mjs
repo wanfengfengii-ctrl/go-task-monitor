@@ -46,7 +46,18 @@ import {
   normalizeDiagnosisGitMetadata,
   resolvePinnedGoVersion,
 } from './src/review-rules.js';
-import { createPipelineStages, CURRENT_BUG_POLICY_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, CURRENT_WORKFLOW_POLICY_VERSION, CURRENT_WORKFLOW_VERSION, DEFAULT_BUG_COUNT, isPipelineBugDeliveryComplete, pipelineBugQuota, pipelineStageLayoutMatches, pipelineTaskOutcome, pipelineUserQueryReadiness, publicPipelineJob, reactivateFrozenVerificationFailures, reactivatePipelineBug, rewindPipelineBugAfterMissingTrajectory, upgradeUnfinishedPipelineBugQuota, validatePipelineRequest } from './src/pipeline-rules.js';
+import { createPipelineStages, CURRENT_BUG_POLICY_VERSION, CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, CURRENT_WORKFLOW_POLICY_VERSION, CURRENT_WORKFLOW_VERSION, DEFAULT_BUG_COUNT, isPipelineBugDeliveryComplete, pipelineBugQuota, pipelineStageLayoutMatches, pipelineTaskOutcome, pipelineUserQueryReadiness, publicPipelineJob, reactivateFrozenVerificationFailures, reactivatePipelineBug, rewindPipelineBugAfterMissingTrajectory, upgradeSubmissionPlatformStageLayout, upgradeUnfinishedPipelineBugQuota, validatePipelineRequest } from './src/pipeline-rules.js';
+import {
+  DEFAULT_SUBMISSION_PLATFORM_URL,
+  findPlatformSubmissionByBugId,
+  mergePlatformCookies,
+  platformApiMessage,
+  platformCsrfToken,
+  platformImportState,
+  platformSubmissionFingerprint,
+  platformSubmissionId,
+  preparePlatformSubmission,
+} from './src/submission-platform.js';
 import { enqueueBugRetry, normalizeBugExecution, nextIncompleteBugIndex } from './src/bug-workbench.js';
 import { classifyPipelineFailure, isPipelineAutofillEligible, isRetryablePipelineStartError, isStaleQueuedPipelineReservation, MAX_PIPELINE_AUTO_RETRIES, MAX_PIPELINE_CONCURRENCY, pipelineAbandonmentState, pipelineAutofillStartCapacity, pipelineOccupiedJobIds, pipelineResumeUsesExistingAdmission, pipelineRetryState, queuePipelineManualRetry, reconcilePipelineCloudUpload, reopenPipelineAbandonmentForManualRetry, selectPipelineAutofillCandidates } from './src/pipeline-concurrency.js';
 import {
@@ -156,6 +167,21 @@ const codexCliPath = resolveCliPath(process.env.GO_PIPELINE_CODEX_BIN, 'codex', 
   '/Applications/ChatGPT.app/Contents/Resources/codex',
   path.join(os.homedir(), '.local/bin/codex'),
 ]);
+const configuredCodexInferenceProbeIntervalMs = Number(process.env.GO_PIPELINE_CODEX_INFERENCE_PROBE_INTERVAL_MS || 5 * 60_000);
+const CODEX_INFERENCE_PROBE_INTERVAL_MS = Number.isFinite(configuredCodexInferenceProbeIntervalMs)
+  && configuredCodexInferenceProbeIntervalMs > 0
+  ? Math.max(60_000, configuredCodexInferenceProbeIntervalMs)
+  : 5 * 60_000;
+const configuredCodexInferenceProbeCooldownMs = Number(process.env.GO_PIPELINE_CODEX_INFERENCE_PROBE_COOLDOWN_MS || 2 * 60_000);
+const CODEX_INFERENCE_PROBE_COOLDOWN_MS = Number.isFinite(configuredCodexInferenceProbeCooldownMs)
+  && configuredCodexInferenceProbeCooldownMs > 0
+  ? Math.max(30_000, configuredCodexInferenceProbeCooldownMs)
+  : 2 * 60_000;
+const configuredCodexInferenceProbeTimeoutMs = Number(process.env.GO_PIPELINE_CODEX_INFERENCE_PROBE_TIMEOUT_MS || 45_000);
+const CODEX_INFERENCE_PROBE_TIMEOUT_MS = Number.isFinite(configuredCodexInferenceProbeTimeoutMs)
+  && configuredCodexInferenceProbeTimeoutMs > 0
+  ? Math.max(15_000, configuredCodexInferenceProbeTimeoutMs)
+  : 45_000;
 const claudeCliPath = resolveCliPath(process.env.GO_TASK_MONITOR_CLAUDE_BIN, 'claude', [
   path.join(os.homedir(), '.npm-global/bin/claude'),
   path.join(os.homedir(), '.local/bin/claude'),
@@ -169,6 +195,13 @@ const cloudKeychainSourcePath = path.join(import.meta.dirname, 'scripts/cloud-ke
 const cloudKeychainBinaryPath = path.join(workRoot, '.bin/cloud-keychain');
 const cloudKeychainService = `go-task-monitor.cloud-upload.${crypto.createHash('sha256').update(cloudUploadBaseUrl).digest('hex').slice(0, 12)}`;
 const cloudHealthCheckIntervalMs = 2 * 60 * 1000;
+const submissionPlatformBaseUrl = String(process.env.GO_SUBMISSION_PLATFORM_URL || DEFAULT_SUBMISSION_PLATFORM_URL).replace(/\/$/, '');
+const submissionPlatformApiUrl = `${submissionPlatformBaseUrl}/api/v1`;
+const submissionPlatformSessionPath = path.join(managedLibraryRoot, 'validation/submission_platform_session.json');
+const submissionPlatformRecordsPath = path.join(managedLibraryRoot, 'validation/platform_submissions.json');
+const submissionPlatformRecordsLockPath = `${submissionPlatformRecordsPath}.lock`;
+const submissionPlatformKeychainService = `go-task-monitor.submission-platform.${crypto.createHash('sha256').update(submissionPlatformBaseUrl).digest('hex').slice(0, 12)}`;
+const SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS = 2 * 60 * 1000;
 function optionalPositiveLimit(value) {
   const parsed = Number(value);
   return String(value || '').trim() && Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
@@ -203,6 +236,16 @@ let cloudLastCheckedAt = null;
 let cloudLastRefreshedAt = null;
 let cloudLastError = '';
 const cloudUploadTails = new Map();
+let submissionPlatformCookie = '';
+let submissionPlatformConnectedAs = '';
+let submissionPlatformAutoLoginAccount = '';
+let submissionPlatformAutoLoginConfigured = false;
+let submissionPlatformAuthEpoch = 0;
+let submissionPlatformAuthRefreshPromise = null;
+let submissionPlatformLastCheckedAt = null;
+let submissionPlatformLastRefreshedAt = null;
+let submissionPlatformLastError = '';
+const submissionPlatformSubmitTails = new Map();
 let automaticUploadRunning = false;
 let pipelineCloudReconcileRunning = false;
 const automaticUploadRetryAt = new Map();
@@ -309,6 +352,7 @@ let pipelineWatchdogRunning = false;
 let pipelineCodexTriageRunning = false;
 let pipelineHealthCheckRunning = false;
 let pipelineHealthState = { updatedAt: null, services: {} };
+let codexInferenceProbeHealth = null;
 let pipelineAlertTail = Promise.resolve();
 let pipelineResourceMaintenanceRunning = false;
 let dockerGraderCpuGuardRunning = false;
@@ -511,11 +555,10 @@ async function activePipelineResourceSlotSnapshot() {
   const slotsRoot = path.join(pipelineRefillRoot, 'resource-slots');
   const pools = await fsp.readdir(slotsRoot, { withFileTypes: true }).catch(() => []);
   const counts = Object.fromEntries([
-    'project-planning',
+    'codex-structured',
     'project-generation',
     'compute-analysis',
     'compute-repair',
-    'compute-test-author',
     'compute-proof',
     'compute-docker',
     'compute-heavy',
@@ -542,6 +585,11 @@ async function activePipelineResourceSlotSnapshot() {
       }
     }
   }
+  // Runners started before the shared structured-Codex pool was introduced
+  // may still hold one of the two legacy leases. Count them during the rolling
+  // reload so a new planner cannot overbook the same upstream capacity.
+  counts['codex-structured'] += Number(counts['project-planning'] || 0)
+    + Number(counts['compute-test-author'] || 0);
   return { counts, jobIds };
 }
 
@@ -1017,6 +1065,7 @@ async function createPipelineJob(input) {
     workflowVersion: CURRENT_WORKFLOW_VERSION,
     workflowPolicyVersion: CURRENT_WORKFLOW_POLICY_VERSION,
     verificationPolicyVersion: CURRENT_VERIFICATION_POLICY_VERSION,
+    submissionPlatformPolicyVersion: CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION,
     // The semantic verify_cmds coverage review is retired. V5 independent
     // red/green proof validation remains enabled through verificationPolicyVersion.
     verificationCoveragePolicyVersion: 0,
@@ -1049,7 +1098,14 @@ async function createPipelineJob(input) {
     startedAt: null,
     finishedAt: null,
     currentStage: null,
-    stages: createPipelineStages(validated.value.bugCount, CURRENT_WORKFLOW_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, validated.value.taskType, CURRENT_WORKFLOW_POLICY_VERSION),
+    stages: createPipelineStages(
+      validated.value.bugCount,
+      CURRENT_WORKFLOW_VERSION,
+      CURRENT_VERIFICATION_POLICY_VERSION,
+      validated.value.taskType,
+      CURRENT_WORKFLOW_POLICY_VERSION,
+      CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION,
+    ),
     bugs: [],
     bugExecution: normalizeBugExecution({ autoContinue: true, status: 'bug_ready' }),
     repositoryDisposition: 'provisioned',
@@ -1139,7 +1195,8 @@ async function runCodexPipelineRefillPlan(batchId, jobs, {
     '仅返回符合指定 schema 的 JSON。',
   ].join('\n\n');
   const result = await runCapturedCommand(codexCliPath, [
-    'exec', '--skip-git-repo-check', '-C', batchDir, '-s', 'read-only', '--json',
+    'exec', '--ephemeral', '--ignore-user-config', '-c', 'model_reasoning_effort="low"',
+    '--skip-git-repo-check', '-C', batchDir, '-s', 'read-only', '--json',
     '--output-schema', schemaPath, '-o', outputPath, prompt,
   ], { cwd: batchDir, timeoutMs: 60 * 60 * 1000 });
   await fsp.writeFile(eventsPath, result.stdout || '', 'utf8');
@@ -1287,7 +1344,8 @@ async function runCodexWatchdogTriage(incident) {
     '返回符合 schema 的中文 JSON 结论。',
   ].join('\n\n');
   const result = await runCapturedCommand(codexCliPath, [
-    'exec', '--skip-git-repo-check', '-C', triageDir, '-s', 'read-only', '--json',
+    'exec', '--ephemeral', '--ignore-user-config', '-c', 'model_reasoning_effort="low"',
+    '--skip-git-repo-check', '-C', triageDir, '-s', 'read-only', '--json',
     '--output-schema', schemaPath, '-o', outputPath, prompt,
   ], { cwd: triageDir, timeoutMs: 30 * 60 * 1000 });
   await fsp.writeFile(eventsPath, result.stdout || '', 'utf8');
@@ -1637,6 +1695,81 @@ async function checkCommandHealth(name, command, args) {
   return commandHealth(name, await runCapturedCommand(command, args, { cwd: import.meta.dirname, timeoutMs: 15_000 }));
 }
 
+async function runCodexInferenceProbe() {
+  const probeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-task-codex-health-'));
+  const schemaPath = path.join(probeDir, 'schema.json');
+  const outputPath = path.join(probeDir, 'result.json');
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['status'],
+    properties: { status: { type: 'string', enum: ['ok'] } },
+  };
+  try {
+    await fsp.writeFile(schemaPath, `${JSON.stringify(schema)}\n`, 'utf8');
+    const result = await runCapturedCommand(codexCliPath, [
+      'exec', '--ephemeral', '--ignore-user-config',
+      '-c', 'model_reasoning_effort="low"',
+      '--skip-git-repo-check', '-C', probeDir, '-s', 'read-only', '--json',
+      '--output-schema', schemaPath, '-o', outputPath,
+      'Return only the requested JSON object with status set to ok. Do not use tools.',
+    ], { cwd: probeDir, timeoutMs: CODEX_INFERENCE_PROBE_TIMEOUT_MS });
+    let validOutput = false;
+    if (result.exitCode === 0) {
+      const output = await fsp.readFile(outputPath, 'utf8').then((value) => JSON.parse(value)).catch(() => null);
+      validOutput = output?.status === 'ok';
+    }
+    const probeCheckedAt = new Date().toISOString();
+    if (result.exitCode === 0 && validOutput) {
+      return {
+        name: 'Codex CLI',
+        status: 'online',
+        authStatus: 'online',
+        inferenceStatus: 'online',
+        probeCheckedAt,
+        checkedAt: probeCheckedAt,
+        latencyMs: result.durationMs,
+        detail: '认证有效，结构化推理在线',
+      };
+    }
+    const detail = sanitizeMonitorText(compactCapturedOutput(result)).slice(-240)
+      || (result.exitCode === 0 ? '结构化输出无效' : `exit=${result.exitCode ?? 'none'}`);
+    return {
+      name: 'Codex CLI',
+      status: 'degraded',
+      authStatus: 'online',
+      inferenceStatus: 'degraded',
+      probeCheckedAt,
+      checkedAt: probeCheckedAt,
+      latencyMs: result.durationMs,
+      detail: `认证有效，但结构化推理探针失败：${detail}`,
+    };
+  } finally {
+    await fsp.rm(probeDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function checkCodexHealth(authResult) {
+  const auth = authenticatedCommandHealth('Codex CLI', authResult, '认证有效');
+  if (auth.status !== 'online') {
+    codexInferenceProbeHealth = null;
+    return { ...auth, authStatus: 'offline', inferenceStatus: 'unknown' };
+  }
+  const previousCheckedAt = Date.parse(codexInferenceProbeHealth?.probeCheckedAt || '');
+  const probeIntervalMs = codexInferenceProbeHealth?.status === 'online'
+    ? CODEX_INFERENCE_PROBE_INTERVAL_MS
+    : CODEX_INFERENCE_PROBE_COOLDOWN_MS;
+  if (Number.isFinite(previousCheckedAt) && Date.now() - previousCheckedAt < probeIntervalMs) {
+    return {
+      ...codexInferenceProbeHealth,
+      checkedAt: new Date().toISOString(),
+      latencyMs: authResult.durationMs,
+    };
+  }
+  codexInferenceProbeHealth = await runCodexInferenceProbe();
+  return codexInferenceProbeHealth;
+}
+
 async function checkGitHubHealth() {
   const startedAt = Date.now();
   const authResult = await runCapturedCommand(githubCliPath, [
@@ -1784,7 +1917,7 @@ async function runSystemHealthChecks() {
       ...claudeAuth,
       exitCode: claudeAuth.exitCode === 0 && claudeLoggedIn ? 0 : claudeAuth.exitCode || 1,
     }, '认证有效');
-    const codex = authenticatedCommandHealth('Codex CLI', codexAuth, '认证有效');
+    const codex = await checkCodexHealth(codexAuth);
     const memoryPercentMatch = memoryPressure.stdout?.match(/memory free percentage:\s*(\d+)%/i);
     const dockerSystemReclaimableBytes = await readDockerReclaimableBytes(dockerDisk);
     const dockerBuilderReclaimableBytes = dockerBuilderDisk.exitCode === 0
@@ -2201,6 +2334,7 @@ async function preparePipelineStart(jobId, { automatic = false, externalResume =
       Number(job.verificationPolicyVersion || CURRENT_VERIFICATION_POLICY_VERSION),
       job.request?.taskType || 'bugfix',
       CURRENT_WORKFLOW_POLICY_VERSION,
+      Number(job.submissionPlatformPolicyVersion || 0),
     ).map((stage) => ({
       ...stage,
       ...((job.stages || []).find((existing) => existing.id === stage.id) || {}),
@@ -3788,12 +3922,12 @@ async function ensureCloudKeychainBinary() {
   await fsp.chmod(cloudKeychainBinaryPath, 0o700);
 }
 
-async function runCloudKeychain(action, account, password = null) {
+async function runKeychain(action, service, account, password = null) {
   if (!['store', 'read', 'exists', 'delete'].includes(action)) throw new Error('不支持的钥匙串操作');
   if (!account) throw new Error('钥匙串账号不能为空');
   await ensureCloudKeychainBinary();
   return new Promise((resolve, reject) => {
-    const child = spawn(cloudKeychainBinaryPath, [action, cloudKeychainService, account], {
+    const child = spawn(cloudKeychainBinaryPath, [action, service, account], {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const chunks = [];
@@ -3820,6 +3954,14 @@ async function runCloudKeychain(action, account, password = null) {
     if (secret) child.stdin.end(secret);
     else child.stdin.end();
   });
+}
+
+function runCloudKeychain(action, account, password = null) {
+  return runKeychain(action, cloudKeychainService, account, password);
+}
+
+function runSubmissionPlatformKeychain(action, account, password = null) {
+  return runKeychain(action, submissionPlatformKeychainService, account, password);
 }
 
 async function clearCloudSession({ forgetCredentials = false } = {}) {
@@ -4037,6 +4179,387 @@ async function restoreCloudSession() {
   await clearCloudSession();
   if (cloudAutoLoginConfigured) await refreshCloudLogin('服务启动时发现会话过期');
   else throw new Error('已保存的云盘会话失效，请重新连接一次以启用自动登录');
+}
+
+function responseSetCookieHeaders(response) {
+  return typeof response.headers.getSetCookie === 'function'
+    ? response.headers.getSetCookie()
+    : [response.headers.get('set-cookie')].filter(Boolean);
+}
+
+async function persistSubmissionPlatformSession() {
+  await fsp.mkdir(path.dirname(submissionPlatformSessionPath), { recursive: true });
+  const temporary = `${submissionPlatformSessionPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const session = {
+    cookie: submissionPlatformCookie,
+    connectedAs: submissionPlatformConnectedAs,
+    autoLoginAccount: submissionPlatformAutoLoginAccount,
+    autoLoginConfigured: submissionPlatformAutoLoginConfigured,
+    lastCheckedAt: submissionPlatformLastCheckedAt,
+    lastRefreshedAt: submissionPlatformLastRefreshedAt,
+    lastError: submissionPlatformLastError,
+    updatedAt: new Date().toISOString(),
+  };
+  await fsp.writeFile(temporary, `${JSON.stringify(session, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await fsp.rename(temporary, submissionPlatformSessionPath);
+  await fsp.chmod(submissionPlatformSessionPath, 0o600);
+}
+
+async function requestSubmissionPlatformLogin(username, password) {
+  const response = await fetch(`${submissionPlatformApiUrl}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+    redirect: 'manual',
+    signal: AbortSignal.timeout(SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS),
+  });
+  const payload = await response.json().catch(() => ({}));
+  let cookie = mergePlatformCookies('', responseSetCookieHeaders(response));
+  if (!response.ok || !cookie) throw new Error(platformApiMessage(payload, `提交平台登录失败（HTTP ${response.status}）`));
+  const check = await fetch(`${submissionPlatformApiUrl}/auth/me`, {
+    headers: { cookie },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS),
+  });
+  const checkPayload = await check.json().catch(() => ({}));
+  cookie = mergePlatformCookies(cookie, responseSetCookieHeaders(check));
+  if (!check.ok) throw new Error(platformApiMessage(checkPayload, `提交平台会话校验失败（HTTP ${check.status}）`));
+  return { cookie, profile: checkPayload };
+}
+
+async function connectSubmissionPlatform(username, password) {
+  const previousAccount = submissionPlatformAutoLoginAccount;
+  const login = await requestSubmissionPlatformLogin(username, password);
+  await runSubmissionPlatformKeychain('store', username, password);
+  if (previousAccount && previousAccount !== username) {
+    await runSubmissionPlatformKeychain('delete', previousAccount)
+      .catch((error) => addLog('warn', `旧提交平台账号的钥匙串凭据未能删除：${error.message}`));
+  }
+  submissionPlatformAuthEpoch += 1;
+  submissionPlatformCookie = login.cookie;
+  submissionPlatformConnectedAs = username;
+  submissionPlatformAutoLoginAccount = username;
+  submissionPlatformAutoLoginConfigured = true;
+  submissionPlatformLastCheckedAt = new Date().toISOString();
+  submissionPlatformLastRefreshedAt = submissionPlatformLastCheckedAt;
+  submissionPlatformLastError = '';
+  await persistSubmissionPlatformSession();
+}
+
+async function clearSubmissionPlatformSession({ forgetCredentials = false } = {}) {
+  if (forgetCredentials) submissionPlatformAuthEpoch += 1;
+  const account = submissionPlatformAutoLoginAccount || submissionPlatformConnectedAs;
+  if (forgetCredentials && account) await runSubmissionPlatformKeychain('delete', account);
+  submissionPlatformCookie = '';
+  submissionPlatformConnectedAs = '';
+  if (forgetCredentials) {
+    submissionPlatformAutoLoginAccount = '';
+    submissionPlatformAutoLoginConfigured = false;
+    submissionPlatformLastCheckedAt = null;
+    submissionPlatformLastRefreshedAt = null;
+    submissionPlatformLastError = '';
+    await fsp.rm(submissionPlatformSessionPath, { force: true });
+  } else if (submissionPlatformAutoLoginConfigured && submissionPlatformAutoLoginAccount) {
+    await persistSubmissionPlatformSession();
+  }
+}
+
+async function refreshSubmissionPlatformLogin(reason = '会话失效') {
+  if (submissionPlatformAuthRefreshPromise) return submissionPlatformAuthRefreshPromise;
+  if (!submissionPlatformAutoLoginConfigured || !submissionPlatformAutoLoginAccount) {
+    throw new Error('请在任务系统中连接一次提交平台以启用自动登录');
+  }
+  const account = submissionPlatformAutoLoginAccount;
+  const epoch = submissionPlatformAuthEpoch;
+  const refresh = (async () => {
+    const stored = await runSubmissionPlatformKeychain('read', account);
+    if (!stored.found || !stored.data.length) throw new Error('macOS 钥匙串中没有找到提交平台凭据，请重新连接');
+    try {
+      const login = await requestSubmissionPlatformLogin(account, stored.data.toString('utf8'));
+      if (epoch !== submissionPlatformAuthEpoch || account !== submissionPlatformAutoLoginAccount) throw new Error('提交平台自动登录已被取消');
+      submissionPlatformCookie = login.cookie;
+      submissionPlatformConnectedAs = account;
+      submissionPlatformLastCheckedAt = new Date().toISOString();
+      submissionPlatformLastRefreshedAt = submissionPlatformLastCheckedAt;
+      submissionPlatformLastError = '';
+      await persistSubmissionPlatformSession();
+      addLog('success', `提交平台会话已自动恢复：${account}（${reason}）`);
+      return true;
+    } finally {
+      stored.data.fill(0);
+    }
+  })();
+  submissionPlatformAuthRefreshPromise = refresh;
+  try {
+    return await refresh;
+  } catch (error) {
+    if (epoch === submissionPlatformAuthEpoch) {
+      submissionPlatformLastError = `提交平台自动登录失败：${error.message}`;
+      await persistSubmissionPlatformSession().catch(() => {});
+    }
+    throw new Error(submissionPlatformLastError || error.message);
+  } finally {
+    if (submissionPlatformAuthRefreshPromise === refresh) submissionPlatformAuthRefreshPromise = null;
+  }
+}
+
+async function ensureSubmissionPlatformSession(reason = '需要提交') {
+  if (submissionPlatformCookie) return true;
+  return refreshSubmissionPlatformLogin(reason);
+}
+
+async function submissionPlatformRequest(endpoint, options = {}, retryAuth = true) {
+  await ensureSubmissionPlatformSession(endpoint);
+  const method = String(options.method || 'GET').toUpperCase();
+  const headers = { ...(options.headers || {}), cookie: submissionPlatformCookie };
+  if (!['GET', 'HEAD'].includes(method)) {
+    const csrf = platformCsrfToken(submissionPlatformCookie);
+    if (!csrf) throw new Error('提交平台登录会话缺少 CSRF 令牌，请重新连接');
+    headers['X-CSRF-Token'] = csrf;
+  }
+  const response = await fetch(`${submissionPlatformApiUrl}${endpoint}`, {
+    ...options,
+    method,
+    headers,
+    redirect: 'manual',
+    signal: options.signal || AbortSignal.timeout(SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS),
+  });
+  const nextCookie = mergePlatformCookies(submissionPlatformCookie, responseSetCookieHeaders(response));
+  if (nextCookie !== submissionPlatformCookie) submissionPlatformCookie = nextCookie;
+  const payload = await response.json().catch(() => ({}));
+  if (retryAuth && [401, 403].includes(response.status)) {
+    submissionPlatformCookie = '';
+    await refreshSubmissionPlatformLogin(`HTTP ${response.status}`);
+    return submissionPlatformRequest(endpoint, options, false);
+  }
+  submissionPlatformLastCheckedAt = new Date().toISOString();
+  submissionPlatformLastError = response.ok ? '' : platformApiMessage(payload, `HTTP ${response.status}`);
+  await persistSubmissionPlatformSession().catch(() => {});
+  return { response, payload };
+}
+
+async function restoreSubmissionPlatformSession() {
+  const saved = JSON.parse(await fsp.readFile(submissionPlatformSessionPath, 'utf8'));
+  submissionPlatformCookie = String(saved?.cookie || '');
+  submissionPlatformConnectedAs = String(saved?.connectedAs || '');
+  submissionPlatformAutoLoginAccount = String(saved?.autoLoginAccount || saved?.connectedAs || '');
+  submissionPlatformLastCheckedAt = saved?.lastCheckedAt || null;
+  submissionPlatformLastRefreshedAt = saved?.lastRefreshedAt || null;
+  submissionPlatformLastError = String(saved?.lastError || '');
+  if (submissionPlatformAutoLoginAccount) {
+    submissionPlatformAutoLoginConfigured = (await runSubmissionPlatformKeychain('exists', submissionPlatformAutoLoginAccount)).found;
+  }
+  if (!submissionPlatformCookie) {
+    if (submissionPlatformAutoLoginConfigured) await refreshSubmissionPlatformLogin('服务启动');
+    return;
+  }
+  const response = await fetch(`${submissionPlatformApiUrl}/auth/me`, {
+    headers: { cookie: submissionPlatformCookie },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS),
+  });
+  submissionPlatformCookie = mergePlatformCookies(submissionPlatformCookie, responseSetCookieHeaders(response));
+  if (response.ok) {
+    submissionPlatformLastCheckedAt = new Date().toISOString();
+    submissionPlatformLastError = '';
+    await persistSubmissionPlatformSession();
+    addLog('success', `已恢复提交平台登录：${submissionPlatformConnectedAs}`);
+    return;
+  }
+  submissionPlatformCookie = '';
+  if (submissionPlatformAutoLoginConfigured) await refreshSubmissionPlatformLogin('服务启动时发现会话过期');
+  else throw new Error('已保存的提交平台会话失效，请重新连接');
+}
+
+async function readSubmissionPlatformRecords() {
+  try {
+    const records = JSON.parse(await fsp.readFile(submissionPlatformRecordsPath, 'utf8'));
+    if (!Array.isArray(records)) throw new Error('提交平台幂等记录格式损坏');
+    return records;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+async function writeSubmissionPlatformRecordsUnlocked(records) {
+  await fsp.mkdir(path.dirname(submissionPlatformRecordsPath), { recursive: true });
+  const temporary = `${submissionPlatformRecordsPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fsp.writeFile(temporary, `${JSON.stringify(records, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await fsp.rename(temporary, submissionPlatformRecordsPath);
+  await fsp.chmod(submissionPlatformRecordsPath, 0o600);
+}
+
+async function upsertSubmissionPlatformRecord(record) {
+  const updated = await withFileLock(submissionPlatformRecordsLockPath, async () => {
+    const records = await readSubmissionPlatformRecords();
+    const next = records.filter((item) => item.taskId !== record.taskId);
+    next.push(record);
+    await writeSubmissionPlatformRecordsUnlocked(next);
+    return record;
+  }, { timeoutMs: 30_000, staleMs: 5 * 60_000 });
+  invalidateTaskDiscoveryCache();
+  return updated;
+}
+
+async function findRemoteSubmission(bugId) {
+  const query = new URLSearchParams({ page: '1', page_size: '100', bug_id: bugId });
+  const { response, payload } = await submissionPlatformRequest(`/submissions/mine?${query}`);
+  if (!response.ok) throw new Error(platformApiMessage(payload, `读取提交平台“我的提交”失败（HTTP ${response.status}）`));
+  return findPlatformSubmissionByBugId(payload, bugId);
+}
+
+async function postSubmissionPlatformRecord(submission) {
+  const form = new FormData();
+  form.append('data', JSON.stringify(submission.data));
+  form.append('trajectory_url', submission.trajectoryUrl);
+  return submissionPlatformRequest('/submissions', { method: 'POST', body: form });
+}
+
+async function runSerializedSubmissionPlatformTask(taskId, callback) {
+  const previous = submissionPlatformSubmitTails.get(taskId) || Promise.resolve();
+  let release;
+  const turn = new Promise((resolve) => { release = resolve; });
+  submissionPlatformSubmitTails.set(taskId, turn);
+  await previous.catch(() => {});
+  try {
+    return await callback();
+  } finally {
+    release();
+    if (submissionPlatformSubmitTails.get(taskId) === turn) submissionPlatformSubmitTails.delete(taskId);
+  }
+}
+
+async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId) {
+  const job = await readPipelineJob(pipelineJobId);
+  if (!job || Number(job.submissionPlatformPolicyVersion || 0) < CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION) {
+    throw new Error('流水线未启用提交平台策略');
+  }
+  const platformStage = (job.stages || []).find((stage) => stage.id === `bug${bugIndex}_platform_submit`);
+  const finalizeStage = (job.stages || []).find((stage) => stage.id === `bug${bugIndex}_verification_finalize`);
+  if (!platformStage || !['running', 'passed'].includes(platformStage.status) || finalizeStage?.status !== 'passed') {
+    throw new Error('提交平台节点与验证完成节点状态不一致');
+  }
+  const task = await loadPipelineReviewTask(job, bugIndex, taskId);
+  const qualified = (await readReviewStatuses()).some((record) => record.taskId === task.id && record.status === 'qualified');
+  if (!qualified) throw new Error(`${task.bug_id} 尚未通过本地交付审核`);
+  await validateTaskExcelVerification(task);
+  if (task.ruleIssues?.length) throw new Error(`${task.bug_id} 尚未满足交付规则：${task.ruleIssues.join('；')}`);
+  await readTrajectoryMetadata(task, { requireV4: await requiresV4Trajectory(task) });
+
+  const schema = await submissionPlatformRequest('/form/fields');
+  if (!schema.response.ok) throw new Error(platformApiMessage(schema.payload, `读取提交平台字段失败（HTTP ${schema.response.status}）`));
+  const submission = preparePlatformSubmission(task, schema.payload);
+  const fingerprint = platformSubmissionFingerprint(submission);
+
+  return runSerializedSubmissionPlatformTask(task.id, async () => {
+    const existingRecord = (await readSubmissionPlatformRecords()).find((record) => record.taskId === task.id);
+    if (existingRecord?.status === 'submitted') {
+      if (existingRecord.fingerprint !== fingerprint) throw new Error(`${task.bug_id} 已提交，但本地交付字段发生变化，禁止创建重复记录`);
+      return { ...existingRecord, skipped: true };
+    }
+
+    const remote = await findRemoteSubmission(task.bug_id);
+    if (remote) {
+      const reconciled = {
+        taskId: task.id,
+        bugId: task.bug_id,
+        fingerprint,
+        status: 'submitted',
+        platformSubmissionId: platformSubmissionId(remote),
+        platformUrl: `${submissionPlatformBaseUrl}/u/submissions`,
+        submittedAt: remote.submitted_at || remote.created_at || new Date().toISOString(),
+        reconciledAt: new Date().toISOString(),
+      };
+      await upsertSubmissionPlatformRecord(reconciled);
+      return { ...reconciled, skipped: true, reconciled: true };
+    }
+
+    const startedAt = new Date().toISOString();
+    await upsertSubmissionPlatformRecord({
+      taskId: task.id,
+      bugId: task.bug_id,
+      fingerprint,
+      status: 'submitting',
+      startedAt,
+      attemptId: crypto.randomUUID(),
+    });
+    const result = await postSubmissionPlatformRecord(submission);
+    if (!result.response.ok) {
+      if (result.response.status === 409) {
+        const duplicate = await findRemoteSubmission(task.bug_id);
+        if (duplicate) {
+          const reconciled = {
+            taskId: task.id,
+            bugId: task.bug_id,
+            fingerprint,
+            status: 'submitted',
+            platformSubmissionId: platformSubmissionId(duplicate),
+            platformUrl: `${submissionPlatformBaseUrl}/u/submissions`,
+            submittedAt: duplicate.submitted_at || duplicate.created_at || new Date().toISOString(),
+            reconciledAt: new Date().toISOString(),
+          };
+          await upsertSubmissionPlatformRecord(reconciled);
+          return { ...reconciled, skipped: true, reconciled: true };
+        }
+      }
+      const message = platformApiMessage(result.payload, `提交平台返回 HTTP ${result.response.status}`);
+      await upsertSubmissionPlatformRecord({ taskId: task.id, bugId: task.bug_id, fingerprint, status: 'failed', startedAt, failedAt: new Date().toISOString(), error: message });
+      throw new Error(message);
+    }
+    const submitted = {
+      taskId: task.id,
+      bugId: task.bug_id,
+      fingerprint,
+      status: 'submitted',
+      platformSubmissionId: platformSubmissionId(result.payload),
+      platformUrl: `${submissionPlatformBaseUrl}/u/submissions`,
+      submittedAt: new Date().toISOString(),
+    };
+    await upsertSubmissionPlatformRecord(submitted);
+    addLog('success', `${task.bug_id} 已提交质检平台`);
+    return submitted;
+  });
+}
+
+async function submissionPlatformPublicState() {
+  const records = await readSubmissionPlatformRecords();
+  return {
+    baseUrl: submissionPlatformBaseUrl,
+    connected: Boolean(submissionPlatformCookie),
+    connectedAs: submissionPlatformConnectedAs || submissionPlatformAutoLoginAccount,
+    autoLoginConfigured: submissionPlatformAutoLoginConfigured,
+    lastCheckedAt: submissionPlatformLastCheckedAt,
+    lastRefreshedAt: submissionPlatformLastRefreshedAt,
+    lastError: submissionPlatformLastError,
+    submittedCount: records.filter((record) => record.status === 'submitted').length,
+    submissions: records.map(({ taskId, bugId, status, platformSubmissionId: submissionId, platformUrl, submittedAt, error }) => ({
+      taskId,
+      bugId,
+      status,
+      submissionId,
+      platformUrl,
+      submittedAt,
+      error,
+    })),
+  };
+}
+
+async function resumeSubmissionPlatformWaiters() {
+  let resumed = 0;
+  for (const visible of await listPipelineJobs()) {
+    if (!pipelineRetryState(visible).waitingForPlatform || activePipelineProcesses.has(visible.id)) continue;
+    const job = await readPipelineJob(visible.id);
+    if (!job || !pipelineRetryState(job).waitingForPlatform) continue;
+    const queued = queuePipelineManualRetry(job, new Date().toISOString(), 'submission_platform_connected');
+    await writePipelineJob(queued);
+    resumed += 1;
+  }
+  if (resumed) {
+    addLog('info', `提交平台连接恢复，已重新排队 ${resumed} 个等待提交的项目`);
+    void fillPipelineSlots();
+  }
+  return resumed;
 }
 
 async function pathExists(target) {
@@ -4960,6 +5483,7 @@ async function discoverTasksFresh() {
   const tasks = [];
   const labelRecordMap = await readLabelExportRecords();
   const taskExportMap = new Map((await readTaskExportRecords()).map((record) => [record.taskId, record]));
+  const submissionPlatformRecordMap = new Map((await readSubmissionPlatformRecords()).map((record) => [record.taskId, record]));
   const pipelineJobs = await listPipelineJobs();
   const pipelineTaskOwners = new Map();
   for (const job of pipelineJobs) {
@@ -5215,10 +5739,12 @@ async function discoverTasksFresh() {
       && task.status === 'passed'
       && !hardRuleFailure;
     const reviewRecord = reviewMap.get(task.id);
+    const platformImport = platformImportState(submissionPlatformRecordMap.get(task.id));
     const manualStatus = reviewRecord?.status || 'pending';
     const manualRecoveryQualified = task.manualRecoveryValidated && !duplicateImport && !task.workflowConflict;
     return {
       ...task,
+      ...platformImport,
       status: duplicateImport || task.workflowConflict ? 'duplicate' : pipelineSkipped && !legacyReviewEligible ? 'skipped' : task.status,
       finishedAt: pipelineSkipped ? (task.pipelineSkippedAt || task.finishedAt) : task.finishedAt,
       qualificationBlocked: false,
@@ -6387,6 +6913,45 @@ const server = http.createServer(async (request, response) => {
     if (request.url === '/api/cloud/status' && request.method === 'GET') {
       return json(response, 200, await cloudPublicState());
     }
+    if (request.url === '/api/submission-platform/status' && request.method === 'GET') {
+      return json(response, 200, await submissionPlatformPublicState());
+    }
+    if (request.url === '/api/submission-platform/connect' && request.method === 'POST') {
+      const body = await readJson(request);
+      const username = String(body.username || '').trim();
+      const password = String(body.password || '');
+      if (!username || !password) return json(response, 400, { message: '请输入提交平台账号和密码' });
+      try {
+        await connectSubmissionPlatform(username, password);
+        const resumed = await resumeSubmissionPlatformWaiters();
+        return json(response, 200, { message: `提交平台已连接，自动登录已启用${resumed ? `；已恢复 ${resumed} 个等待项目` : ''}`, ...(await submissionPlatformPublicState()) });
+      } catch (error) {
+        return json(response, 409, { message: error.message, ...(await submissionPlatformPublicState().catch(() => ({}))) });
+      }
+    }
+    if (request.url === '/api/submission-platform/disconnect' && request.method === 'POST') {
+      try {
+        await clearSubmissionPlatformSession({ forgetCredentials: true });
+        return json(response, 200, { message: '提交平台已断开，钥匙串凭据已删除', ...(await submissionPlatformPublicState()) });
+      } catch (error) {
+        return json(response, 409, { message: error.message, ...(await submissionPlatformPublicState().catch(() => ({}))) });
+      }
+    }
+    if (request.url === '/api/submission-platform/submit' && request.method === 'POST') {
+      const body = await readJson(request);
+      const pipelineJobId = String(body.pipelineJobId || '');
+      const bugIndex = Number(body.bugIndex);
+      const taskId = String(body.taskId || '');
+      if (!pipelineJobId || !Number.isInteger(bugIndex) || bugIndex < 1 || !taskId) {
+        return json(response, 400, { message: 'pipelineJobId、bugIndex 和 taskId 必填' });
+      }
+      try {
+        const submission = await submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId);
+        return json(response, 200, { message: submission.skipped ? '提交平台记录已存在，已完成幂等确认' : '已提交质检平台', submission });
+      } catch (error) {
+        return json(response, 409, { message: error.message });
+      }
+    }
     if (request.url === '/api/cloud/connect' && request.method === 'POST') {
       const body = await readJson(request);
       const username = String(body.username || '').trim();
@@ -6654,7 +7219,13 @@ async function restoreRuntimeAfterRestart() {
   } catch (error) {
     if (error.code !== 'ENOENT') addLog('warn', error.message);
   }
+  try {
+    await restoreSubmissionPlatformSession();
+  } catch (error) {
+    if (error.code !== 'ENOENT') addLog('warn', `提交平台会话恢复失败：${error.message}`);
+  }
   await upgradePersistedPipelineBugQuotas();
+  await upgradePersistedSubmissionPlatformStages();
   await reconcileUploadedPipelineJobs();
   void autoUploadCompletedTrajectories();
   const scheduler = await readPipelineSchedulerState();
@@ -6731,6 +7302,36 @@ async function upgradePersistedPipelineBugQuotas() {
   }
 }
 
+let submissionPlatformStageMigrationRunning = false;
+
+async function upgradePersistedSubmissionPlatformStages() {
+  if (submissionPlatformStageMigrationRunning) return;
+  submissionPlatformStageMigrationRunning = true;
+  try {
+    const visibleJobs = await listPipelineJobsFresh();
+    let upgraded = 0;
+    for (const visibleJob of visibleJobs) {
+      const job = await readPipelineJob(visibleJob.id);
+      if (!job || ['passed', 'abandoned'].includes(String(job.status || ''))) continue;
+      const result = upgradeSubmissionPlatformStageLayout(job);
+      if (!result.changed) continue;
+      const at = new Date().toISOString();
+      result.job.updatedAt = at;
+      result.job.logs = [...(result.job.logs || []), {
+        at,
+        level: 'info',
+        stageId: result.job.currentStage || 'pipeline_resume',
+        message: `恢复提交平台阶段布局：补齐 ${result.addedStageIds.length} 个自动导入节点并保留现有进度`,
+      }].slice(-300);
+      await writePipelineJob(result.job);
+      upgraded += 1;
+    }
+    if (upgraded) addLog('info', `服务恢复提交平台阶段布局：已修复 ${upgraded} 个在途项目`);
+  } finally {
+    submissionPlatformStageMigrationRunning = false;
+  }
+}
+
 server.on('error', (error) => {
   if (error?.code === 'EADDRINUSE') {
     console.error(`Go task monitor API 已在 127.0.0.1:${port} 运行，当前实例退出`);
@@ -6751,6 +7352,10 @@ setInterval(() => { void autoUploadCompletedTrajectories(); }, 30_000).unref();
 setInterval(() => { void autoConfirmStaleUserQueryReviews(); }, 30_000).unref();
 setInterval(() => { void autoResolveStaleInjectionReviews(); }, 30_000).unref();
 setInterval(() => { void reconcileUploadedPipelineJobs(); }, 30_000).unref();
+setInterval(() => {
+  void upgradePersistedSubmissionPlatformStages()
+    .catch((error) => addLog('warn', `恢复提交平台阶段布局失败：${error.message}`));
+}, 30_000).unref();
 setInterval(() => { void fillPipelineSlots(); }, 30_000).unref();
 setInterval(() => { void ensurePipelineRefill(); }, 30_000).unref();
 setInterval(() => { void runPipelineWatchdog(); }, PIPELINE_WATCHDOG_INTERVAL_MS).unref();

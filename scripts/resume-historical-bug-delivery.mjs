@@ -49,7 +49,7 @@ async function main() {
     if (suffix === 'claude_fix') {
       resetStage(stage, 'passed', at);
       stage.result = { recoveredHistoricalTrajectory: true, sessionId, commit };
-    } else if (['trajectory_validate', 'pre_verify', 'post_verify', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'delivery_ready'].includes(suffix)) {
+    } else if (['trajectory_validate', 'pre_verify', 'post_verify', 'verification_coverage', 'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready'].includes(suffix)) {
       resetStage(stage, 'pending');
     } else if (suffix === 'sol_quality') {
       resetStage(stage, 'pending');

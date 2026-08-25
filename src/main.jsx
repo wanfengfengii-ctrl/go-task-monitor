@@ -538,6 +538,12 @@ function App() {
   const [cloudPassword, setCloudPassword] = useState('');
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudMessage, setCloudMessage] = useState('');
+  const [submissionPlatformState, setSubmissionPlatformState] = useState({ connected: false, connectedAs: '', autoLoginConfigured: false, lastCheckedAt: null, lastRefreshedAt: null, lastError: '', submittedCount: 0, submissions: [] });
+  const [showSubmissionPlatformLogin, setShowSubmissionPlatformLogin] = useState(false);
+  const [submissionPlatformUsername, setSubmissionPlatformUsername] = useState('');
+  const [submissionPlatformPassword, setSubmissionPlatformPassword] = useState('');
+  const [submissionPlatformBusy, setSubmissionPlatformBusy] = useState(false);
+  const [submissionPlatformMessage, setSubmissionPlatformMessage] = useState('');
   const [showTrajectoryUpload, setShowTrajectoryUpload] = useState(false);
   const [trajectoryFiles, setTrajectoryFiles] = useState([]);
   const [trajectoryUploadMessage, setTrajectoryUploadMessage] = useState('');
@@ -594,6 +600,26 @@ function App() {
     try {
       const response = await fetch('/api/cloud/status');
       if (response.ok) applyCloudState(await response.json());
+    } catch {}
+  };
+
+  const applySubmissionPlatformState = (payload) => {
+    setSubmissionPlatformState({
+      connected: Boolean(payload.connected),
+      connectedAs: payload.connectedAs || '',
+      autoLoginConfigured: Boolean(payload.autoLoginConfigured),
+      lastCheckedAt: payload.lastCheckedAt || null,
+      lastRefreshedAt: payload.lastRefreshedAt || null,
+      lastError: payload.lastError || '',
+      submittedCount: Number(payload.submittedCount || 0),
+      submissions: Array.isArray(payload.submissions) ? payload.submissions : [],
+    });
+  };
+
+  const syncSubmissionPlatform = async () => {
+    try {
+      const response = await fetch('/api/submission-platform/status');
+      if (response.ok) applySubmissionPlatformState(await response.json());
     } catch {}
   };
 
@@ -677,7 +703,7 @@ function App() {
 
   const refresh = async () => {
     setIsRefreshing(true);
-    await Promise.all([syncRunner(), syncCloud(), syncPipeline(), syncPipelineRepository(), syncSystemHealth()]);
+    await Promise.all([syncRunner(), syncCloud(), syncSubmissionPlatform(), syncPipeline(), syncPipelineRepository(), syncSystemHealth()]);
     setRefreshed('刚刚');
     window.setTimeout(() => setIsRefreshing(false), 400);
   };
@@ -708,6 +734,7 @@ function App() {
         syncTimer = null;
         void syncRunner();
         void syncCloud();
+        void syncSubmissionPlatform();
         void syncPipeline();
         void syncSystemHealth();
       }, 250);
@@ -1002,6 +1029,52 @@ function App() {
       await syncCloud();
     } finally {
       setCloudBusy(false);
+    }
+  };
+
+  const connectSubmissionPlatform = async (event) => {
+    event.preventDefault();
+    setSubmissionPlatformBusy(true);
+    setSubmissionPlatformMessage('');
+    try {
+      const response = await fetch('/api/submission-platform/connect', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: submissionPlatformUsername, password: submissionPlatformPassword }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.message || '提交平台连接失败');
+      applySubmissionPlatformState(payload);
+      setShowSubmissionPlatformLogin(false);
+      setSubmissionPlatformMessage(payload.message);
+    } catch (error) {
+      setSubmissionPlatformMessage(error.message);
+    } finally {
+      setSubmissionPlatformPassword('');
+      setSubmissionPlatformBusy(false);
+    }
+  };
+
+  const openSubmissionPlatformLogin = () => {
+    setSubmissionPlatformUsername((current) => current || submissionPlatformState.connectedAs || '');
+    setSubmissionPlatformMessage('');
+    setShowSubmissionPlatformLogin(true);
+  };
+
+  const disconnectSubmissionPlatform = async () => {
+    setSubmissionPlatformBusy(true);
+    setSubmissionPlatformMessage('');
+    try {
+      const response = await fetch('/api/submission-platform/disconnect', { method: 'POST' });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.message || '提交平台断开失败');
+      applySubmissionPlatformState(payload);
+      setSubmissionPlatformMessage(payload.message);
+    } catch (error) {
+      setSubmissionPlatformMessage(error.message);
+      await syncSubmissionPlatform();
+    } finally {
+      setSubmissionPlatformBusy(false);
     }
   };
 
@@ -1570,10 +1643,11 @@ function App() {
                 const progress = stages.length ? (passedStages / stages.length) * 100 : 0;
                 const autoRetryCount = Number(job.autoRetryCount) || 0;
                 const waitingForCloud = job.status === 'failed' && String(job.currentStage || '').endsWith('_cloud_upload') && /请先连接轨迹云盘/.test(job.error || '');
+                const waitingForPlatform = job.status === 'failed' && String(job.currentStage || '').endsWith('_platform_submit') && /提交平台|质检平台|钥匙串/.test(job.error || '');
                 const invalidBaseline = job.status === 'failed' && /(?:已发布 main\s*|项目)基线不合格/.test(job.error || '');
-                const retryExhausted = job.status === 'failed' && !waitingForCloud && !invalidBaseline && autoRetryCount >= pipelineRuntime.maxAutoRetries;
+                const retryExhausted = job.status === 'failed' && !waitingForCloud && !waitingForPlatform && !invalidBaseline && autoRetryCount >= pipelineRuntime.maxAutoRetries;
                 const automaticRetryEligible = Number(job.workflowVersion || 1) >= CURRENT_WORKFLOW_VERSION || job.legacyAutoRetryEnabled || job.retryRequestedAt;
-                const automaticRetryPending = job.status === 'failed' && !waitingForCloud && !invalidBaseline && !job.watchdogTriagePending && automaticRetryEligible && autoRetryCount < pipelineRuntime.maxAutoRetries && pipelineRuntime.autoFillEnabled;
+                const automaticRetryPending = job.status === 'failed' && !waitingForCloud && !waitingForPlatform && !invalidBaseline && !job.watchdogTriagePending && automaticRetryEligible && autoRetryCount < pipelineRuntime.maxAutoRetries && pipelineRuntime.autoFillEnabled;
                 const waitingForResource = job.status === 'waiting_resource';
                 const waitingForUserQuery = job.status === 'waiting_review';
                 const injectionReviewIndexes = Array.isArray(job.injectionReviewPending?.bugIndexes)
@@ -1602,6 +1676,8 @@ function App() {
                   ? (job.replacementJobId ? '已废弃，替补已创建' : '已废弃，等待替补')
                   : waitingForCloud
                   ? '等待连接云盘'
+                  : waitingForPlatform
+                  ? '等待连接提交平台'
                   : invalidBaseline
                     ? '失败，项目基线不合格'
                     : waitingForResource
@@ -1616,11 +1692,11 @@ function App() {
                         ? '等待自动重试'
                         : (pipelineStatusLabel[job.status] || job.status);
                 const canStart = ['draft'].includes(job.status);
-                const canRetry = ['failed', 'stopped'].includes(job.status) && !waitingForCloud && !job.watchdogTriagePending;
+                const canRetry = ['failed', 'stopped'].includes(job.status) && !waitingForCloud && !waitingForPlatform && !job.watchdogTriagePending;
                 const canStop = job.processActive || ['queued', 'running'].includes(job.status);
                 return (
                   <article className={`pipeline-job pipeline-job-${job.status}`} key={job.id}>
-                    <div className="pipeline-job-top"><div><strong>{job.id}</strong><span>{job.request?.repository}</span></div><span className={`status-chip ${effectiveRunning ? 'green' : job.status === 'passed' ? 'green' : job.status === 'abandoned' || job.status === 'failed' && !waitingForCloud && !automaticRetryPending ? 'red' : 'blue'}`}>{displayStatus}</span></div>
+                    <div className="pipeline-job-top"><div><strong>{job.id}</strong><span>{job.request?.repository}</span></div><span className={`status-chip ${effectiveRunning ? 'green' : job.status === 'passed' ? 'green' : job.status === 'abandoned' || job.status === 'failed' && !waitingForCloud && !waitingForPlatform && !automaticRetryPending ? 'red' : 'blue'}`}>{displayStatus}</span></div>
                     <div className="pipeline-bug-ids"><span>Bug ID</span>{jobBugIds.length ? jobBugIds.map((bugId) => <code key={bugId}>{bugId}</code>) : <em>尚未生成</em>}</div>
                     <div className="pipeline-job-meta"><span>{job.request?.bugCount} Bug</span><span>{job.request?.taskType}</span><span>创建 {formatCompletionTime(job.createdAt)}</span><span>轨迹尝试 {job.request?.maxTrajectoryAttempts}</span><span>自动重试 {autoRetryCount}/{pipelineRuntime.maxAutoRetries}</span><span>{passedStages}/{stages.length} 阶段</span>{job.replacementJobId && <span>替补 {job.replacementJobId}</span>}</div>
                     <div className="pipeline-progress"><span style={{ width: `${progress}%` }} /></div>
@@ -1744,7 +1820,7 @@ function App() {
             </div>
             <div className="toolbar"><div className="search-box"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 session、仓库或任务 ID" /></div><div className="completion-filter"><Clock3 size={14} /><span>完成</span><input type="date" aria-label="完成日期开始" title="完成日期开始" value={completedFrom} max={completedTo || undefined} onChange={(event) => setCompletedFrom(event.target.value)} /><i>至</i><input type="date" aria-label="完成日期结束" title="完成日期结束" value={completedTo} min={completedFrom || undefined} onChange={(event) => setCompletedTo(event.target.value)} />{(completedFrom || completedTo) && <button type="button" title="清除完成时间筛选" aria-label="清除完成时间筛选" onClick={() => { setCompletedFrom(''); setCompletedTo(''); }}><X size={13} /></button>}</div><select className="review-filter-select" aria-label="导出次数筛选" value={exportCountFilter} onChange={(event) => setExportCountFilter(event.target.value)}><option value="all">全部导出次数</option><option value="0">未导出</option><option value="1">导出 1 次</option><option value="2">导出 2 次</option><option value="3-plus">导出 3 次及以上</option></select><select className="review-filter-select" aria-label="轨迹上传状态筛选" value={trajectoryUploadFilter} onChange={(event) => setTrajectoryUploadFilter(event.target.value)}><option value="all">全部轨迹</option><option value="uploaded">轨迹已上传</option><option value="not-uploaded">轨迹未上传</option></select><select className="review-filter-select" aria-label="人工状态筛选" value={reviewFilter} onChange={(event) => setReviewFilter(event.target.value)}><option value="all">全部状态</option><option value="pending">待审核</option><option value="qualified">合格</option><option value="unqualified">不合格</option></select><div className="filter-tabs"><button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>全部</button><button className={filter === 'bugfix' ? 'active' : ''} onClick={() => setFilter('bugfix')}>Bugfix</button><button className={filter === 'diagnosis' ? 'active' : ''} onClick={() => setFilter('diagnosis')}>Diagnosis</button></div></div>
             <div className="task-list">
-              {pagedTasks.map((task, index) => { const trajectoryUploaded = hasRecordedTrajectoryUpload(task); const trajectorySkipped = task.status === 'skipped'; const proofReady = Boolean(task.verificationEvidenceRecorded) || hasUploadedVerificationEvidence(task); const pipelineJob = pipelineForTask(task); const pipelineStage = pipelineJob ? (pipelineJob.stages || []).find((stage) => stage.id === pipelineJob.currentStage) : null; const archivedExportReady = canExportArchivedTask(task); return <div className={`task-row review-${task.reviewStatus || 'none'} ${task.duplicateFields?.length ? 'identity-duplicate' : ''} ${activeTask?.id === task.id ? 'selected' : ''}`} key={task.id}><label className="task-select" title={task.archived ? archivedExportReady ? '云盘原件已恢复，可选择导出' : '历史记录缺少可校验的云盘原件' : task.status === 'running' ? '运行中的任务不能选择' : '选择用于审核、导出或重新生成'}><input type="checkbox" checked={selectedTaskIds.includes(task.id)} disabled={task.status === 'running' || !archivedExportReady} onChange={() => toggleTaskSelection(task.id)} /></label><button className="task-row-button" onClick={() => setActiveTask(task)}><span className="task-sequence">{pageStart + index + 1}</span><span className={`task-status ${task.status}`}>{task.status === 'passed' ? <CheckCircle2 size={17} /> : task.status === 'running' ? <Activity size={17} /> : ['failed', 'duplicate', 'skipped'].includes(task.status) ? <XCircle size={17} /> : <Clock3 size={17} />}</span><span className="task-copy"><strong>{taskSessionLabel(task)}</strong><span><b>{task.bug_id}</b><i>·</i><GitBranch size={13} />{task.repoName}<i>·</i>{task.task_type}{task.archived && <em className="workflow-chip">历史恢复</em>}{task.archived && task.archiveExportReady && <em className="workflow-chip">云盘原件可导出</em>}{pipelineJob && <em className="workflow-chip">流水线 · {pipelineStageDisplayLabel(pipelineStage) || pipelineStatusLabel[pipelineJob.status] || pipelineJob.status}</em>}{task.project_origin === 'generated_0to1' && <em className="workflow-chip">Codex 题目 · {task.project_generation_provider === 'deepseek' ? 'DeepSeek 项目' : 'Claude 项目'}</em>}{task.gitStatus === 'prepared' && <em className="workflow-chip">Gold 已准备</em>}{task.gitStatus === 'passed' && <em className="workflow-chip">{task.task_type === 'diagnosis' ? '红分支已交付' : '双修复已交付'}</em>}{Number(task.verification_policy_version || 0) >= VERIFICATION_POLICY_VERSION && <em className={proofReady ? 'workflow-chip' : 'rule-chip'}>验证证明 {proofReady ? '已上传' : '待完成'}</em>}{trajectorySkipped && <em className="rule-chip" title={task.pipelineFailureReason || task.pipelineSkipReason}>轨迹登记未完成 · 已跳过</em>}{task.workflowConflict && <em className="duplicate-chip">流程冲突</em>}{task.reviewStatus && <em className={`review-chip ${task.reviewStatus}`}>{reviewStatusLabel[task.reviewStatus]}</em>}{task.ruleIssues?.length > 0 && <em className="rule-chip">规则问题 {task.ruleIssues.length}</em>}{task.trajectoryValidationError && <em className="rule-chip">轨迹登记失败</em>}{task.duplicateFields?.length > 0 && <em className="duplicate-chip">{task.duplicateFields.map((field) => field === 'sessionId' ? 'session-id' : field).join(' + ')} 重复</em>}</span></span><span className={`task-upload ${trajectorySkipped ? 'skipped' : trajectoryUploaded ? 'uploaded' : 'not-uploaded'}`}><strong>{trajectorySkipped ? '不会上传' : trajectoryUploaded ? '已上传' : '未上传'}</strong><span>{task.archived && trajectoryUploaded ? '历史记录' : trajectorySkipped ? '已跳过' : '主轨迹'}</span></span><span className="task-completed"><strong>{formatCompletionTime(task.finishedAt)}</strong><span>完成时间</span></span><span className="task-export-count"><strong>{Number(task.exportCount || 0)}</strong><span>导出次数</span></span><span className="task-events"><strong>{task.eventCount ? formatNumber(task.eventCount) : statusLabel[task.status]}</strong><span>{task.eventCount ? 'events' : 'status'}</span></span><ChevronRight size={16} className="row-chevron" /></button></div>; })}
+              {pagedTasks.map((task, index) => { const trajectoryUploaded = hasRecordedTrajectoryUpload(task); const trajectorySkipped = task.status === 'skipped'; const platformImported = task.submissionPlatformImportStatus === 'imported'; const proofReady = Boolean(task.verificationEvidenceRecorded) || hasUploadedVerificationEvidence(task); const pipelineJob = pipelineForTask(task); const pipelineStage = pipelineJob ? (pipelineJob.stages || []).find((stage) => stage.id === pipelineJob.currentStage) : null; const archivedExportReady = canExportArchivedTask(task); return <div className={`task-row review-${task.reviewStatus || 'none'} ${task.duplicateFields?.length ? 'identity-duplicate' : ''} ${activeTask?.id === task.id ? 'selected' : ''}`} key={task.id}><label className="task-select" title={task.archived ? archivedExportReady ? '云盘原件已恢复，可选择导出' : '历史记录缺少可校验的云盘原件' : task.status === 'running' ? '运行中的任务不能选择' : '选择用于审核、导出或重新生成'}><input type="checkbox" checked={selectedTaskIds.includes(task.id)} disabled={task.status === 'running' || !archivedExportReady} onChange={() => toggleTaskSelection(task.id)} /></label><button className="task-row-button" onClick={() => setActiveTask(task)}><span className="task-sequence">{pageStart + index + 1}</span><span className={`task-status ${task.status}`}>{task.status === 'passed' ? <CheckCircle2 size={17} /> : task.status === 'running' ? <Activity size={17} /> : ['failed', 'duplicate', 'skipped'].includes(task.status) ? <XCircle size={17} /> : <Clock3 size={17} />}</span><span className="task-copy"><strong>{taskSessionLabel(task)}</strong><span><b>{task.bug_id}</b><i>·</i><GitBranch size={13} />{task.repoName}<i>·</i>{task.task_type}{task.archived && <em className="workflow-chip">历史恢复</em>}{task.archived && task.archiveExportReady && <em className="workflow-chip">云盘原件可导出</em>}{pipelineJob && <em className="workflow-chip">流水线 · {pipelineStageDisplayLabel(pipelineStage) || pipelineStatusLabel[pipelineJob.status] || pipelineJob.status}</em>}{task.project_origin === 'generated_0to1' && <em className="workflow-chip">Codex 题目 · {task.project_generation_provider === 'deepseek' ? 'DeepSeek 项目' : 'Claude 项目'}</em>}{task.gitStatus === 'prepared' && <em className="workflow-chip">Gold 已准备</em>}{task.gitStatus === 'passed' && <em className="workflow-chip">{task.task_type === 'diagnosis' ? '红分支已交付' : '双修复已交付'}</em>}{Number(task.verification_policy_version || 0) >= VERIFICATION_POLICY_VERSION && <em className={proofReady ? 'workflow-chip' : 'rule-chip'}>验证证明 {proofReady ? '已上传' : '待完成'}</em>}{trajectorySkipped && <em className="rule-chip" title={task.pipelineFailureReason || task.pipelineSkipReason}>轨迹登记未完成 · 已跳过</em>}{task.workflowConflict && <em className="duplicate-chip">流程冲突</em>}{task.reviewStatus && <em className={`review-chip ${task.reviewStatus}`}>{reviewStatusLabel[task.reviewStatus]}</em>}{task.ruleIssues?.length > 0 && <em className="rule-chip">规则问题 {task.ruleIssues.length}</em>}{task.trajectoryValidationError && <em className="rule-chip">轨迹登记失败</em>}{task.duplicateFields?.length > 0 && <em className="duplicate-chip">{task.duplicateFields.map((field) => field === 'sessionId' ? 'session-id' : field).join(' + ')} 重复</em>}</span></span><span className={`task-upload ${trajectorySkipped ? 'skipped' : trajectoryUploaded ? 'uploaded' : 'not-uploaded'}`}><strong>{trajectorySkipped ? '不会上传' : trajectoryUploaded ? '已上传' : '未上传'}</strong><span>{task.archived && trajectoryUploaded ? '历史记录' : trajectorySkipped ? '已跳过' : '主轨迹'}</span></span><span className={`task-platform-import ${platformImported ? 'imported' : 'not-imported'}`} title={task.submissionPlatformError || (platformImported ? `平台提交 ${task.submissionPlatformSubmissionId || ''}` : '尚未提交到数据系统')}><strong>{platformImported ? '已导入' : '未导入'}</strong><span>数据系统</span></span><span className="task-completed"><strong>{formatCompletionTime(task.finishedAt)}</strong><span>完成时间</span></span><span className="task-export-count"><strong>{Number(task.exportCount || 0)}</strong><span>导出次数</span></span><span className="task-events"><strong>{task.eventCount ? formatNumber(task.eventCount) : statusLabel[task.status]}</strong><span>{task.eventCount ? 'events' : 'status'}</span></span><ChevronRight size={16} className="row-chevron" /></button></div>; })}
               {!filteredTasks.length && <div className="empty-task-list">没有符合当前筛选条件的任务</div>}
             </div>
             {filteredTasks.length > 0 && <nav className="pagination" aria-label="任务队列分页"><span className="pagination-summary">第 {pageStart + 1}-{Math.min(pageStart + pageSize, filteredTasks.length)} 项，共 {filteredTasks.length} 项</span><label>每页<select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}><option value="10">10</option><option value="20">20</option><option value="50">50</option></select></label><div className="pagination-pages"><button type="button" title="上一页" aria-label="上一页" disabled={currentPage === 1} onClick={() => setPage((value) => Math.max(1, value - 1))}><ChevronLeft size={15} /></button>{Array.from({ length: totalPages }, (_, index) => index + 1).map((pageNumber) => <button type="button" className={pageNumber === currentPage ? 'active' : ''} aria-current={pageNumber === currentPage ? 'page' : undefined} key={pageNumber} onClick={() => setPage(pageNumber)}>{pageNumber}</button>)}<button type="button" title="下一页" aria-label="下一页" disabled={currentPage === totalPages} onClick={() => setPage((value) => Math.min(totalPages, value + 1))}><ChevronRight size={15} /></button></div></nav>}
@@ -1755,13 +1831,16 @@ function App() {
         </section>
 
         <section className="export-band">
-          <div className="export-copy"><div className="export-icon"><CloudUpload size={19} /></div><div><h2>交付数据</h2><p>主轨迹完成采集登记后自动上传并回填链接；红绿证明仍按 V5 规则校验。</p>{(cloudMessage || cloudState.lastError) && <span className={`cloud-message ${cloudState.lastError ? 'cloud-message-error' : ''}`}>{cloudMessage || cloudState.lastError}</span>}{exportFeedback.message && <span className={`cloud-message ${exportFeedback.error ? 'cloud-message-error' : ''}`}>{exportFeedback.message}</span>}</div></div>
+          <div className="export-copy"><div className="export-icon"><CloudUpload size={19} /></div><div><h2>交付数据</h2><p>主轨迹上传并通过交付校验后，新任务会自动提交质检平台。</p>{(cloudMessage || cloudState.lastError) && <span className={`cloud-message ${cloudState.lastError ? 'cloud-message-error' : ''}`}>{cloudMessage || cloudState.lastError}</span>}{(submissionPlatformMessage || submissionPlatformState.lastError) && <span className={`cloud-message ${submissionPlatformState.lastError ? 'cloud-message-error' : ''}`}>{submissionPlatformMessage || submissionPlatformState.lastError}</span>}{exportFeedback.message && <span className={`cloud-message ${exportFeedback.error ? 'cloud-message-error' : ''}`}>{exportFeedback.message}</span>}</div></div>
           <div className="export-actions cloud-actions">
             {cloudState.connected && <span className="cloud-connected"><CheckCircle2 size={14} />{cloudState.connectedAs}</span>}
             {cloudState.autoLoginConfigured && <span className="cloud-auto-login" title={cloudState.lastRefreshedAt ? `最近自动刷新：${formatCompletionTime(cloudState.lastRefreshedAt)}` : '凭据已保存到 macOS 钥匙串'}><RefreshCcw size={13} />自动登录</span>}
             {!cloudState.connected && <button className="secondary-button" onClick={openCloudLogin}><LogIn size={16} />{cloudState.autoLoginConfigured ? '重新连接' : '连接云盘'}</button>}
             {cloudState.connected && !cloudState.autoLoginConfigured && <button className="secondary-button" onClick={openCloudLogin}><LogIn size={16} />启用自动登录</button>}
             {(cloudState.connected || cloudState.autoLoginConfigured) && <button className="icon-button" disabled={cloudBusy} onClick={disconnectCloud} title="断开云盘并删除钥匙串凭据" aria-label="断开云盘并删除钥匙串凭据"><LogOut size={16} /></button>}
+            {submissionPlatformState.connected && <a className="cloud-connected" href="https://go.jzxhnh.com/u/submissions" target="_blank" rel="noreferrer"><CheckCircle2 size={14} />质检平台 · {submissionPlatformState.connectedAs}</a>}
+            {!submissionPlatformState.connected && <button className="secondary-button" onClick={openSubmissionPlatformLogin}><LogIn size={16} />{submissionPlatformState.autoLoginConfigured ? '重连提交平台' : '连接提交平台'}</button>}
+            {(submissionPlatformState.connected || submissionPlatformState.autoLoginConfigured) && <button className="icon-button" disabled={submissionPlatformBusy} onClick={disconnectSubmissionPlatform} title="断开提交平台并删除钥匙串凭据" aria-label="断开提交平台并删除钥匙串凭据"><LogOut size={16} /></button>}
             <button className="secondary-button" disabled={cloudBusy} onClick={openTrajectoryUpload}><CloudUpload size={16} />手动补传轨迹</button>
             <button className="secondary-button" disabled={!exportReady.length || excelExportProgress.busy} title={exportReady.length ? `导出 ${exportReady.length} 条已完成采集登记和云盘回填的任务` : '暂无已完成云盘回填的合格任务'} onClick={() => exportExcelWithTracking(exportReady)}><FileSpreadsheet size={16} />{excelExportProgress.busy ? `${excelExportProgress.phase === 'validating' ? '校验中' : excelExportProgress.phase === 'generating' ? '生成中' : '登记中'} ${excelExportProgress.completed}/${excelExportProgress.total}` : `Excel (${exportReady.length})`}</button>
           </div>
@@ -1784,7 +1863,7 @@ function App() {
             {activeTask.trajectoryValidationError && <div className="hard-rule-alert"><strong>轨迹文件违规</strong><p>{activeTask.trajectoryValidationError}</p></div>}
             {activeTask.gitStatus === 'failed' && <div className="hard-rule-alert"><strong>Git 准备流程未通过</strong><p>{Number(activeTask.workflow_version || 1) >= 3 ? '运行前必须完成 main 与每个 Bug 独立 orphan green 基线；修复结果发布到 bugN_green，并生成独立 bugN_red 验收快照。' : '运行前必须完成 Claude 生成的 main、对应编号的 bug_main / BUG_BASE 分支；修复结果由 Claude 发布到 test_model_fix。'}</p></div>}
             <dl className="detail-list">
-              <div><dt>任务 ID</dt><dd>{activeTask.id}</dd></div><div><dt>业务任务</dt><dd>{activeTask.bug_id}</dd></div><div><dt>Session</dt><dd>{taskSessionLabel(activeTask)}</dd></div>{activeTask.archived && <div><dt>记录状态</dt><dd>{activeTask.archiveExportReady ? '历史恢复 · 云盘原件已校验，可导出' : '历史恢复 · 本地工件尚未恢复'}</dd></div>}<div><dt>导出记录</dt><dd>共 {Number(activeTask.exportCount || 0)} 次（轨迹 {Number(activeTask.trajectoryExportCount || 0)} 次，Excel {Number(activeTask.excelExportCount || 0)} 次）{activeTask.lastExportedAt ? `；最近 ${formatCompletionTime(activeTask.lastExportedAt)}` : ''}</dd></div>
+              <div><dt>任务 ID</dt><dd>{activeTask.id}</dd></div><div><dt>业务任务</dt><dd>{activeTask.bug_id}</dd></div><div><dt>Session</dt><dd>{taskSessionLabel(activeTask)}</dd></div>{activeTask.archived && <div><dt>记录状态</dt><dd>{activeTask.archiveExportReady ? '历史恢复 · 云盘原件已校验，可导出' : '历史恢复 · 本地工件尚未恢复'}</dd></div>}<div><dt>数据系统</dt><dd>{activeTask.submissionPlatformImported ? `已导入${activeTask.submissionPlatformSubmittedAt ? `；${formatCompletionTime(activeTask.submissionPlatformSubmittedAt)}` : ''}${activeTask.submissionPlatformSubmissionId ? `；提交 ${activeTask.submissionPlatformSubmissionId}` : ''}` : `未导入${activeTask.submissionPlatformError ? `；${activeTask.submissionPlatformError}` : ''}`}</dd></div><div><dt>导出记录</dt><dd>共 {Number(activeTask.exportCount || 0)} 次（轨迹 {Number(activeTask.trajectoryExportCount || 0)} 次，Excel {Number(activeTask.excelExportCount || 0)} 次）{activeTask.lastExportedAt ? `；最近 ${formatCompletionTime(activeTask.lastExportedAt)}` : ''}</dd></div>
               <div><dt>审核状态</dt><dd>{activeTask.reviewStatus ? reviewStatusLabel[activeTask.reviewStatus] : '轨迹尚未生成'}{activeTask.reviewStatusSource === 'rule' ? '（交付规则自动判定）' : ''}{activeTask.duplicateFields?.length > 0 ? `；重复字段：${activeTask.duplicateFields.map((field) => field === 'sessionId' ? 'session-id' : field).join('、')}` : ''}</dd></div>
               {Number(activeTask.verification_policy_version || 0) >= VERIFICATION_POLICY_VERSION && <div><dt>修复前证明</dt><dd>{activeTask.verification_evidence?.pre_fix?.trajectory_url ? `已上传 · ${activeTask.verification_evidence.pre_fix.result}` : activeTask.verificationEvidenceRecorded ? '已上传（历史记录）' : activeTask.verification_evidence?.pre_fix?.session_id ? '已生成，等待上传' : '等待新 Session 验证'}</dd></div>}
               {Number(activeTask.verification_policy_version || 0) >= VERIFICATION_POLICY_VERSION && <div><dt>修复后证明</dt><dd>{activeTask.task_type === 'diagnosis' ? '不需要（diagnosis 只传运行前证明）' : activeTask.verification_evidence?.post_fix?.trajectory_url ? `已上传 · ${activeTask.verification_evidence.post_fix.result}` : activeTask.verificationEvidenceRecorded ? '已上传（历史记录）' : activeTask.verification_evidence?.post_fix?.session_id ? '已生成，等待上传' : '等待新 Session 验证'}</dd></div>}
@@ -1802,6 +1881,7 @@ function App() {
       )}
       {showRuleValidator && <div className="drawer-backdrop" onClick={() => setShowRuleValidator(false)}><aside className="detail-drawer rule-drawer" onClick={(event) => event.stopPropagation()}><div className="drawer-header"><div><span className="drawer-kicker">SCHEMA / GO LABEL</span><h2>交付字段校验</h2></div><button className="icon-button" onClick={() => setShowRuleValidator(false)} title="关闭校验" aria-label="关闭校验"><X size={18} /></button></div><p className="rule-intro">校验标注字段、项目证据和交付条件；主轨迹只登记原始文件，红绿证明按 V5 规则校验。</p><label className="rule-upload"><FileJson size={16} /><span>{ruleFileName || '选择 JSON 文件'}</span><input type="file" accept="application/json,.json" onChange={handleRuleFile} /></label><textarea className="rule-textarea" value={ruleInput} onChange={(event) => { setRuleInput(event.target.value); setRuleResult(null); }} placeholder="粘贴待校验的标注行 JSON 内容…" spellCheck="false" /><div className="rule-actions"><button className="secondary-button" disabled={!exportReady.length} onClick={() => { setRuleInput(JSON.stringify(exportReady.map(taskToRuleRecord), null, 2)); setRuleFileName('采集登记及云盘回填完成题目（17 字段）'); setRuleResult(null); }}><FileJson size={15} />载入合格 JSON</button><button className="primary-button" onClick={() => validateRuleJson()}><CheckCheck size={15} />开始校验</button></div>{ruleResult && <div className={`rule-result ${ruleResult.ok ? 'rule-result-ok' : 'rule-result-fail'}`}><div className="rule-result-heading">{ruleResult.ok ? <CheckCircle2 size={18} /> : <XCircle size={18} />}<strong>{ruleResult.ok ? `校验通过 · ${ruleResult.count} 条` : `校验失败 · ${ruleResult.issues.length} 个问题`}</strong></div>{ruleResult.ok ? <p>字段、项目证据和交付条件符合规则；轨迹内容质量未参与判定。</p> : <ul>{ruleResult.issues.map((issue, index) => <li key={`${issue.section}-${issue.message}-${index}`}><b>{issue.section}</b>：{issue.message}</li>)}</ul>}</div>}</aside></div>}
       {showCloudLogin && <div className="drawer-backdrop cloud-login-backdrop" onClick={() => !cloudBusy && setShowCloudLogin(false)}><form className="cloud-login-dialog" onSubmit={connectCloud} onClick={(event) => event.stopPropagation()}><div className="drawer-header"><div><span className="drawer-kicker">UPLOAD.JZXHNH.COM</span><h2>连接轨迹云盘</h2></div><button type="button" className="icon-button" onClick={() => setShowCloudLogin(false)} title="关闭" aria-label="关闭"><X size={18} /></button></div><p>密码仅保存到本机 macOS 钥匙串，用于会话失效后的自动登录；不会写入任务文件、Excel、日志或前端存储。</p><label>账号<input autoComplete="username" value={cloudUsername} onChange={(event) => setCloudUsername(event.target.value)} required /></label><label>密码<input type="password" autoComplete="current-password" value={cloudPassword} onChange={(event) => setCloudPassword(event.target.value)} required /></label>{cloudMessage && <div className="cloud-login-message">{cloudMessage}</div>}<button className="primary-button" disabled={cloudBusy} type="submit"><LogIn size={16} />{cloudBusy ? '连接中' : '连接并启用自动登录'}</button></form></div>}
+      {showSubmissionPlatformLogin && <div className="drawer-backdrop cloud-login-backdrop" onClick={() => !submissionPlatformBusy && setShowSubmissionPlatformLogin(false)}><form className="cloud-login-dialog" onSubmit={connectSubmissionPlatform} onClick={(event) => event.stopPropagation()}><div className="drawer-header"><div><span className="drawer-kicker">GO.JZXHNH.COM</span><h2>连接质检提交平台</h2></div><button type="button" className="icon-button" onClick={() => setShowSubmissionPlatformLogin(false)} title="关闭" aria-label="关闭"><X size={18} /></button></div><p>使用普通用户提交接口；密码只保存到本机 macOS 钥匙串，不写入任务、轨迹、日志或前端存储。</p><label>账号<input autoComplete="username" value={submissionPlatformUsername} onChange={(event) => setSubmissionPlatformUsername(event.target.value)} required /></label><label>密码<input type="password" autoComplete="current-password" value={submissionPlatformPassword} onChange={(event) => setSubmissionPlatformPassword(event.target.value)} required /></label>{submissionPlatformMessage && <div className="cloud-login-message">{submissionPlatformMessage}</div>}<button className="primary-button" disabled={submissionPlatformBusy} type="submit"><LogIn size={16} />{submissionPlatformBusy ? '连接中' : '连接并启用自动提交'}</button></form></div>}
       {showTrajectoryUpload && (
         <div className="drawer-backdrop trajectory-upload-backdrop" onClick={() => !cloudBusy && setShowTrajectoryUpload(false)}>
           <section className="trajectory-upload-dialog" role="dialog" aria-modal="true" aria-labelledby="trajectory-upload-title" onClick={(event) => event.stopPropagation()}>

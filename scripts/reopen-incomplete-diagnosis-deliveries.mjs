@@ -41,7 +41,7 @@ async function reopenProofMismatch(job, bug) {
   for (const stage of job.stages || []) {
     if (Number(stage.bugIndex) !== Number(bug.bugIndex)) continue;
     const suffix = String(stage.id || '').replace(`bug${bug.bugIndex}_`, '');
-    if (['pre_verify', 'cloud_upload', 'verification_finalize', 'delivery_ready'].includes(suffix)) resetStage(stage);
+    if (['pre_verify', 'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready'].includes(suffix)) resetStage(stage);
   }
   if (metadata.verification_evidence?.pre_fix) delete metadata.verification_evidence.pre_fix;
   delete metadata.verify_result;

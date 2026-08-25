@@ -17,6 +17,7 @@ export function classifyPipelineFailure(job = {}) {
   // malformed Bug record or a failed cloud upload.
   if (/resource-slots[\\/][^\s]*owner\.json|owner\.json\.\d+\.tmp/i.test(error)) return 'runner_infrastructure';
   if (/云盘/.test(error) || stage.endsWith('_cloud_upload')) return 'cloud_upload';
+  if (/提交平台|质检平台/.test(error) || stage.endsWith('_platform_submit')) return 'submission_platform';
   if (/生成前数据快照|等待数据快照超时|SEEK_HOLE|lseek\s*\([^)]*SEEK_HOLE|snapshot lock|快照锁|tar:\s*\(null\)/i.test(error)) return 'snapshot_infrastructure';
   if (/\[system:grader_collision\]|GRADER_COLLISION|grader[_ -]collision/i.test(error)) return 'grader_infrastructure';
   if (/\[system:audit_infrastructure\]|mutation-audit[\s\S]*(?:未记录\s*(?:PreToolUse|PostToolUse)|baseline.*missing)/i.test(error)) return 'audit_infrastructure';
@@ -62,6 +63,9 @@ export function pipelineRetryState(job) {
   const waitingForCloud = failed
     && String(job?.currentStage || '').endsWith('_cloud_upload')
     && /请先连接轨迹云盘/.test(String(job?.error || ''));
+  const waitingForPlatform = failed
+    && String(job?.currentStage || '').endsWith('_platform_submit')
+    && /请在任务系统中连接一次提交平台|请重新连接|钥匙串中没有找到提交平台凭据/.test(String(job?.error || ''));
   const failureCategory = classifyPipelineFailure(job);
   const legacyPublishedBaseline = Number(job?.workflowVersion || 1) < 2 && failureCategory === 'main_baseline_validation';
   const nonRetryable = failed && (failureCategory === 'git_baseline_conflict' || legacyPublishedBaseline);
@@ -70,9 +74,10 @@ export function pipelineRetryState(job) {
     maxRetries: MAX_PIPELINE_AUTO_RETRIES,
     failureCategory,
     waitingForCloud,
+    waitingForPlatform,
     nonRetryable,
-    exhausted: failed && !waitingForCloud && !nonRetryable && retryCount >= MAX_PIPELINE_AUTO_RETRIES,
-    automaticRetryPending: failed && !waitingForCloud && !nonRetryable && retryCount < MAX_PIPELINE_AUTO_RETRIES,
+    exhausted: failed && !waitingForCloud && !waitingForPlatform && !nonRetryable && retryCount >= MAX_PIPELINE_AUTO_RETRIES,
+    automaticRetryPending: failed && !waitingForCloud && !waitingForPlatform && !nonRetryable && retryCount < MAX_PIPELINE_AUTO_RETRIES,
   };
 }
 
@@ -80,6 +85,8 @@ export function pipelineAbandonmentState(job) {
   const retry = pipelineRetryState(job);
   const terminalFailure = job?.status === 'failed'
     && !retry.waitingForCloud
+    && !retry.waitingForPlatform
+    && retry.failureCategory !== 'submission_platform'
     && (retry.nonRetryable || retry.exhausted);
   const approved = Boolean(job?.abandonmentApprovedAt);
   return {
@@ -183,7 +190,7 @@ export function pipelineCentralPriority(job = {}) {
   // keeping downstream generation and delivery stages ahead of planning.
   if (isStoppedProjectPlanning(job)) return 45;
   const stage = String(nextPipelineStage(job) || job.currentStage || '');
-  if (/^bug\d+_(?:post_verify|verification_coverage|cloud_upload|verification_finalize|delivery_ready)$/.test(stage)) return 10;
+  if (/^bug\d+_(?:post_verify|verification_coverage|cloud_upload|verification_finalize|platform_submit|delivery_ready)$/.test(stage)) return 10;
   if (/^bug\d+_/.test(stage)) return 20;
   if (['project_validate', 'main_freeze', 'main_publish'].includes(stage)) return 30;
   if (stage === 'project_generate') return 40;

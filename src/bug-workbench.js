@@ -83,8 +83,8 @@ export function bugExecutionSubphaseLabel(value = '') {
 export function bugExecutionPhaseIndex(value = '', stage = '') {
   const phase = text(value);
   const stageId = text(stage);
-  if (/git_publication|git_publication_complete|cloud_upload|verification_finalize|delivery_ready/.test(phase)
-    || /(?:^|_)git_publication(?:$|_)|(?:^|_)(?:cloud_upload|verification_finalize|delivery_ready)(?:$|_)/.test(stageId)) return 5;
+  if (/git_publication|git_publication_complete|cloud_upload|verification_finalize|platform_submit|delivery_ready/.test(phase)
+    || /(?:^|_)git_publication(?:$|_)|(?:^|_)(?:cloud_upload|verification_finalize|platform_submit|delivery_ready)(?:$|_)/.test(stageId)) return 5;
   if (/docker_checkpoint|docker|package_validation/.test(phase)
     || /(?:^|_)docker_validation(?:$|_)|(?:^|_)package_validation(?:$|_)/.test(stageId)) return 4;
   if (/red_green_checkpoint|red_green|pre_verify|post_verify/.test(phase)
