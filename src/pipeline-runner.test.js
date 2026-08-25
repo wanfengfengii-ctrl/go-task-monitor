@@ -387,6 +387,42 @@ test('stale diagnosis task prompts are sanitized before a Claude retry', async (
   }
 });
 
+test('completed diagnosis trajectories restore their manifest-bound prompt before a platform retry', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'diagnosis-prompt-restore-'));
+  try {
+    const original = '任务使用旧版本重试后错误推进。\n\n公开复现命令：go test ./service -run TestExisting -count=1';
+    const rewritten = '任务使用旧版本重试后错误推进。';
+    const sessionId = '11111111-2222-4333-8444-555555555555';
+    const trajectoryDir = path.join(root, 'trajectory');
+    await mkdir(trajectoryDir, { recursive: true });
+    await writeFile(path.join(root, 'public.json'), JSON.stringify({
+      task_type: 'diagnosis',
+      user_query: rewritten,
+      verify_cmds: [],
+    }));
+    await writeFile(path.join(root, 'PROMPT.md'), `${rewritten}\n`);
+    await writeFile(path.join(trajectoryDir, `raw.native.${sessionId}.jsonl`), `${JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: original },
+    })}\n`);
+    await writeFile(path.join(trajectoryDir, 'runner-manifest.json'), JSON.stringify({
+      prompt_sha256: createHash('sha256').update(original).digest('hex'),
+      raw_filename: `raw.native.${sessionId}.jsonl`,
+    }));
+
+    const result = await sanitizeModelFacingDiagnosisTask({ taskDir: root, taskType: 'diagnosis' }, {
+      discovery: { user_query: rewritten },
+    });
+
+    assert.equal(result.restoredFromTrajectory, true);
+    assert.equal(result.changed, true);
+    assert.equal((await readFile(path.join(root, 'PROMPT.md'), 'utf8')).trim(), original);
+    assert.equal(JSON.parse(await readFile(path.join(root, 'public.json'), 'utf8')).user_query, original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('diagnosis normalization makes the public test run without an internal prefix', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'diagnosis-test-normalize-'));
   try {
@@ -1516,7 +1552,7 @@ test('fresh Claude sessions receive ordinary project context without acceptance-
   assert.match(runner, /Run only an explicitly public reproduction/);
   assert.match(runner, /Do not run broad go test \.\/\.\.\., go vet \.\/\.\.\., go build \.\/\.\.\., Docker/);
   assert.match(runner, /Do not author any new bug-specific test, TestModel_ test, helper, script, or fixture/);
-  assert.match(runner, /never create a new TestModel_ or other bug-specific test/);
+  assert.match(runner, /tests are immutable in this Session and are authored independently after you exit/);
   assert.match(runner, /-iname 'BUG_REPRO\*'/);
   assert.doesNotMatch(runner, /-iname '\*answer\*'|-iname '\*solution\*'|-iname '\*patch\*'|-iname '\*gold\*'/);
   assert.match(runner, /deny file-read\* \(subpath \\"\$project_root\\"\)/);
@@ -2563,6 +2599,7 @@ test('Claude runner captures an original complete trajectory and keeps Docker ta
   assert.match(runner, /backend=docker-target/);
   assert.match(runner, /target_cli=Claude Code CLI/);
   assert.match(runner, /target_cli_version=\$claude_code_version \(Claude Code\)/);
+  assert.match(runner, /target_cli_version=\$claude_code_version \(Claude Code\)[\s\S]+Claude diagnosis checkpoint complete; skipping Docker\/Git repair delivery/);
   assert.match(pipeline, /Claude runner exited successfully without required trajectory capture/);
   assert.match(runner, /validator_args=\(--static-only/);
   assert.match(runner, /--baseline=\$sandbox_pristine/);
@@ -2933,6 +2970,9 @@ test('structured Codex calls use clean sessions, real health probes, and shared 
   assert.match(operations, /stage === 'project_plan' \|\| stage === 'codex_injection_plan' \|\| stage === 'codex_injection'/);
   assert.match(operations, /return \{ pool: 'codex-structured', limit: 2, weight: 1 \}/);
   assert.match(operations, /loadRatio >= 1\.2 \? 1 : limit/);
+  assert.doesNotMatch(operations, /node:os/);
+  assert.match(pipeline, /loadAverage: os\.loadavg\(\)\[0\],[\s\S]{0,80}cpuCount: os\.cpus\(\)\.length/);
+  assert.match(server, /collectHostResourceSnapshot\(\{[\s\S]{0,160}loadAverage: os\.loadavg\(\)\[0\],[\s\S]{0,80}cpuCount: os\.cpus\(\)\.length,[\s\S]{0,80}freeMemoryBytes: os\.freemem\(\),[\s\S]{0,80}totalMemoryBytes: os\.totalmem\(\)/);
   assert.match(pipeline, /async function runInjectionCodexJson\(options\)/);
   assert.match(pipeline, /acquireStageResourceSlot\(options\.jobFile, 'codex_injection'/);
   assert.match(pipeline, /const result = await runInjectionCodexJson\(\{ jobFile, stageId: sourceStage/);
@@ -3153,6 +3193,16 @@ test('export record writes invalidate the task snapshot before the UI refreshes 
   assert.doesNotMatch(writer, /graceMs/);
 });
 
+test('an invalidated in-flight task discovery cannot republish its stale snapshot', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  const start = server.indexOf('async function discoverTasks({ allowStale = false } = {})');
+  const end = server.indexOf('async function discoverTasksFresh()', start);
+  const discovery = server.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(discovery, /if \(generation !== taskDiscoveryCache\.generation\) \{\s*taskDiscoveryCache\.expiresAt = 0;\s*return value;\s*\}/);
+  assert.doesNotMatch(discovery, /generation === taskDiscoveryCache\.generation\s*\?\s*TASK_DISCOVERY_CACHE_TTL_MS\s*:\s*TASK_DISCOVERY_DIRTY_SNAPSHOT_TTL_MS/);
+});
+
 test('completed Bug workbench requests are idempotently ignored after delivery', async () => {
   const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
   assert.match(server, /isPipelineBugDeliveryComplete\(job, index\)/);
@@ -3268,8 +3318,32 @@ test('new pipelines submit the strictly validated delivery to the normal review 
   assert.match(server, /preparePlatformSubmission\(task, schema\.payload\)/);
   assert.match(server, /submissionPlatformRequest\('\/submissions', \{ method: 'POST', body: form \}\)/);
   assert.match(server, /findRemoteSubmission\(task\.bug_id\)/);
+  assert.match(server, /const SUBMISSION_PLATFORM_PAGE_SIZE = 50/);
+  assert.doesNotMatch(server, /page_size: '100'/);
   assert.match(server, /platformSubmissionFingerprint\(submission\)/);
+  assert.match(server, /validatePlatformVerificationCompatibility\(task, submission\)/);
+  assert.match(server, /reconcileSubmissionPlatformReviews\(\)/);
+  assert.match(server, /platformReviewReason/);
+  assert.match(server, /postSubmissionPlatformRepair\(submissionId, submission\)/);
+  assert.match(server, /\/submissions\/mine\/\$\{encodeURIComponent\(submissionId\)\}\/resubmit/);
+  assert.match(server, /remoteBugId !== task\.bug_id/);
   assert.doesNotMatch(server, /admin\/import\/excel/);
+});
+
+test('delivered public root-cause repairs are not overwritten by stale discovery drafts', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  assert.match(server, /let resolvedRootCause = meta\.gold_root_cause \|\| goldRootCause;/);
+  assert.match(server, /if \(!resolvedRootCause && pipelineBug\?\.discovery\?\.failure_mechanism\)/);
+});
+
+test('Bugfix repair Sessions cannot mutate tests before the independent author stage', async () => {
+  const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
+  assert.match(runner, /bugfix_workspace_tests_unchanged\(\)/);
+  assert.match(runner, /--include='\*_test\.go'/);
+  assert.match(runner, /--include='testdata\/\*\*\*'/);
+  assert.match(runner, /do not create, delete, or modify any \*_test\.go file or anything under testdata/);
+  assert.match(runner, /INVALID_REPAIR_TEST_MUTATION=1/);
+  assert.match(runner, /exit 45/);
 });
 
 test('stage transitions keep the project runner lease instead of preempting the pipeline', async () => {

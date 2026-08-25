@@ -81,7 +81,7 @@ import {
 } from '../src/bug-policy.js';
 import { assessProjectDomain, prohibitedProjectDomainPolicyText } from '../src/project-domain-rules.js';
 import { buildVerificationResult, VERIFICATION_POLICY_VERSION } from '../src/verification-evidence.js';
-import { directPublicVerifyCommandIssues, verificationCommandsSha256 } from '../src/verification-proof.js';
+import { directPublicVerifyCommandIssues, isConcurrencyVerificationRecord, verificationCommandsSha256 } from '../src/verification-proof.js';
 import { verificationTestNamesFromCommand, buildModelVerificationPlan, goTestNames, isTableDrivenGoTest, modelVerificationPlanIssues, verificationTestPackage } from '../src/model-verification.js';
 import { normalizeDiagnosisPublicCommand, normalizeDiagnosisVerificationSource } from '../src/diagnosis-verification.js';
 import {
@@ -1974,7 +1974,11 @@ async function acquireStageResourceSlot(jobFile, stageId, {
   let waitLoggedAt = 0;
   while (true) {
   const effectiveSlotLimit = profile.pool === 'codex-structured'
-    ? pipelineStructuredCodexLimit({ configuredLimit: profile.limit })
+    ? pipelineStructuredCodexLimit({
+        configuredLimit: profile.limit,
+        loadAverage: os.loadavg()[0],
+        cpuCount: os.cpus().length,
+      })
     : profile.limit;
   for (let slot = 1; slot <= effectiveSlotLimit; slot += 1) {
     const slotDir = path.join(poolRoot, `slot-${slot}`);
@@ -6201,9 +6205,7 @@ async function reviewVerificationCoverage(jobFile, stageId, sourceDir, bug, veri
 }
 
 function isConcurrencyBug(bug) {
-  return ['concurrency', 'concurrency并发问题'].includes(bug?.bug_category)
-    || (Array.isArray(bug?.runtime_mechanisms) && bug.runtime_mechanisms.includes('concurrency_race'))
-    || /并发|竞态|data race|race condition|goroutine/i.test(`${bug?.failure_mechanism || ''} ${bug?.title || ''}`);
+  return isConcurrencyVerificationRecord(bug);
 }
 
 function targetTestCommand(gold, { repeat = DETERMINISTIC_TEST_RUNS, race = false } = {}) {
@@ -6729,6 +6731,62 @@ export function modelFacingDiagnosisQuery(userQuery, publicTargetCommand = '') {
   return command ? `${query}\n\n公开复现命令：${command}` : query;
 }
 
+function nativeTrajectoryUserPrompts(content) {
+  const prompts = [];
+  for (const line of String(content || '').split('\n')) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event?.type !== 'user') continue;
+    const messageContent = event?.message?.content;
+    const prompt = typeof messageContent === 'string'
+      ? messageContent.trim()
+      : Array.isArray(messageContent) && messageContent.every((block) => block?.type === 'text')
+        ? messageContent.map((block) => String(block?.text || '').trim()).filter(Boolean).join('\n').trim()
+        : '';
+    if (prompt) prompts.push(prompt);
+  }
+  return prompts;
+}
+
+async function restoreImmutableDiagnosisPrompt(taskDir, metadata) {
+  const artifactDirectories = ['trajectory', '.repair-checkpoint'];
+  let immutableManifestFound = false;
+  for (const directoryName of artifactDirectories) {
+    const directory = path.join(taskDir, directoryName);
+    const manifest = await readJson(path.join(directory, 'runner-manifest.json'), null);
+    if (!manifest?.prompt_sha256) continue;
+    immutableManifestFound = true;
+    const rawFilename = directoryName === 'trajectory'
+      && path.basename(String(manifest.raw_filename || '')) === manifest.raw_filename
+      ? manifest.raw_filename
+      : 'raw.native.jsonl';
+    const rawContent = await fsp.readFile(path.join(directory, rawFilename), 'utf8').catch(() => '');
+    const prompt = nativeTrajectoryUserPrompts(rawContent)
+      .find((candidate) => crypto.createHash('sha256').update(candidate).digest('hex') === manifest.prompt_sha256);
+    if (!prompt) continue;
+    const promptPath = path.join(taskDir, 'PROMPT.md');
+    const currentPrompt = await fsp.readFile(promptPath, 'utf8').catch(() => '');
+    const promptChanged = currentPrompt.trim() !== prompt;
+    const metadataChanged = String(metadata.user_query || '').trim() !== prompt;
+    if (promptChanged) await fsp.writeFile(promptPath, `${prompt}\n`, 'utf8');
+    if (metadataChanged) {
+      metadata.user_query = prompt;
+      await writeJsonAtomic(path.join(taskDir, 'public.json'), metadata);
+    }
+    return {
+      found: true,
+      changed: promptChanged || metadataChanged,
+      prompt,
+    };
+  }
+  return { found: false, immutableManifestFound, changed: false, prompt: '' };
+}
+
 // A task directory can outlive a failed attempt and its task_prepare stage.
 // Rebuild the model-facing copy immediately before every Claude retry so an
 // older guessed Test* command cannot survive in PROMPT.md/public.json.
@@ -6737,6 +6795,18 @@ export async function sanitizeModelFacingDiagnosisTask(task, bugRecord) {
   const publicPath = path.join(task.taskDir, 'public.json');
   const metadata = await readJson(publicPath, null);
   if (!metadata || String(metadata.task_type || '') !== 'diagnosis') return { sanitized: false };
+  const immutablePrompt = await restoreImmutableDiagnosisPrompt(task.taskDir, metadata);
+  if (immutablePrompt.found) {
+    return {
+      sanitized: true,
+      changed: immutablePrompt.changed,
+      restoredFromTrajectory: true,
+      publicTargetCommand: String(immutablePrompt.prompt).split(/\n\n公开复现命令：/i)[1]?.trim() || '',
+    };
+  }
+  if (immutablePrompt.immutableManifestFound) {
+    return { sanitized: false, changed: false, preservedImmutableArtifacts: true };
+  }
   const baseQuery = String(bugRecord?.discovery?.user_query || '').trim()
     || String(metadata.user_query || '').split(/\n\n公开复现命令：/i)[0].trim();
   let confirmedCommand = '';

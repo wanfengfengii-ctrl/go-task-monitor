@@ -1,5 +1,3 @@
-import os from 'node:os';
-
 export const PIPELINE_CONTROL_MODES = new Set(['running', 'paused', 'draining', 'emergency_stopped']);
 
 export function normalizePipelineControlMode(value, autoFillEnabled = true) {
@@ -111,8 +109,8 @@ export function pipelineRepairWorkerLimit(environment = globalThis.process?.env 
 
 export function pipelineStructuredCodexLimit({
   configuredLimit = 2,
-  loadAverage = os.loadavg()[0],
-  cpuCount = os.cpus().length,
+  loadAverage = 0,
+  cpuCount = 1,
 } = {}) {
   const limit = Math.max(1, Math.min(2, Number(configuredLimit) || 2));
   const normalizedCpuCount = Math.max(1, Number(cpuCount) || 1);
@@ -491,10 +489,10 @@ export function pipelineDockerMaintenanceAction(snapshot = {}, state = {}, {
 
 export function collectHostResourceSnapshot({
   statfs,
-  loadAverage = os.loadavg()[0],
-  cpuCount = os.cpus().length,
-  freeMemoryBytes = os.freemem(),
-  totalMemoryBytes = os.totalmem(),
+  loadAverage = 0,
+  cpuCount = 1,
+  freeMemoryBytes = 0,
+  totalMemoryBytes = 0,
   memoryAvailablePercent,
   dockerReclaimableBytes = null,
   dockerSystemReclaimableBytes = 0,

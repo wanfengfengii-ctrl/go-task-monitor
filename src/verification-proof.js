@@ -247,8 +247,61 @@ export function directVerificationExecutions(events) {
         command: String(block?.input?.command || ''),
         exitCode: result ? toolResultExitCode(result) : null,
         hasResult: Boolean(result),
+        isError: result?.is_error === true,
+        output: result ? toolResultText(result) : '',
       };
     }));
+}
+
+export function platformCompatibleVerificationProofIssues({
+  phase = '',
+  taskType = '',
+  verifyCmds = [],
+  trajectoryContent = '',
+} = {}) {
+  const issues = [];
+  let events;
+  try {
+    events = parseTrajectoryJson(String(trajectoryContent || ''));
+  } catch (error) {
+    return [`云端验证轨迹无法解析：${error.message}`];
+  }
+  const commands = Array.isArray(verifyCmds) ? verifyCmds.map((command) => String(command)) : [];
+  const executions = directVerificationExecutions(events);
+  if (executions.length !== commands.length) {
+    issues.push(`云端验证轨迹必须逐条执行 ${commands.length} 条 verify_cmds，实际 ${executions.length} 条`);
+  }
+  let targetCount = 0;
+  executions.forEach((execution, index) => {
+    const command = commands[index] || '';
+    if (execution.command !== command) {
+      issues.push(`云端验证轨迹第 ${index + 1} 条 Bash 命令与 verify_cmds 不一致`);
+      return;
+    }
+    if (!execution.id || !execution.hasResult || !Number.isInteger(execution.exitCode)) {
+      issues.push(`云端验证轨迹第 ${index + 1} 条命令缺少可配对的 tool_result 或真实退出码`);
+      return;
+    }
+    if (verificationCommandKind(command, taskType) !== 'target') return;
+    targetCount += 1;
+    if (phase === 'pre_fix') {
+      if (execution.exitCode === 0 || !execution.isError) {
+        issues.push(`pre_fix 第 ${index + 1} 条目标命令没有以非零退出码呈红`);
+        return;
+      }
+      if (!/(?:^|\n)Exit code\s+[1-9]\d*(?:\n|$)/i.test(execution.output)) {
+        issues.push(`pre_fix 第 ${index + 1} 条目标命令未在 tool_result 中显式记录非零 Exit code`);
+      }
+      if (DIRECT_GO_TEST_PATTERN.test(command)
+        && !/(?:^|\n)(?:--- FAIL:|FAIL(?:\s|\t|$)|panic:|#\s+\S+)|\[(?:build failed|setup failed)\]/im.test(execution.output)) {
+        issues.push(`pre_fix 第 ${index + 1} 条 go test 结果缺少可识别的 FAIL、panic 或构建失败输出`);
+      }
+    } else if (phase === 'post_fix' && execution.exitCode !== 0) {
+      issues.push(`post_fix 第 ${index + 1} 条目标命令未呈绿`);
+    }
+  });
+  if (!targetCount) issues.push('云端验证轨迹中缺少可识别的目标 Bug 命令');
+  return [...new Set(issues)];
 }
 
 function toolResultOutput(events) {

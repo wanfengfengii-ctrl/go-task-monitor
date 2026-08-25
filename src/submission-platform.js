@@ -4,6 +4,24 @@ import { prepareExcelRecord } from './export-rules.js';
 export const DEFAULT_SUBMISSION_PLATFORM_URL = 'https://go.jzxhnh.com';
 export const SUBMISSION_ACTIVITY_TIME_ZONE = 'Asia/Shanghai';
 
+export const PLATFORM_REVIEW_STATUS_LABELS = Object.freeze({
+  PENDING_FIRST_REVIEW: '待初审',
+  FIRST_REVIEWING: '初审中',
+  FIRST_REVIEW_ERROR: '初审异常',
+  FIRST_PASSED: '初审通过',
+  FINAL_REVIEWING: '终审中',
+  FINAL_REVIEW_ERROR: '终审异常',
+  FINAL_PASSED: '已通过',
+  SYNCING: '同步中',
+  SYNC_FAILED: '同步失败',
+  SYNCED: '已同步',
+  PENDING_FIX: '待返修',
+  DISCARDED: '已废弃',
+});
+const PLATFORM_REVIEW_LABEL_STATUSES = Object.freeze(Object.fromEntries(
+  Object.entries(PLATFORM_REVIEW_STATUS_LABELS).map(([status, label]) => [label, status]),
+));
+
 function text(value) {
   return String(value ?? '').trim();
 }
@@ -75,7 +93,7 @@ export function buildSubmissionActivityStats(submissionRecords = [], reviewRecor
 }
 
 export function normalizePlatformFieldKey(value) {
-  return text(value).replace(/\s+/g, ' ').toLowerCase();
+  return text(value).replace(/[\s_-]+/g, ' ').toLowerCase();
 }
 
 export function extractPlatformFields(payload) {
@@ -148,6 +166,15 @@ export function preparePlatformSubmission(record, schemaPayload) {
   };
 }
 
+export function isLegacyDeliveredPlatformBackfill(job, bugIndex, currentPolicyVersion = 1) {
+  const index = Number(bugIndex);
+  if (!job || !Number.isInteger(index) || index < 1) return false;
+  if (Number(job.submissionPlatformPolicyVersion || 0) >= Number(currentPolicyVersion || 1)) return false;
+  const bug = (job.bugs || []).find((item) => Number(item?.bugIndex) === index);
+  const delivery = (job.stages || []).find((stage) => stage?.id === `bug${index}_delivery_ready`);
+  return bug?.disposition === 'delivered' && delivery?.status === 'passed';
+}
+
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (!value || typeof value !== 'object') return value;
@@ -199,17 +226,46 @@ export function extractPlatformSubmissionItems(payload) {
   return candidates.find((candidate) => Array.isArray(candidate)) || [];
 }
 
+export function extractPlatformSubmissionTotal(payload) {
+  const candidates = [payload?.data?.total, payload?.total, payload?.data?.count, payload?.count];
+  const total = candidates.map(Number).find((value) => Number.isFinite(value) && value >= 0);
+  return total ?? extractPlatformSubmissionItems(payload).length;
+}
+
 export function findPlatformSubmissionByBugId(payload, bugId) {
   const expected = text(bugId);
   return extractPlatformSubmissionItems(payload).find((item) => {
     const direct = item?.bug_id ?? item?.bugId;
     const nested = item?.data?.bug_id ?? item?.form_data?.bug_id;
-    return text(direct ?? nested) === expected;
+    const summaryBugId = text(item?.summary).split(/\s*\|\s*/, 1)[0];
+    return text(direct ?? nested) === expected || summaryBugId === expected;
   }) || null;
 }
 
 export function platformSubmissionId(payload) {
   return text(payload?.data?.id ?? payload?.data?.submission_id ?? payload?.id ?? payload?.submission_id);
+}
+
+export function mergePlatformSubmissionReview(record = {}, remote = {}, { observedAt = new Date().toISOString() } = {}) {
+  const rawStatus = text(remote?.status ?? remote?.review_status);
+  const status = PLATFORM_REVIEW_LABEL_STATUSES[rawStatus] || rawStatus.toUpperCase();
+  if (!status) return { ...record };
+  const reason = text(remote?.reject_reason ?? remote?.review_reason ?? remote?.discard_reason);
+  const label = PLATFORM_REVIEW_STATUS_LABELS[status] || status;
+  const version = Number(remote?.current_version ?? remote?.version);
+  const changed = status !== text(record?.platformReviewStatus).toUpperCase()
+    || reason !== text(record?.platformReviewReason)
+    || (Number.isFinite(version) && version !== Number(record?.platformCurrentVersion || 0));
+  return {
+    ...record,
+    platformReviewStatus: status,
+    platformReviewLabel: label,
+    platformReviewReason: reason,
+    platformCurrentVersion: Number.isFinite(version) && version > 0 ? version : Number(record?.platformCurrentVersion || 0) || null,
+    platformReviewUpdatedAt: changed
+      ? text(remote?.updated_at ?? remote?.reviewed_at) || observedAt
+      : record?.platformReviewUpdatedAt || null,
+  };
 }
 
 export function platformImportState(record) {
@@ -222,7 +278,12 @@ export function platformImportState(record) {
     submissionPlatformSubmissionId: text(record?.platformSubmissionId),
     submissionPlatformSubmittedAt: record?.submittedAt || null,
     submissionPlatformUrl: text(record?.platformUrl),
-    submissionPlatformError: text(record?.error),
+    submissionPlatformError: text(record?.error || record?.platformReviewReason),
+    submissionPlatformReviewStatus: text(record?.platformReviewStatus),
+    submissionPlatformReviewLabel: text(record?.platformReviewLabel),
+    submissionPlatformReviewReason: text(record?.platformReviewReason),
+    submissionPlatformReviewUpdatedAt: record?.platformReviewUpdatedAt || null,
+    submissionPlatformCurrentVersion: Number(record?.platformCurrentVersion || 0) || null,
   };
 }
 

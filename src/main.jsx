@@ -538,7 +538,7 @@ function App() {
   const [cloudPassword, setCloudPassword] = useState('');
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudMessage, setCloudMessage] = useState('');
-  const [submissionPlatformState, setSubmissionPlatformState] = useState({ connected: false, connectedAs: '', autoLoginConfigured: false, lastCheckedAt: null, lastRefreshedAt: null, lastError: '', submittedCount: 0, submissions: [] });
+  const [submissionPlatformState, setSubmissionPlatformState] = useState({ connected: false, connectedAs: '', autoLoginConfigured: false, lastCheckedAt: null, lastRefreshedAt: null, lastError: '', reviewLastSyncedAt: null, reviewLastError: '', pendingRepairCount: 0, reviewCounts: {}, submittedCount: 0, submissions: [] });
   const [showSubmissionPlatformLogin, setShowSubmissionPlatformLogin] = useState(false);
   const [submissionPlatformUsername, setSubmissionPlatformUsername] = useState('');
   const [submissionPlatformPassword, setSubmissionPlatformPassword] = useState('');
@@ -611,6 +611,10 @@ function App() {
       lastCheckedAt: payload.lastCheckedAt || null,
       lastRefreshedAt: payload.lastRefreshedAt || null,
       lastError: payload.lastError || '',
+      reviewLastSyncedAt: payload.reviewLastSyncedAt || null,
+      reviewLastError: payload.reviewLastError || '',
+      pendingRepairCount: Number(payload.pendingRepairCount || 0),
+      reviewCounts: payload.reviewCounts && typeof payload.reviewCounts === 'object' ? payload.reviewCounts : {},
       submittedCount: Number(payload.submittedCount || 0),
       submissions: Array.isArray(payload.submissions) ? payload.submissions : [],
     });
@@ -1846,6 +1850,7 @@ function App() {
             {cloudState.connected && !cloudState.autoLoginConfigured && <button className="secondary-button" onClick={openCloudLogin}><LogIn size={16} />启用自动登录</button>}
             {(cloudState.connected || cloudState.autoLoginConfigured) && <button className="icon-button" disabled={cloudBusy} onClick={disconnectCloud} title="断开云盘并删除钥匙串凭据" aria-label="断开云盘并删除钥匙串凭据"><LogOut size={16} /></button>}
             {submissionPlatformState.connected && <a className="cloud-connected" href="https://go.jzxhnh.com/u/submissions" target="_blank" rel="noreferrer"><CheckCircle2 size={14} />质检平台 · {submissionPlatformState.connectedAs}</a>}
+            {submissionPlatformState.pendingRepairCount > 0 && <span className="rule-chip" title={submissionPlatformState.reviewLastSyncedAt ? `最近同步：${formatCompletionTime(submissionPlatformState.reviewLastSyncedAt)}` : '等待同步平台审核状态'}>平台待返修 {submissionPlatformState.pendingRepairCount}</span>}
             {!submissionPlatformState.connected && <button className="secondary-button" onClick={openSubmissionPlatformLogin}><LogIn size={16} />{submissionPlatformState.autoLoginConfigured ? '重连提交平台' : '连接提交平台'}</button>}
             {(submissionPlatformState.connected || submissionPlatformState.autoLoginConfigured) && <button className="icon-button" disabled={submissionPlatformBusy} onClick={disconnectSubmissionPlatform} title="断开提交平台并删除钥匙串凭据" aria-label="断开提交平台并删除钥匙串凭据"><LogOut size={16} /></button>}
             <button className="secondary-button" disabled={cloudBusy} onClick={openTrajectoryUpload}><CloudUpload size={16} />手动补传轨迹</button>
@@ -1871,6 +1876,7 @@ function App() {
             {activeTask.gitStatus === 'failed' && <div className="hard-rule-alert"><strong>Git 准备流程未通过</strong><p>{Number(activeTask.workflow_version || 1) >= 3 ? '运行前必须完成 main 与每个 Bug 独立 orphan green 基线；修复结果发布到 bugN_green，并生成独立 bugN_red 验收快照。' : '运行前必须完成 Claude 生成的 main、对应编号的 bug_main / BUG_BASE 分支；修复结果由 Claude 发布到 test_model_fix。'}</p></div>}
             <dl className="detail-list">
               <div><dt>任务 ID</dt><dd>{activeTask.id}</dd></div><div><dt>业务任务</dt><dd>{activeTask.bug_id}</dd></div><div><dt>Session</dt><dd>{taskSessionLabel(activeTask)}</dd></div>{activeTask.archived && <div><dt>记录状态</dt><dd>{activeTask.archiveExportReady ? '历史恢复 · 云盘原件已校验，可导出' : '历史恢复 · 本地工件尚未恢复'}</dd></div>}<div><dt>数据系统</dt><dd>{activeTask.submissionPlatformImported ? `已导入${activeTask.submissionPlatformSubmittedAt ? `；${formatCompletionTime(activeTask.submissionPlatformSubmittedAt)}` : ''}${activeTask.submissionPlatformSubmissionId ? `；提交 ${activeTask.submissionPlatformSubmissionId}` : ''}` : `未导入${activeTask.submissionPlatformError ? `；${activeTask.submissionPlatformError}` : ''}`}</dd></div><div><dt>导出记录</dt><dd>共 {Number(activeTask.exportCount || 0)} 次（轨迹 {Number(activeTask.trajectoryExportCount || 0)} 次，Excel {Number(activeTask.excelExportCount || 0)} 次）{activeTask.lastExportedAt ? `；最近 ${formatCompletionTime(activeTask.lastExportedAt)}` : ''}</dd></div>
+              {activeTask.submissionPlatformReviewStatus && <div><dt>平台审核</dt><dd>{activeTask.submissionPlatformReviewLabel || activeTask.submissionPlatformReviewStatus}{activeTask.submissionPlatformReviewReason ? `；${activeTask.submissionPlatformReviewReason}` : ''}</dd></div>}
               <div><dt>审核状态</dt><dd>{activeTask.reviewStatus ? reviewStatusLabel[activeTask.reviewStatus] : '轨迹尚未生成'}{activeTask.reviewStatusSource === 'rule' ? '（交付规则自动判定）' : ''}{activeTask.duplicateFields?.length > 0 ? `；重复字段：${activeTask.duplicateFields.map((field) => field === 'sessionId' ? 'session-id' : field).join('、')}` : ''}</dd></div>
               {Number(activeTask.verification_policy_version || 0) >= VERIFICATION_POLICY_VERSION && <div><dt>修复前证明</dt><dd>{activeTask.verification_evidence?.pre_fix?.trajectory_url ? `已上传 · ${activeTask.verification_evidence.pre_fix.result}` : activeTask.verificationEvidenceRecorded ? '已上传（历史记录）' : activeTask.verification_evidence?.pre_fix?.session_id ? '已生成，等待上传' : '等待新 Session 验证'}</dd></div>}
               {Number(activeTask.verification_policy_version || 0) >= VERIFICATION_POLICY_VERSION && <div><dt>修复后证明</dt><dd>{activeTask.task_type === 'diagnosis' ? '不需要（diagnosis 只传运行前证明）' : activeTask.verification_evidence?.post_fix?.trajectory_url ? `已上传 · ${activeTask.verification_evidence.post_fix.result}` : activeTask.verificationEvidenceRecorded ? '已上传（历史记录）' : activeTask.verification_evidence?.post_fix?.session_id ? '已生成，等待上传' : '等待新 Session 验证'}</dd></div>}

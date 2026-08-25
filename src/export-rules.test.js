@@ -106,6 +106,8 @@ test('Chinese export fields reject embedded English narrative but keep identifie
     requireChineseText('修复后运行 `go test ./... -run TestProbe -count=1`，RecordProbe 和 EvidenceClosed 必须按 target 校验证据。', 'success_criteria', 'sample-task'),
     '修复后运行 `go test ./... -run TestProbe -count=1`，RecordProbe 和 EvidenceClosed 必须按 target 校验证据。',
   );
+  const curlQuery = '分批上报清洗循环后错误通过，请排查跨请求校验。\n\n公开复现命令：curl -i -X POST http://localhost:8080/v1/clearances/TASK_ID/cleaning-cycles -H \'Content-Type: application/json\' --data \'{"operation_id":"clean-cycle-2","expected_version":12,"cells":[{"segment_id":"A","parameter":"flow_rate_ml_per_min","value":100}]}\'';
+  assert.equal(requireChineseText(curlQuery, 'user_query', 'sample-task'), curlQuery);
 });
 
 test('Gold root cause builder rejects code prose that becomes English after Markdown removal', () => {

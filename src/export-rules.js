@@ -43,6 +43,8 @@ const englishProseWords = new Set([
 
 export function hasEnglishProse(value) {
   const text = String(value ?? '')
+    .replace(/```[\s\S]*?```/gu, ' ')
+    .replace(/(?:^|\n)\s*(?:公开复现命令|复现命令|验证命令)\s*[：:]\s*[^\n]*/gu, ' ')
     .replace(/`[^`]*`/gu, ' ')
     .replace(/https?:\/\/\S+/giu, ' ')
     .replace(/(?:[A-Za-z0-9_.*{}()-]+\/)+[A-Za-z0-9_.*{}()\/-]+/gu, ' ');
@@ -301,6 +303,7 @@ export function prepareExcelRecord(record) {
     : stripVerifyPassPrefix(record?.verify_result);
   const prepared = {
     ...record,
+    'session  id': record?.['session  id'] || record?.sessionId || record?.test_model_fix_session_id || '',
     bug_category: bugCategory,
     go_version: requirePinnedGoVersion(goVersion, record?.bug_id),
     trajectory: requireCloudTrajectoryUrl(record?.trajectory, record?.bug_id),

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assertVerificationExportMetadata, verificationExportMetadataIssues } from './verification-export-rules.js';
-import { directPublicVerifyCommandIssues, verificationCommandsSha256 } from './verification-proof.js';
+import { directPublicVerifyCommandIssues, isConcurrencyVerificationRecord, verificationCommandsSha256 } from './verification-proof.js';
 
 const commands = [
   "go test ./internal/sample -run '^TestRegression$' -count=1 -v",
@@ -163,6 +163,22 @@ test('direct verification allows regex alternation inside a quoted -run value', 
     directPublicVerifyCommandIssues(["go test ./internal/service -run '^TestRollback$' -count=1 | tee result.log"]).join(';'),
     /管道/,
   );
+});
+
+test('version and idempotency prose does not make a record a concurrency task', () => {
+  const record = {
+    bug_category: 'error',
+    runtime_mechanisms: ['state_machine_transition', 'idempotency_or_duplicate_delivery'],
+    failure_mechanism: '旧版本请求跨过并发控制边界并推进状态。',
+  };
+  assert.equal(isConcurrencyVerificationRecord(record), false);
+  assert.deepEqual(directPublicVerifyCommandIssues([
+    "go test ./internal/service -run '^TestInstrumentRetrySequence$' -count=1",
+  ], 'diagnosis', { concurrency: isConcurrencyVerificationRecord(record) }), []);
+  assert.equal(isConcurrencyVerificationRecord({
+    ...record,
+    runtime_mechanisms: [...record.runtime_mechanisms, 'concurrency_race'],
+  }), true);
 });
 
 test('diagnosis accepts a direct targeted test or real public go run command', () => {

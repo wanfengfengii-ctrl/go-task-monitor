@@ -631,6 +631,40 @@ export function reactivatePipelineBug(job, bugIndex, { resetAttempts = false } =
   return job;
 }
 
+export function reactivateFailedPipelineBugsForManualRetry(job, at = new Date().toISOString()) {
+  if (Number(job?.workflowVersion || 1) < 3) return [];
+  const failed = (job.bugs || [])
+    .filter((bug) => bug?.disposition === 'failed' || bug?.failureDisposition === 'auto_continued')
+    .map((bug) => ({ bug, index: Number(bug.bugIndex), stage: String(bug.failureStage || '') }))
+    .filter(({ index }) => Number.isInteger(index) && index > 0)
+    .sort((left, right) => left.index - right.index);
+  if (!failed.length) return [];
+
+  for (const { bug, index, stage } of failed) {
+    reactivatePipelineBug(job, index, { resetAttempts: false });
+    bug.workerExecution = {
+      ...(bug.workerExecution || {}),
+      status: 'fast_lane_queued',
+      currentStage: stage,
+      startedAt: null,
+      currentAttempt: 0,
+      blockedReason: '项目级人工重试已加入 Bug 队列',
+      lastAction: 'project_manual_retry',
+      updatedAt: at,
+    };
+  }
+  const pending = Array.isArray(job.pendingBugRetries) ? job.pendingBugRetries : [];
+  job.pendingBugRetries = [...new Set([
+    ...pending.map(Number).filter((index) => Number.isInteger(index) && index > 0),
+    ...failed.map(({ index }) => index),
+  ])].sort((left, right) => left - right);
+  job.currentStage = failed[0].stage || job.currentStage;
+  job.error = '';
+  job.finishedAt = null;
+  job.updatedAt = at;
+  return failed.map(({ index }) => index);
+}
+
 export function rewindPipelineBugAfterMissingTrajectory(job, bugIndex, at = new Date().toISOString()) {
   const normalizedIndex = Number(bugIndex);
   const bug = (job.bugs || []).find((item) => Number(item.bugIndex) === normalizedIndex);

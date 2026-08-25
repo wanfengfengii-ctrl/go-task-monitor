@@ -18,7 +18,7 @@ import { parseZipEntries } from './src/zip-reader.js';
 import { extractTrajectorySessionId, requireUniquePassedTaskForSession, selectPermanentSignedUrl } from './src/trajectory-upload-rules.js';
 import { parseTrajectoryJson } from './src/trajectory-file-validator.js';
 import { resolveTrajectoryManifestPrompt, validateTrajectoryManifest } from './src/trajectory-v4.js';
-import { validateVerificationProofBundle, verificationCommandsSha256 } from './src/verification-proof.js';
+import { platformCompatibleVerificationProofIssues, validateVerificationProofBundle, verificationCommandsSha256 } from './src/verification-proof.js';
 import { assertVerificationExportMetadata } from './src/verification-export-rules.js';
 import { buildGoldRootCause, requireDockerHarness } from './src/export-rules.js';
 import { createExportValidationTokenStore, EXCEL_EXPORT_VALIDATION_BATCH_SIZE } from './src/export-coordinator.js';
@@ -46,11 +46,15 @@ import {
   normalizeDiagnosisGitMetadata,
   resolvePinnedGoVersion,
 } from './src/review-rules.js';
-import { createPipelineStages, CURRENT_BUG_POLICY_VERSION, CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, CURRENT_WORKFLOW_POLICY_VERSION, CURRENT_WORKFLOW_VERSION, DEFAULT_BUG_COUNT, isPipelineBugDeliveryComplete, pipelineBugQuota, pipelineStageLayoutMatches, pipelineTaskOutcome, pipelineUserQueryReadiness, publicPipelineJob, reactivateFrozenVerificationFailures, reactivatePipelineBug, rewindPipelineBugAfterMissingTrajectory, upgradeSubmissionPlatformStageLayout, upgradeUnfinishedPipelineBugQuota, validatePipelineRequest } from './src/pipeline-rules.js';
+import { createPipelineStages, CURRENT_BUG_POLICY_VERSION, CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, CURRENT_WORKFLOW_POLICY_VERSION, CURRENT_WORKFLOW_VERSION, DEFAULT_BUG_COUNT, isPipelineBugDeliveryComplete, pipelineBugQuota, pipelineStageLayoutMatches, pipelineTaskOutcome, pipelineUserQueryReadiness, publicPipelineJob, reactivateFailedPipelineBugsForManualRetry, reactivateFrozenVerificationFailures, reactivatePipelineBug, rewindPipelineBugAfterMissingTrajectory, upgradeSubmissionPlatformStageLayout, upgradeUnfinishedPipelineBugQuota, validatePipelineRequest } from './src/pipeline-rules.js';
 import {
   buildSubmissionActivityStats,
   DEFAULT_SUBMISSION_PLATFORM_URL,
+  extractPlatformSubmissionItems,
+  extractPlatformSubmissionTotal,
   findPlatformSubmissionByBugId,
+  isLegacyDeliveredPlatformBackfill,
+  mergePlatformSubmissionReview,
   mergePlatformCookies,
   platformApiMessage,
   platformCsrfToken,
@@ -245,6 +249,7 @@ const submissionPlatformRecordsPath = path.join(managedLibraryRoot, 'validation/
 const submissionPlatformRecordsLockPath = `${submissionPlatformRecordsPath}.lock`;
 const submissionPlatformKeychainService = `go-task-monitor.submission-platform.${crypto.createHash('sha256').update(submissionPlatformBaseUrl).digest('hex').slice(0, 12)}`;
 const SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS = 2 * 60 * 1000;
+const SUBMISSION_PLATFORM_PAGE_SIZE = 50;
 function optionalPositiveLimit(value) {
   const parsed = Number(value);
   return String(value || '').trim() && Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
@@ -289,6 +294,9 @@ let submissionPlatformLastCheckedAt = null;
 let submissionPlatformLastRefreshedAt = null;
 let submissionPlatformLastError = '';
 const submissionPlatformSubmitTails = new Map();
+let submissionPlatformReviewSyncPromise = null;
+let submissionPlatformReviewLastSyncedAt = null;
+let submissionPlatformReviewLastError = '';
 let automaticUploadRunning = false;
 let pipelineCloudReconcileRunning = false;
 const automaticUploadRetryAt = new Map();
@@ -2184,6 +2192,10 @@ async function runSystemHealthChecks() {
       : 0;
     const resources = collectHostResourceSnapshot({
       statfs,
+      loadAverage: os.loadavg()[0],
+      cpuCount: os.cpus().length,
+      freeMemoryBytes: os.freemem(),
+      totalMemoryBytes: os.totalmem(),
       memoryAvailablePercent: memoryPercentMatch ? Number(memoryPercentMatch[1]) : undefined,
       dockerSystemReclaimableBytes,
       dockerBuilderReclaimableBytes,
@@ -4721,10 +4733,25 @@ async function upsertSubmissionPlatformRecord(record) {
 }
 
 async function findRemoteSubmission(bugId) {
-  const query = new URLSearchParams({ page: '1', page_size: '100', bug_id: bugId });
+  const query = new URLSearchParams({ page: '1', page_size: String(SUBMISSION_PLATFORM_PAGE_SIZE), bug_id: bugId });
   const { response, payload } = await submissionPlatformRequest(`/submissions/mine?${query}`);
   if (!response.ok) throw new Error(platformApiMessage(payload, `读取提交平台“我的提交”失败（HTTP ${response.status}）`));
   return findPlatformSubmissionByBugId(payload, bugId);
+}
+
+async function listRemoteSubmissions() {
+  const items = [];
+  const pageSize = SUBMISSION_PLATFORM_PAGE_SIZE;
+  for (let page = 1; page <= 100; page += 1) {
+    const query = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+    const { response, payload } = await submissionPlatformRequest(`/submissions/mine?${query}`);
+    if (!response.ok) throw new Error(platformApiMessage(payload, `读取提交平台审核状态失败（HTTP ${response.status}）`));
+    const pageItems = extractPlatformSubmissionItems(payload);
+    items.push(...pageItems);
+    const total = extractPlatformSubmissionTotal(payload);
+    if (!pageItems.length || items.length >= total || pageItems.length < pageSize) break;
+  }
+  return items;
 }
 
 async function postSubmissionPlatformRecord(submission) {
@@ -4732,6 +4759,110 @@ async function postSubmissionPlatformRecord(submission) {
   form.append('data', JSON.stringify(submission.data));
   form.append('trajectory_url', submission.trajectoryUrl);
   return submissionPlatformRequest('/submissions', { method: 'POST', body: form });
+}
+
+async function editablePlatformSubmission(submissionId) {
+  const { response, payload } = await submissionPlatformRequest(`/submissions/mine/${encodeURIComponent(submissionId)}/editable`);
+  if (!response.ok) throw new Error(platformApiMessage(payload, `读取平台返修数据失败（HTTP ${response.status}）`));
+  return payload?.data ?? payload;
+}
+
+async function postSubmissionPlatformRepair(submissionId, submission) {
+  const form = new FormData();
+  form.append('data', JSON.stringify(submission.data));
+  form.append('trajectory_url', submission.trajectoryUrl);
+  return submissionPlatformRequest(`/submissions/mine/${encodeURIComponent(submissionId)}/resubmit`, { method: 'POST', body: form });
+}
+
+async function validatePlatformVerificationCompatibility(task, submission) {
+  let verifyResult;
+  try {
+    verifyResult = JSON.parse(String(submission?.prepared?.verify_result || ''));
+  } catch (error) {
+    throw new Error(`${task.bug_id} 提交前证明兼容检查失败：verify_result 无法解析：${error.message}`);
+  }
+  const phases = task.task_type === 'diagnosis' ? ['pre_fix'] : ['pre_fix', 'post_fix'];
+  for (const phase of phases) {
+    const proofUrl = String(verifyResult?.[phase]?.trajectory_url || '').trim();
+    const artifactKind = phase === 'pre_fix' ? 'verify_pre' : 'verify_post';
+    const localProof = await readVerificationProof(task, artifactKind);
+    let response;
+    try {
+      response = await fetch(proofUrl, { redirect: 'follow', signal: AbortSignal.timeout(SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS) });
+    } catch (error) {
+      throw new Error(`${task.bug_id} ${phase} 云端证明不可读：${error.message}`);
+    }
+    if (!response.ok) throw new Error(`${task.bug_id} ${phase} 云端证明返回 HTTP ${response.status}`);
+    const remoteContent = await response.text();
+    const localContent = String(localProof.content || '');
+    const remoteSha256 = crypto.createHash('sha256').update(remoteContent).digest('hex');
+    const localSha256 = crypto.createHash('sha256').update(localContent).digest('hex');
+    if (remoteSha256 !== localSha256) {
+      throw new Error(`${task.bug_id} ${phase} 云端证明与本地已校验证明的 SHA-256 不一致`);
+    }
+    const issues = platformCompatibleVerificationProofIssues({
+      phase,
+      taskType: task.task_type,
+      verifyCmds: task.verify_cmds,
+      trajectoryContent: remoteContent,
+    });
+    if (issues.length) throw new Error(`${task.bug_id} ${phase} 不符合提交平台证明识别格式：${issues.join('；')}`);
+  }
+}
+
+function platformReviewFields(record = {}) {
+  return JSON.stringify([
+    record.platformSubmissionId || '',
+    record.submittedAt || '',
+    record.platformReviewStatus || '',
+    record.platformReviewLabel || '',
+    record.platformReviewReason || '',
+    record.platformReviewUpdatedAt || '',
+    Number(record.platformCurrentVersion || 0),
+  ]);
+}
+
+async function reconcileSubmissionPlatformReviews() {
+  if (submissionPlatformReviewSyncPromise) return submissionPlatformReviewSyncPromise;
+  if (!submissionPlatformCookie && !(submissionPlatformAutoLoginConfigured && submissionPlatformAutoLoginAccount)) return { updated: 0, remote: 0 };
+  const sync = (async () => {
+    const observedAt = new Date().toISOString();
+    const remoteItems = await listRemoteSubmissions();
+    let updated = 0;
+    await withFileLock(submissionPlatformRecordsLockPath, async () => {
+      const records = await readSubmissionPlatformRecords();
+      const next = records.map((record) => {
+        if (record?.status !== 'submitted' || !record?.bugId) return record;
+        const remote = findPlatformSubmissionByBugId({ items: remoteItems }, record.bugId);
+        if (!remote) return record;
+        const merged = mergePlatformSubmissionReview({
+          ...record,
+          platformSubmissionId: platformSubmissionId(remote) || record.platformSubmissionId,
+          submittedAt: remote.submitted_at || record.submittedAt,
+        }, remote, { observedAt });
+        if (platformReviewFields(merged) !== platformReviewFields(record)) updated += 1;
+        return merged;
+      });
+      if (updated) await writeSubmissionPlatformRecordsUnlocked(next);
+    }, { timeoutMs: 30_000, staleMs: 5 * 60_000 });
+    submissionPlatformReviewLastSyncedAt = observedAt;
+    submissionPlatformReviewLastError = '';
+    if (updated) {
+      invalidateTaskDiscoveryCache();
+      broadcast('data');
+      addLog('info', `已同步 ${updated} 条提交平台审核状态`);
+    }
+    return { updated, remote: remoteItems.length };
+  })();
+  submissionPlatformReviewSyncPromise = sync;
+  try {
+    return await sync;
+  } catch (error) {
+    submissionPlatformReviewLastError = error.message;
+    throw error;
+  } finally {
+    if (submissionPlatformReviewSyncPromise === sync) submissionPlatformReviewSyncPromise = null;
+  }
 }
 
 async function runSerializedSubmissionPlatformTask(taskId, callback) {
@@ -4748,14 +4879,19 @@ async function runSerializedSubmissionPlatformTask(taskId, callback) {
   }
 }
 
-async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId) {
+async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId, { allowLegacyDeliveredBackfill = false } = {}) {
   const job = await readPipelineJob(pipelineJobId);
-  if (!job || Number(job.submissionPlatformPolicyVersion || 0) < CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION) {
+  if (!job) throw new Error('流水线作业不存在');
+  const platformPolicyEnabled = Number(job.submissionPlatformPolicyVersion || 0) >= CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION;
+  const legacyBackfill = allowLegacyDeliveredBackfill
+    && isLegacyDeliveredPlatformBackfill(job, bugIndex, CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION);
+  if (!platformPolicyEnabled && !legacyBackfill) {
     throw new Error('流水线未启用提交平台策略');
   }
   const platformStage = (job.stages || []).find((stage) => stage.id === `bug${bugIndex}_platform_submit`);
   const finalizeStage = (job.stages || []).find((stage) => stage.id === `bug${bugIndex}_verification_finalize`);
-  if (!platformStage || !['running', 'passed'].includes(platformStage.status) || finalizeStage?.status !== 'passed') {
+  if (platformPolicyEnabled
+    && (!platformStage || !['running', 'passed'].includes(platformStage.status) || finalizeStage?.status !== 'passed')) {
     throw new Error('提交平台节点与验证完成节点状态不一致');
   }
   const task = await loadPipelineReviewTask(job, bugIndex, taskId);
@@ -4779,7 +4915,7 @@ async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId) {
 
     const remote = await findRemoteSubmission(task.bug_id);
     if (remote) {
-      const reconciled = {
+      const reconciled = mergePlatformSubmissionReview({
         taskId: task.id,
         bugId: task.bug_id,
         fingerprint,
@@ -4788,11 +4924,12 @@ async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId) {
         platformUrl: `${submissionPlatformBaseUrl}/u/submissions`,
         submittedAt: remote.submitted_at || remote.created_at || new Date().toISOString(),
         reconciledAt: new Date().toISOString(),
-      };
+      }, remote);
       await upsertSubmissionPlatformRecord(reconciled);
       return { ...reconciled, skipped: true, reconciled: true };
     }
 
+    await validatePlatformVerificationCompatibility(task, submission);
     const startedAt = new Date().toISOString();
     await upsertSubmissionPlatformRecord({
       taskId: task.id,
@@ -4807,7 +4944,7 @@ async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId) {
       if (result.response.status === 409) {
         const duplicate = await findRemoteSubmission(task.bug_id);
         if (duplicate) {
-          const reconciled = {
+          const reconciled = mergePlatformSubmissionReview({
             taskId: task.id,
             bugId: task.bug_id,
             fingerprint,
@@ -4816,7 +4953,7 @@ async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId) {
             platformUrl: `${submissionPlatformBaseUrl}/u/submissions`,
             submittedAt: duplicate.submitted_at || duplicate.created_at || new Date().toISOString(),
             reconciledAt: new Date().toISOString(),
-          };
+          }, duplicate);
           await upsertSubmissionPlatformRecord(reconciled);
           return { ...reconciled, skipped: true, reconciled: true };
         }
@@ -4825,7 +4962,7 @@ async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId) {
       await upsertSubmissionPlatformRecord({ taskId: task.id, bugId: task.bug_id, fingerprint, status: 'failed', startedAt, failedAt: new Date().toISOString(), error: message });
       throw new Error(message);
     }
-    const submitted = {
+    const submitted = mergePlatformSubmissionReview({
       taskId: task.id,
       bugId: task.bug_id,
       fingerprint,
@@ -4833,15 +4970,87 @@ async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId) {
       platformSubmissionId: platformSubmissionId(result.payload),
       platformUrl: `${submissionPlatformBaseUrl}/u/submissions`,
       submittedAt: new Date().toISOString(),
-    };
+    }, result.payload?.data || result.payload);
     await upsertSubmissionPlatformRecord(submitted);
     addLog('success', `${task.bug_id} 已提交质检平台`);
+    setTimeout(() => {
+      void reconcileSubmissionPlatformReviews().catch((error) => addLog('warn', `提交平台审核状态同步失败：${error.message}`));
+    }, 5_000).unref();
     return submitted;
+  });
+}
+
+async function resubmitTaskToPlatform(taskId, submissionId) {
+  const task = (await discoverTasksFresh()).find((item) => item.id === taskId);
+  if (!task) throw new Error('没有找到待返修任务');
+  if (task.status !== 'passed') throw new Error(`${task.bug_id} 尚未完成，不能返修提交`);
+  const qualified = (await readReviewStatuses()).some((record) => record.taskId === task.id && record.status === 'qualified');
+  if (!qualified) throw new Error(`${task.bug_id} 尚未通过本地交付审核`);
+  await validateTaskExcelVerification(task);
+  if (task.ruleIssues?.length) throw new Error(`${task.bug_id} 尚未满足交付规则：${task.ruleIssues.join('；')}`);
+  await readTrajectoryMetadata(task, { requireV4: await requiresV4Trajectory(task) });
+
+  const [schema, editable] = await Promise.all([
+    submissionPlatformRequest('/form/fields'),
+    editablePlatformSubmission(submissionId),
+  ]);
+  if (!schema.response.ok) throw new Error(platformApiMessage(schema.payload, `读取提交平台字段失败（HTTP ${schema.response.status}）`));
+  const remoteData = editable?.data ?? {};
+  const remoteBugId = String(remoteData?.bug_id ?? remoteData?.bugId ?? '').trim();
+  if (remoteBugId !== task.bug_id) {
+    throw new Error(`平台返修记录 ${submissionId} 属于 ${remoteBugId || '未知 BUG'}，不是 ${task.bug_id}`);
+  }
+  const submission = preparePlatformSubmission(task, schema.payload);
+  await validatePlatformVerificationCompatibility(task, submission);
+  const fingerprint = platformSubmissionFingerprint(submission);
+
+  return runSerializedSubmissionPlatformTask(task.id, async () => {
+    const startedAt = new Date().toISOString();
+    const result = await postSubmissionPlatformRepair(submissionId, submission);
+    if (!result.response.ok) {
+      const message = platformApiMessage(result.payload, `平台返修提交返回 HTTP ${result.response.status}`);
+      await upsertSubmissionPlatformRecord({
+        taskId: task.id,
+        bugId: task.bug_id,
+        fingerprint,
+        status: 'submitted',
+        platformSubmissionId: String(submissionId),
+        platformUrl: `${submissionPlatformBaseUrl}/u/detail/${submissionId}`,
+        repairAttemptedAt: startedAt,
+        repairError: message,
+      });
+      throw new Error(message);
+    }
+    const remote = result.payload?.data ?? result.payload ?? {};
+    const resubmitted = mergePlatformSubmissionReview({
+      taskId: task.id,
+      bugId: task.bug_id,
+      fingerprint,
+      status: 'submitted',
+      platformSubmissionId: String(submissionId),
+      platformUrl: `${submissionPlatformBaseUrl}/u/detail/${submissionId}`,
+      submittedAt: editable?.submitted_at || startedAt,
+      resubmittedAt: startedAt,
+      repairError: '',
+    }, { status: remote?.status || 'PENDING_FIRST_REVIEW', ...remote });
+    await upsertSubmissionPlatformRecord(resubmitted);
+    invalidateTaskDiscoveryCache();
+    broadcast('data');
+    addLog('success', `${task.bug_id} 已返修并重新提交质检平台`);
+    setTimeout(() => {
+      void reconcileSubmissionPlatformReviews().catch((error) => addLog('warn', `提交平台审核状态同步失败：${error.message}`));
+    }, 5_000).unref();
+    return resubmitted;
   });
 }
 
 async function submissionPlatformPublicState() {
   const records = await readSubmissionPlatformRecords();
+  const reviewCounts = records.reduce((counts, record) => {
+    const status = String(record?.platformReviewStatus || '').trim();
+    if (status) counts[status] = Number(counts[status] || 0) + 1;
+    return counts;
+  }, {});
   return {
     baseUrl: submissionPlatformBaseUrl,
     connected: Boolean(submissionPlatformCookie),
@@ -4850,8 +5059,12 @@ async function submissionPlatformPublicState() {
     lastCheckedAt: submissionPlatformLastCheckedAt,
     lastRefreshedAt: submissionPlatformLastRefreshedAt,
     lastError: submissionPlatformLastError,
+    reviewLastSyncedAt: submissionPlatformReviewLastSyncedAt,
+    reviewLastError: submissionPlatformReviewLastError,
+    reviewCounts,
+    pendingRepairCount: Number(reviewCounts.PENDING_FIX || 0),
     submittedCount: records.filter((record) => record.status === 'submitted').length,
-    submissions: records.map(({ taskId, bugId, status, platformSubmissionId: submissionId, platformUrl, submittedAt, error }) => ({
+    submissions: records.map(({ taskId, bugId, status, platformSubmissionId: submissionId, platformUrl, submittedAt, error, platformReviewStatus: reviewStatus, platformReviewLabel: reviewLabel, platformReviewReason: reviewReason, platformReviewUpdatedAt: reviewUpdatedAt, platformCurrentVersion: currentVersion }) => ({
       taskId,
       bugId,
       status,
@@ -4859,6 +5072,11 @@ async function submissionPlatformPublicState() {
       platformUrl,
       submittedAt,
       error,
+      reviewStatus,
+      reviewLabel,
+      reviewReason,
+      reviewUpdatedAt,
+      currentVersion,
     })),
   };
 }
@@ -5785,10 +6003,12 @@ async function discoverTasks({ allowStale = false } = {}) {
   }
   const generation = taskDiscoveryCache.generation;
   const discovery = discoverTasksFresh().then((value) => {
+    if (generation !== taskDiscoveryCache.generation) {
+      taskDiscoveryCache.expiresAt = 0;
+      return value;
+    }
     taskDiscoveryCache.value = value;
-    taskDiscoveryCache.expiresAt = Date.now() + (generation === taskDiscoveryCache.generation
-      ? TASK_DISCOVERY_CACHE_TTL_MS
-      : TASK_DISCOVERY_DIRTY_SNAPSHOT_TTL_MS);
+    taskDiscoveryCache.expiresAt = Date.now() + TASK_DISCOVERY_CACHE_TTL_MS;
     return value;
   });
   taskDiscoveryCache.promise = discovery;
@@ -5894,7 +6114,7 @@ async function discoverTasksFresh() {
         const resolvedGoldFiles = pipelineBug?.discovery?.target_files || meta.gold_files || meta.target_files || [];
         const resolvedGoldSymbols = pipelineBug?.discovery?.symbols || meta.gold_symbols || meta.symbols || [];
         let resolvedRootCause = meta.gold_root_cause || goldRootCause;
-        if (pipelineBug?.discovery?.failure_mechanism) {
+        if (!resolvedRootCause && pipelineBug?.discovery?.failure_mechanism) {
           resolvedRootCause = (() => {
             try {
               return buildGoldRootCause(pipelineBug.discovery);
@@ -7457,6 +7677,7 @@ const server = http.createServer(async (request, response) => {
           requestedJob.manualRetryRequestedAt = new Date().toISOString();
           requestedJob.retryRequestedAt = requestedJob.manualRetryRequestedAt;
           requestedJob.updatedAt = requestedJob.manualRetryRequestedAt;
+          reactivateFailedPipelineBugsForManualRetry(requestedJob, requestedJob.manualRetryRequestedAt);
           await writePipelineJob(requestedJob);
         }
         let job;
@@ -7523,6 +7744,14 @@ const server = http.createServer(async (request, response) => {
     if (request.url === '/api/submission-platform/status' && request.method === 'GET') {
       return json(response, 200, await submissionPlatformPublicState());
     }
+    if (request.url === '/api/submission-platform/sync' && request.method === 'POST') {
+      try {
+        const result = await reconcileSubmissionPlatformReviews();
+        return json(response, 200, { message: `已同步 ${result.updated} 条审核变化`, result, ...(await submissionPlatformPublicState()) });
+      } catch (error) {
+        return json(response, 409, { message: error.message, ...(await submissionPlatformPublicState().catch(() => ({}))) });
+      }
+    }
     if (request.url === '/api/submission-platform/connect' && request.method === 'POST') {
       const body = await readJson(request);
       const username = String(body.username || '').trim();
@@ -7530,6 +7759,7 @@ const server = http.createServer(async (request, response) => {
       if (!username || !password) return json(response, 400, { message: '请输入提交平台账号和密码' });
       try {
         await connectSubmissionPlatform(username, password);
+        await reconcileSubmissionPlatformReviews();
         const resumed = await resumeSubmissionPlatformWaiters();
         return json(response, 200, { message: `提交平台已连接，自动登录已启用${resumed ? `；已恢复 ${resumed} 个等待项目` : ''}`, ...(await submissionPlatformPublicState()) });
       } catch (error) {
@@ -7553,8 +7783,22 @@ const server = http.createServer(async (request, response) => {
         return json(response, 400, { message: 'pipelineJobId、bugIndex 和 taskId 必填' });
       }
       try {
-        const submission = await submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId);
+        const submission = await submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId, {
+          allowLegacyDeliveredBackfill: body.legacyDeliveredBackfill === true,
+        });
         return json(response, 200, { message: submission.skipped ? '提交平台记录已存在，已完成幂等确认' : '已提交质检平台', submission });
+      } catch (error) {
+        return json(response, 409, { message: error.message });
+      }
+    }
+    if (request.url === '/api/submission-platform/resubmit' && request.method === 'POST') {
+      const body = await readJson(request);
+      const taskId = String(body.taskId || '').trim();
+      const submissionId = String(body.submissionId || '').trim();
+      if (!taskId || !submissionId) return json(response, 400, { message: 'taskId 和 submissionId 必填' });
+      try {
+        const submission = await resubmitTaskToPlatform(taskId, submissionId);
+        return json(response, 200, { message: '已返修并重新提交质检平台', submission });
       } catch (error) {
         return json(response, 409, { message: error.message });
       }
@@ -7828,6 +8072,7 @@ async function restoreRuntimeAfterRestart() {
   }
   try {
     await restoreSubmissionPlatformSession();
+    await reconcileSubmissionPlatformReviews();
   } catch (error) {
     if (error.code !== 'ENOENT') addLog('warn', `提交平台会话恢复失败：${error.message}`);
   }
@@ -7975,4 +8220,8 @@ setInterval(() => { void reapOrphanedPipelineProcesses(); }, 30_000).unref();
 setInterval(() => { void checkDatastoreIntegrity(); }, 60_000).unref();
 setInterval(() => {
   void maintainCloudSession().catch((error) => addLog('warn', `云盘自动恢复暂未成功：${error.message}`));
+}, 60_000).unref();
+setInterval(() => {
+  void reconcileSubmissionPlatformReviews()
+    .catch((error) => addLog('warn', `提交平台审核状态同步失败：${error.message}`));
 }, 60_000).unref();

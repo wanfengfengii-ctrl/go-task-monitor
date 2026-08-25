@@ -3,7 +3,10 @@ import test from 'node:test';
 import {
   buildSubmissionActivityStats,
   extractPlatformFields,
+  extractPlatformSubmissionTotal,
   findPlatformSubmissionByBugId,
+  isLegacyDeliveredPlatformBackfill,
+  mergePlatformSubmissionReview,
   mergePlatformCookies,
   platformImportState,
   platformCsrfToken,
@@ -75,6 +78,33 @@ test('platform payload reuses strict export rules and maps whitespace aliases', 
   assert.equal('trajectory' in submission.data, false);
 });
 
+test('platform payload maps an underscored session field to the canonical Excel session', () => {
+  const underscored = {
+    data: {
+      fields: schema.data.fields.map((field) => field.field_key === 'session id'
+        ? { ...field, field_key: 'session_id' }
+        : field),
+    },
+  };
+  const submission = preparePlatformSubmission({ ...record, 'session  id': '', sessionId: mainSession }, underscored);
+  assert.equal(submission.data.session_id, mainSession);
+});
+
+test('legacy platform backfill accepts only an immutable delivered checkpoint', () => {
+  const legacyJob = {
+    submissionPlatformPolicyVersion: 0,
+    bugs: [{ bugIndex: 4, disposition: 'delivered' }],
+    stages: [{ id: 'bug4_delivery_ready', status: 'passed' }],
+  };
+  assert.equal(isLegacyDeliveredPlatformBackfill(legacyJob, 4), true);
+  assert.equal(isLegacyDeliveredPlatformBackfill({ ...legacyJob, submissionPlatformPolicyVersion: 1 }, 4), false);
+  assert.equal(isLegacyDeliveredPlatformBackfill({
+    ...legacyJob,
+    bugs: [{ bugIndex: 4, disposition: 'failed' }],
+  }, 4), false);
+  assert.equal(isLegacyDeliveredPlatformBackfill({ ...legacyJob, stages: [] }, 4), false);
+});
+
 test('platform payload stops when dynamic schema omits a system identity field', () => {
   const incomplete = { data: { fields: schema.data.fields.filter((field) => field.field_key !== 'repo_url') } };
   assert.throws(() => preparePlatformSubmission(record, incomplete), /动态表单缺少系统字段 repo_url/);
@@ -99,6 +129,8 @@ test('platform response helpers accept nested API envelopes', () => {
   assert.equal(extractPlatformFields(schema).length, schema.data.fields.length);
   const found = findPlatformSubmissionByBugId({ data: { items: [{ id: 'submission-1', data: { bug_id: record.bug_id } }] } }, record.bug_id);
   assert.equal(found.id, 'submission-1');
+  const summaryOnly = findPlatformSubmissionByBugId({ items: [{ id: 'submission-2', summary: `${record.bug_id} | 问题摘要` }] }, record.bug_id);
+  assert.equal(summaryOnly.id, 'submission-2');
 });
 
 test('platform import state is imported only after a confirmed submission', () => {
@@ -110,6 +142,11 @@ test('platform import state is imported only after a confirmed submission', () =
     submissionPlatformSubmittedAt: null,
     submissionPlatformUrl: '',
     submissionPlatformError: '',
+    submissionPlatformReviewStatus: '',
+    submissionPlatformReviewLabel: '',
+    submissionPlatformReviewReason: '',
+    submissionPlatformReviewUpdatedAt: null,
+    submissionPlatformCurrentVersion: null,
   });
   assert.deepEqual(platformImportState({
     status: 'submitted',
@@ -124,8 +161,44 @@ test('platform import state is imported only after a confirmed submission', () =
     submissionPlatformSubmittedAt: '2026-08-25T06:00:00.000Z',
     submissionPlatformUrl: 'https://go.jzxhnh.com/u/submissions',
     submissionPlatformError: '',
+    submissionPlatformReviewStatus: '',
+    submissionPlatformReviewLabel: '',
+    submissionPlatformReviewReason: '',
+    submissionPlatformReviewUpdatedAt: null,
+    submissionPlatformCurrentVersion: null,
   });
   assert.equal(platformImportState({ status: 'failed', error: 'HTTP 503' }).submissionPlatformImported, false);
+});
+
+test('platform review reconciliation preserves import state and records repair feedback', () => {
+  const merged = mergePlatformSubmissionReview({
+    taskId: 'task-1',
+    bugId: 'bug-1',
+    status: 'submitted',
+    submittedAt: '2026-08-25T06:00:00.000Z',
+  }, {
+    id: 11514,
+    status: 'PENDING_FIX',
+    reject_reason: '测试断言被削弱',
+    current_version: 2,
+  }, { observedAt: '2026-08-25T07:00:00.000Z' });
+  assert.equal(merged.status, 'submitted');
+  assert.equal(merged.platformReviewStatus, 'PENDING_FIX');
+  assert.equal(merged.platformReviewLabel, '待返修');
+  assert.equal(merged.platformReviewReason, '测试断言被削弱');
+  assert.equal(merged.platformCurrentVersion, 2);
+  assert.equal(merged.platformReviewUpdatedAt, '2026-08-25T07:00:00.000Z');
+
+  const imported = platformImportState(merged);
+  assert.equal(imported.submissionPlatformImported, true);
+  assert.equal(imported.submissionPlatformImportStatus, 'imported');
+  assert.equal(imported.submissionPlatformReviewStatus, 'PENDING_FIX');
+  assert.equal(imported.submissionPlatformError, '测试断言被削弱');
+});
+
+test('platform submission totals accept nested list envelopes', () => {
+  assert.equal(extractPlatformSubmissionTotal({ data: { total: 369, items: [{}] } }), 369);
+  assert.equal(extractPlatformSubmissionTotal({ items: [{}, {}] }), 2);
 });
 
 test('daily submission activity uses Beijing calendar boundaries and qualified backlog', () => {

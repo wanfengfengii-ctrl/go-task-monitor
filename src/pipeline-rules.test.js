@@ -32,6 +32,7 @@ import {
   validatePipelineRequest,
   invalidatePipelineVerificationAfterMissingTestAuthor,
   reactivatePipelineBug,
+  reactivateFailedPipelineBugsForManualRetry,
   rewindPipelineBugAfterMissingTrajectory,
 } from './pipeline-rules.js';
 
@@ -92,6 +93,36 @@ test('reactivating a skipped Bug clears stale trajectory disposition', () => {
   assert.equal(job.bugs[0].trajectoryDisposition, undefined);
   assert.equal(job.stages[0].status, 'pending');
   assert.equal(job.stages[0].reason, undefined);
+});
+
+test('project-level manual retry queues failed V3 Bugs instead of starting an empty runner', () => {
+  const job = {
+    workflowVersion: 3,
+    status: 'stopped',
+    error: '项目仅交付 1/3 个合格 Bug',
+    finishedAt: '2026-08-25T00:00:00.000Z',
+    bugs: [
+      { bugIndex: 1, disposition: 'delivered' },
+      { bugIndex: 2, disposition: 'failed', failureStage: 'bug2_test_author', failureReason: 'timeout' },
+      { bugIndex: 3, disposition: 'failed', failureStage: 'bug3_platform_submit', failureReason: 'network' },
+    ],
+    stages: [
+      { id: 'bug2_test_author', bugIndex: 2, status: 'failed' },
+      { id: 'bug3_platform_submit', bugIndex: 3, status: 'failed' },
+    ],
+  };
+
+  const reactivated = reactivateFailedPipelineBugsForManualRetry(job, '2026-08-25T01:00:00.000Z');
+
+  assert.deepEqual(reactivated, [2, 3]);
+  assert.deepEqual(job.pendingBugRetries, [2, 3]);
+  assert.equal(job.bugs[0].disposition, 'delivered');
+  assert.equal(job.bugs[1].disposition, undefined);
+  assert.equal(job.bugs[1].workerExecution.status, 'fast_lane_queued');
+  assert.equal(job.bugs[2].workerExecution.currentStage, 'bug3_platform_submit');
+  assert.equal(job.currentStage, 'bug2_test_author');
+  assert.equal(job.error, '');
+  assert.equal(job.finishedAt, null);
 });
 
 test('pipeline requests default to ten bugs per standard generated project', () => {

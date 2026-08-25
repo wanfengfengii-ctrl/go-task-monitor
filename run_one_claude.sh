@@ -253,6 +253,19 @@ bugfix_workspace_has_non_test_change() {
   return 0
 }
 
+bugfix_workspace_tests_unchanged() {
+  local baseline="$1"
+  local candidate="$2"
+  local changes
+  changes="$(rsync -ani --checksum --delete \
+    --include='*/' \
+    --include='*_test.go' \
+    --include='testdata/***' \
+    --exclude='*' \
+    "$baseline/" "$candidate/")"
+  [[ -z "$changes" ]]
+}
+
 # Bind every stage checkpoint to the same answer-free BUG_BASE snapshot. Later
 # stages restore ordinary tests into sandbox_pristine for red/green execution,
 # so computing this lazily would make otherwise valid checkpoints look stale.
@@ -689,6 +702,11 @@ restore_repair_checkpoint() {
     echo "discarding unchanged bugfix repair checkpoint for session $session_id" >&2
     return 1
   fi
+  if [[ "$task_type" == "bugfix" ]] \
+    && ! bugfix_workspace_tests_unchanged "$sandbox_pristine" "$repair_checkpoint/workspace"; then
+    echo "discarding bugfix repair checkpoint that modified test files for session $session_id" >&2
+    return 1
+  fi
   if [[ "$task_type" == "diagnosis" ]]; then
     if ! diff -qr --exclude='.git' "$sandbox_pristine" "$repair_checkpoint/workspace" >/dev/null 2>&1; then
       echo "discarding diagnosis repair checkpoint that modified the isolated workspace" >&2
@@ -1042,7 +1060,7 @@ append_system_prompt="Work only on the user request inside the provided isolated
 if [[ "$task_type" == "diagnosis" ]]; then
   append_system_prompt+=" This is a read-only diagnosis task. Investigate the reported behavior and provide an evidence-based conclusion without modifying any file. The workspace is intentionally read-only. Once the implementation cause is located, stop and report the relevant call chain, state transition, and root cause; do not attempt a fix. Never invoke Edit, Write, NotebookEdit, shell redirection, chmod, or any other file-mutation command."
 else
-  append_system_prompt+=" This is a bugfix task. After locating the implementation cause, make the smallest appropriate production fix requested by the user; do not stop after diagnosis or merely suggest a patch, because a Session with no non-test workspace change is rejected. Add or run a focused regression test only when that test already exists in the workspace; never create a new TestModel_ or other bug-specific test."
+  append_system_prompt+=" This is a bugfix task. After locating the implementation cause, make the smallest appropriate production fix requested by the user; do not stop after diagnosis or merely suggest a patch, because a Session with no non-test workspace change is rejected. You may run a focused pre-existing test, but do not create, delete, or modify any *_test.go file or anything under testdata; tests are immutable in this Session and are authored independently after you exit."
 fi
 prompt="$(<"$prompt_file")"
 claude_effort="${CLAUDE_EFFORT:-low}"
@@ -1199,6 +1217,12 @@ if [[ "$task_type" == "bugfix" ]] \
   echo "bugfix Claude Session completed without a non-test workspace patch" >&2
   exit 43
 fi
+if [[ "$task_type" == "bugfix" ]] \
+  && ! bugfix_workspace_tests_unchanged "$sandbox_pristine" "$sandbox_workspace"; then
+  echo "INVALID_REPAIR_TEST_MUTATION=1" >&2
+  echo "bugfix Claude Session modified immutable test files or testdata" >&2
+  exit 45
+fi
 if [[ ! "$claude_code_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
   echo "invalid or missing Claude Code CLI version in system/init: $claude_code_version" >&2
   exit 5
@@ -1257,6 +1281,15 @@ if [[ "$post_claude_codex_flow" -eq 1 || "$task_type" == "diagnosis" ]]; then
   cp "$audit_log" "$task_dir/trajectory/mutation-audit.jsonl"
   cp "$manifest_candidate" "$task_dir/trajectory/runner-manifest.json"
   printf '%s\n' "$session_id" >"$task_dir/trajectory/session_id.txt"
+  toolchain_patch="$(go env GOVERSION)"
+  if [[ "$workflow_version" -ge 3 ]]; then
+    docker_harness="backend=docker-target; isolation=independent-workspace-without-.git + system-side-public-model-grader; platform=linux/arm64,linux/amd64; container_network=none; target_cli=Claude Code CLI; target_cli_version=$claude_code_version (Claude Code); go=$toolchain_patch; public_target_runs=pending"
+  else
+    docker_harness="backend=docker-target; isolation=independent-workspace-without-.git + read-only-external-hidden-grader; platform=linux/arm64,linux/amd64; container_network=none; target_cli=Claude Code CLI; target_cli_version=$claude_code_version (Claude Code); go=$toolchain_patch; hidden_target_runs=${DETERMINISTIC_TEST_RUNS}/${DETERMINISTIC_TEST_RUNS}"
+  fi
+  public_tmp="$(mktemp "$task_dir/.public.json.trajectory.XXXXXX")"
+  jq --arg harness "$docker_harness" '.harness = $harness' "$task_dir/public.json" >"$public_tmp"
+  mv "$public_tmp" "$task_dir/public.json"
   workspace_committed=1
   if [[ "$task_type" == "diagnosis" ]]; then
     mark_runner_phase "diagnosis_repair_checkpoint_saved"

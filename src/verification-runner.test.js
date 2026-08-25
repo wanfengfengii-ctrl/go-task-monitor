@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { validateVerificationProofBundle, verificationCommandsSha256, verificationProofPrompt } from './verification-proof.js';
+import { platformCompatibleVerificationProofIssues, validateVerificationProofBundle, verificationCommandsSha256, verificationProofPrompt } from './verification-proof.js';
 
 const runner = path.resolve(import.meta.dirname, '../run_verify_claude.sh');
 
@@ -16,6 +16,26 @@ test('verification proof sessions use the dedicated Bug-fix GLM model', async ()
   assert.match(source, /\.test-author-checkpoint\/workspace/);
   assert.match(source, /grader\/model-tests/);
   assert.match(source, /repository verification test materialization failed/);
+});
+
+test('platform proof compatibility requires a paired non-zero Go failure with recognizable output', () => {
+  const command = "go test ./internal/service -run '^TestRegression$' -count=1 -v";
+  const trajectory = (output) => [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', is_error: true, content: output }] } },
+  ].map(JSON.stringify).join('\n');
+  assert.deepEqual(platformCompatibleVerificationProofIssues({
+    phase: 'pre_fix',
+    taskType: 'bugfix',
+    verifyCmds: [command],
+    trajectoryContent: trajectory('Exit code 1\n--- FAIL: TestRegression (0.01s)\nFAIL\n'),
+  }), []);
+  assert.match(platformCompatibleVerificationProofIssues({
+    phase: 'pre_fix',
+    taskType: 'bugfix',
+    verifyCmds: [command],
+    trajectoryContent: trajectory('Exit code 1\ncommand stopped\n'),
+  }).join('；'), /缺少可识别的 FAIL/);
 });
 
 test('proof validator accepts the exact direct-command timeout prompt template', () => {
