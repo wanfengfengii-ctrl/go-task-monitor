@@ -15,7 +15,15 @@ mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
 [[ ! -e "$output_dir/manifest.json" ]] || { echo "verification proof already exists: $output_dir" >&2; exit 3; }
 
-claude_bin="${GO_PIPELINE_CLAUDE_BIN:-/Users/niuyuhang/.npm-global/bin/claude}"
+if [[ -n "${GO_PIPELINE_CLAUDE_BIN:-}" ]]; then
+  claude_bin="$GO_PIPELINE_CLAUDE_BIN"
+elif [[ "$(uname -s)" == "Darwin" && -x /Users/niuyuhang/.npm-global/bin/claude ]]; then
+  claude_bin="/Users/niuyuhang/.npm-global/bin/claude"
+elif command -v claude >/dev/null 2>&1; then
+  claude_bin="$(command -v claude)"
+else
+  claude_bin="/Users/niuyuhang/.npm-global/bin/claude"
+fi
 runner_root="${GO_PIPELINE_MONITOR_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
 result_extractor="$runner_root/scripts/extract-verification-results.mjs"
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/go-task-verify.XXXXXX")"

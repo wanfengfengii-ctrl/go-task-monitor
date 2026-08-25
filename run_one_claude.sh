@@ -10,7 +10,15 @@ task_dir="$(cd "$1" && pwd)"
 work_root="$(cd "$task_dir/../../.." && pwd)"
 project_root="$(cd "$work_root/.." && pwd)"
 task_library_root="$(cd "$task_dir/../.." && pwd)"
-claude_bin="${GO_PIPELINE_CLAUDE_BIN:-/Users/niuyuhang/.npm-global/bin/claude}"
+if [[ -n "${GO_PIPELINE_CLAUDE_BIN:-}" ]]; then
+  claude_bin="$GO_PIPELINE_CLAUDE_BIN"
+elif [[ "$(uname -s)" == "Darwin" && -x /Users/niuyuhang/.npm-global/bin/claude ]]; then
+  claude_bin="/Users/niuyuhang/.npm-global/bin/claude"
+elif command -v claude >/dev/null 2>&1; then
+  claude_bin="$(command -v claude)"
+else
+  claude_bin="/Users/niuyuhang/.npm-global/bin/claude"
+fi
 runner_root="${GO_PIPELINE_MONITOR_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
 publisher="$runner_root/publish_test_model_fix.sh"
 v4_publisher="$runner_root/scripts/publish-v4-git-layout.sh"
@@ -1098,8 +1106,28 @@ if [[ -x /usr/bin/sandbox-exec ]]; then
 (deny file-read* (subpath \"$HOME/.config/gh\"))
 $workspace_write_rule"
   claude_command=(/usr/bin/sandbox-exec -p "$sandbox_profile" "${claude_command[@]}")
+elif command -v bwrap >/dev/null 2>&1; then
+  bubblewrap_command=(
+    "$(command -v bwrap)"
+    --die-with-parent --new-session
+    --ro-bind / /
+    --dev-bind /dev /dev
+    --proc /proc
+    --bind "$run_root" "$run_root"
+    --tmpfs "$project_root"
+  )
+  if [[ -d "$work_root/toolchains" ]]; then
+    bubblewrap_command+=(--dir "$work_root" --ro-bind "$work_root/toolchains" "$work_root/toolchains")
+  fi
+  for hidden_dir in "$HOME/.claude" "$HOME/.codex" "$HOME/.config/gh"; do
+    [[ -d "$hidden_dir" ]] && bubblewrap_command+=(--tmpfs "$hidden_dir")
+  done
+  if [[ -f "$HOME/.claude.json" ]]; then
+    bubblewrap_command+=(--ro-bind /dev/null "$HOME/.claude.json")
+  fi
+  claude_command=("${bubblewrap_command[@]}" -- "${claude_command[@]}")
 else
-  echo "Claude repair requires sandbox-exec; refusing to run without filesystem read isolation" >&2
+  echo "Claude repair requires sandbox-exec (macOS) or bubblewrap (Linux); refusing to run without filesystem read isolation" >&2
   exit 79
 fi
 mark_runner_phase "source_locating"

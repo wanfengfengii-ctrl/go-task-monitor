@@ -743,16 +743,20 @@ test('Bug fixing uses the dedicated GLM model independently of project generatio
   assert.equal(bugfixEffort(1, { GO_PIPELINE_BUGFIX_EFFORT: 'invalid' }), 'low');
 });
 
-test('pipeline child commands never inherit the project-generator secret variable', async () => {
+test('pipeline child commands never inherit orchestrator secret variables', async () => {
   const result = await runCommand('/usr/bin/env', [], {
     env: {
       GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN: 'must-not-leak',
+      GO_PIPELINE_WORKER_TOKEN: 'worker-secret-must-not-leak',
+      GO_PIPELINE_REMOTE_LEASE_ID: 'lease-secret-must-not-leak',
+      GO_TASK_MONITOR_CLOUD_USERNAME: 'cloud-user-must-not-leak',
+      GO_TASK_MONITOR_CLOUD_PASSWORD: 'cloud-secret-must-not-leak',
       PIPELINE_SAFE_TEST_VALUE: 'visible',
     },
   });
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /PIPELINE_SAFE_TEST_VALUE=visible/);
-  assert.doesNotMatch(result.stdout, /must-not-leak|GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN/);
+  assert.doesNotMatch(result.stdout, /must-not-leak|GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN|GO_PIPELINE_WORKER_TOKEN|GO_PIPELINE_REMOTE_LEASE_ID|GO_TASK_MONITOR_CLOUD_USERNAME|GO_TASK_MONITOR_CLOUD_PASSWORD/);
 });
 
 test('pipeline runner safely quotes shell arguments', () => {
@@ -1517,7 +1521,8 @@ test('fresh Claude sessions receive ordinary project context without acceptance-
   assert.doesNotMatch(runner, /-iname '\*answer\*'|-iname '\*solution\*'|-iname '\*patch\*'|-iname '\*gold\*'/);
   assert.match(runner, /deny file-read\* \(subpath \\"\$project_root\\"\)/);
   assert.match(runner, /allow file-read\* \(subpath \\"\$work_root\/toolchains\\"\)/);
-  assert.match(runner, /requires sandbox-exec; refusing to run without filesystem read isolation/);
+  assert.match(runner, /requires sandbox-exec \(macOS\) or bubblewrap \(Linux\); refusing to run without filesystem read isolation/);
+  assert.match(runner, /--ro-bind \/ \/[^]+--tmpfs "\$project_root"/);
   assert.match(runner, /exit 79/);
 });
 

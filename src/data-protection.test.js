@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { assertProtectedSnapshotPath, claudeGenerationSandbox, criticalSnapshotTarOptions, datastoreIntegrityDecision } from './data-protection.js';
 
 test('Claude generation refuses unsupported platforms and wraps macOS CLI in a protected sandbox', () => {
-  assert.throws(() => claudeGenerationSandbox({ platform: 'linux', protectedRoot: '/data/tasks', claudeBin: '/bin/claude' }), /拒绝无保护/);
+  assert.throws(() => claudeGenerationSandbox({ platform: 'freebsd', protectedRoot: '/data/tasks', claudeBin: '/bin/claude' }), /拒绝无保护/);
   const wrapped = claudeGenerationSandbox({
     platform: 'darwin',
     protectedRoot: '/Users/example/Project With Spaces',
@@ -20,6 +21,22 @@ test('Claude generation refuses unsupported platforms and wraps macOS CLI in a p
   assert.match(wrapped.profile, /Project With Spaces/);
 });
 
+test('Claude generation uses Bubblewrap on Linux and makes the datastore read-only', () => {
+  const wrapped = claudeGenerationSandbox({
+    platform: 'linux',
+    bubblewrap: '/usr/bin/bwrap',
+    protectedRoot: '/srv/go-task-monitor',
+    claudeBin: '/usr/local/bin/claude',
+    claudeArgs: ['--print', 'hello'],
+  });
+  assert.equal(wrapped.command, '/usr/bin/bwrap');
+  assert.deepEqual(wrapped.args.slice(-4), ['--', '/usr/local/bin/claude', '--print', 'hello']);
+  const protectedIndex = wrapped.args.indexOf('--ro-bind');
+  assert.deepEqual(wrapped.args.slice(protectedIndex, protectedIndex + 3), [
+    '--ro-bind', '/srv/go-task-monitor', '/srv/go-task-monitor',
+  ]);
+});
+
 test('macOS sandbox blocks a child process from deleting the protected datastore', { skip: process.platform !== 'darwin' || !fs.existsSync('/usr/bin/sandbox-exec') }, async () => {
   const root = await fsp.mkdtemp(path.join(process.cwd(), '.go-monitor-sandbox-test-'));
   const protectedRoot = path.join(root, 'protected');
@@ -28,6 +45,26 @@ test('macOS sandbox blocks a child process from deleting the protected datastore
   await fsp.writeFile(sentinel, '{}\n');
   try {
     const wrapped = claudeGenerationSandbox({
+      protectedRoot,
+      claudeBin: '/bin/rm',
+      claudeArgs: ['-rf', protectedRoot],
+    });
+    spawnSync(wrapped.command, wrapped.args, { encoding: 'utf8' });
+    assert.equal(await fsp.readFile(sentinel, 'utf8'), '{}\n');
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Linux Bubblewrap blocks a child process from deleting the protected datastore', { skip: process.platform !== 'linux' || !fs.existsSync('/usr/bin/bwrap') }, async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-monitor-bwrap-test-'));
+  const protectedRoot = path.join(root, 'protected');
+  const sentinel = path.join(protectedRoot, 'tasks', 'keep.json');
+  await fsp.mkdir(path.dirname(sentinel), { recursive: true });
+  await fsp.writeFile(sentinel, '{}\n');
+  try {
+    const wrapped = claudeGenerationSandbox({
+      platform: 'linux',
       protectedRoot,
       claudeBin: '/bin/rm',
       claudeArgs: ['-rf', protectedRoot],

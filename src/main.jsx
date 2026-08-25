@@ -549,7 +549,7 @@ function App() {
   const [trajectoryUploadMessage, setTrajectoryUploadMessage] = useState('');
   const [trajectoryDragActive, setTrajectoryDragActive] = useState(false);
   const [pipelineJobs, setPipelineJobs] = useState([]);
-  const [pipelineRuntime, setPipelineRuntime] = useState({ autoFillEnabled: false, controlMode: 'paused', activeCount: 0, activeWeight: 0, waitingResourceCount: 0, maxConcurrency: 4, effectiveMaxConcurrency: 4, maxAutoRetries: 2, draftCount: 0, resourcePools: {}, refill: { status: 'idle', plannedCount: 0, createdCount: 0, largeProjectCanary: { status: 'idle', targetCount: 0, remainingCount: 0, createdJobIds: [] } }, submissionQuality: { blockedContributors: [], incidentCount: 0 } });
+  const [pipelineRuntime, setPipelineRuntime] = useState({ autoFillEnabled: false, controlMode: 'paused', activeCount: 0, activeWeight: 0, waitingResourceCount: 0, maxConcurrency: 4, effectiveMaxConcurrency: 4, maxAutoRetries: 2, draftCount: 0, resourcePools: {}, distributedWorkers: { enabled: false, workers: [] }, refill: { status: 'idle', plannedCount: 0, createdCount: 0, largeProjectCanary: { status: 'idle', targetCount: 0, remainingCount: 0, createdJobIds: [] } }, submissionQuality: { blockedContributors: [], incidentCount: 0 } });
   const [systemHealth, setSystemHealth] = useState({ updatedAt: null, services: {}, rollout: { mode: 'drain_to_v2', canaryJobId: '' }, watchdog: { activeIncidentCount: 0, triaging: false, incidents: [] } });
   const [pipelineCreatedFrom, setPipelineCreatedFrom] = useState('');
   const [pipelineCreatedTo, setPipelineCreatedTo] = useState('');
@@ -666,6 +666,7 @@ function App() {
         maxConcurrency: Number(payload.maxConcurrency) || 4,
         effectiveMaxConcurrency: Number(payload.effectiveMaxConcurrency) || 0,
         resourcePools: payload.resourcePools || {},
+        distributedWorkers: payload.distributedWorkers || { enabled: false, workers: [] },
         maxAutoRetries: Number(payload.maxAutoRetries) || 2,
         controlMode: payload.controlMode || (payload.autoFillEnabled ? 'running' : 'paused'),
         budget: payload.budget || null,
@@ -1459,11 +1460,12 @@ function App() {
   const currentTasks = Array.isArray(runState.currentTasks) ? runState.currentTasks : [];
   const recentTasks = passed.filter((task) => task.finishedAt).slice(0, 6);
   const pipelineActiveCount = Number(pipelineRuntime.activeCount || 0);
-  const pipelineRunning = pipelineActiveCount > 0;
+  const remoteRepairActive = (pipelineRuntime.distributedWorkers?.workers || []).some((worker) => worker.status === 'busy');
+  const pipelineRunning = pipelineActiveCount > 0 || remoteRepairActive;
   const pipelinePoolSummary = [
+    ['规划/编测', pipelineRuntime.resourcePools?.['codex-structured']],
     ['分析', pipelineRuntime.resourcePools?.['compute-analysis']],
     ['修复', pipelineRuntime.resourcePools?.['compute-repair']],
-    ['编测', pipelineRuntime.resourcePools?.['compute-test-author']],
     ['证明', pipelineRuntime.resourcePools?.['compute-proof']],
     ['Docker', pipelineRuntime.resourcePools?.['compute-docker']],
   ].map(([label, pool]) => `${label}${pool?.occupied || 0}/${pool?.limit || 0}${pool?.waiting ? `(+${pool.waiting}排队)` : ''}`).join(' · ');
@@ -1471,6 +1473,11 @@ function App() {
     || pipelineActiveCount >= pipelineRuntime.effectiveMaxConcurrency;
   const pipelineRefillActive = ['planning', 'provisioning'].includes(pipelineRuntime.refill?.status);
   const blockedContributors = pipelineRuntime.submissionQuality?.blockedContributors || [];
+  const repairWorkers = pipelineRuntime.distributedWorkers?.workers || [];
+  const repairWorker = repairWorkers.find((worker) => worker.status === 'busy') || repairWorkers.find((worker) => worker.status !== 'offline') || repairWorkers[0];
+  const repairWorkerLabel = repairWorker
+    ? `B ${repairWorker.workerId} · ${repairWorker.status === 'busy' ? `修复 ${repairWorker.currentJobId}` : repairWorker.status === 'offline' ? '离线' : '空闲'}`
+    : 'B repair-worker · 未连接';
   const healthServices = ['git', 'cloud', 'docker', 'claude', 'codex', 'host'].map((key) => ({ key, ...(systemHealth.services?.[key] || { name: key, status: 'checking', detail: '等待检查' }) }));
   const resourceSnapshot = systemHealth.resources || {};
   const dailyBudget = systemHealth.scheduler?.budget || pipelineRuntime.budget || {};
@@ -1589,7 +1596,7 @@ function App() {
         <section className="panel pipeline-panel" aria-labelledby="pipeline-title">
           <div className="panel-heading pipeline-heading">
             <div><h2 id="pipeline-title">流水线作业</h2><span className="panel-subtitle">规划项目 → 生成模型创建 → 双架构构建与运行验证 → 本地冻结 → 找/准备 Bug → 发布 Git → 双修复 → 轨迹采集登记 → 云盘交付</span></div>
-            <div className="pipeline-heading-controls"><span className={`status-chip ${pipelineRunning || pipelineRefillActive ? 'green' : 'blue'}`}><Workflow size={14} />{pipelineRefillActive ? `Codex 自动补题 ${pipelineRuntime.refill.createdCount}/${pipelineRuntime.refill.plannedCount || 10}` : pipelineRunning ? `执行 ${pipelineActiveCount}/${pipelineRuntime.effectiveMaxConcurrency} · 等待资源 ${pipelineRuntime.waitingResourceCount} · ${pipelinePoolSummary} · ${pipelineRuntime.controlMode === 'running' ? '自动补位' : '不补位'}` : `${pipelineJobs.length} 个作业 · 等待闭环检查`}</span><div className="scheduler-controls"><button type="button" className={pipelineRuntime.controlMode === 'running' ? 'active' : ''} disabled={pipelineBusy} title="恢复闭环调度" onClick={() => setPipelineControl('running')}><Play size={14} />运行</button><button type="button" className={pipelineRuntime.controlMode === 'paused' ? 'active' : ''} disabled={pipelineBusy} title="暂停启动新任务" onClick={() => setPipelineControl('paused')}><Pause size={14} />暂停</button><button type="button" className={pipelineRuntime.controlMode === 'draining' ? 'active' : ''} disabled={pipelineBusy} title="当前任务完成后停止补位" onClick={() => setPipelineControl('draining')}><Workflow size={14} />排空</button><button type="button" className="emergency" disabled={pipelineBusy || !pipelineRunning} title="停止所有流水线 Runner" onClick={() => setPipelineControl('emergency_stopped')}><ShieldAlert size={14} />急停</button></div></div>
+            <div className="pipeline-heading-controls"><span className={`status-chip ${pipelineRunning || pipelineRefillActive ? 'green' : 'blue'}`}><Workflow size={14} />{pipelineRefillActive ? `Codex 自动补题 ${pipelineRuntime.refill.createdCount}/${pipelineRuntime.refill.plannedCount || 10}` : pipelineRunning ? `执行 ${pipelineActiveCount}/${pipelineRuntime.effectiveMaxConcurrency} · 等待资源 ${pipelineRuntime.waitingResourceCount} · ${pipelinePoolSummary} · ${pipelineRuntime.controlMode === 'running' ? '自动补位' : '不补位'}` : `${pipelineJobs.length} 个作业 · 等待闭环检查`}</span>{pipelineRuntime.distributedWorkers?.enabled && <span className={`status-chip ${repairWorker?.status === 'busy' || repairWorker?.status === 'online' || repairWorker?.status === 'idle' ? 'green' : 'blue'}`}><Activity size={14} />{repairWorkerLabel}</span>}<div className="scheduler-controls"><button type="button" className={pipelineRuntime.controlMode === 'running' ? 'active' : ''} disabled={pipelineBusy} title="恢复闭环调度" onClick={() => setPipelineControl('running')}><Play size={14} />运行</button><button type="button" className={pipelineRuntime.controlMode === 'paused' ? 'active' : ''} disabled={pipelineBusy} title="暂停启动新任务" onClick={() => setPipelineControl('paused')}><Pause size={14} />暂停</button><button type="button" className={pipelineRuntime.controlMode === 'draining' ? 'active' : ''} disabled={pipelineBusy} title="当前任务完成后停止补位" onClick={() => setPipelineControl('draining')}><Workflow size={14} />排空</button><button type="button" className="emergency" disabled={pipelineBusy || !pipelineRunning} title="停止所有流水线 Runner" onClick={() => setPipelineControl('emergency_stopped')}><ShieldAlert size={14} />急停</button></div></div>
           </div>
           {pipelineMessage && <div className="pipeline-message">{pipelineMessage}</div>}
           {blockedContributors.length > 0 && <div className="hard-rule-alert"><strong>项目质量事故熔断已触发</strong><p>{blockedContributors.map((item) => item.contributorId).join('、')} 已有两个不同项目被确定性质量门禁判定失败；自动补题和调度保持暂停，需人工复核。</p></div>}

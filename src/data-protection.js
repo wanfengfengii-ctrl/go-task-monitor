@@ -5,12 +5,35 @@ function quoteSandboxString(value) {
   return String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
 }
 
-export function claudeGenerationSandbox({ platform = process.platform, sandboxExec = '/usr/bin/sandbox-exec', protectedRoot, claudeBin, claudeArgs = [] }) {
+export function claudeGenerationSandbox({
+  platform = process.platform,
+  sandboxExec = '/usr/bin/sandbox-exec',
+  bubblewrap = '/usr/bin/bwrap',
+  protectedRoot,
+  claudeBin,
+  claudeArgs = [],
+}) {
   if (!path.isAbsolute(protectedRoot)) throw new Error('Claude 保护目录必须是绝对路径');
   if (!path.isAbsolute(claudeBin)) throw new Error('Claude CLI 必须使用绝对路径');
-  if (platform !== 'darwin') throw new Error(`当前平台 ${platform} 缺少已配置的 Claude 文件系统沙箱，拒绝无保护生成项目`);
   const resolvedRoot = path.resolve(protectedRoot);
   const canonicalRoot = fs.existsSync(resolvedRoot) ? fs.realpathSync.native(resolvedRoot) : resolvedRoot;
+  if (platform === 'linux') {
+    if (!path.isAbsolute(bubblewrap)) throw new Error('Bubblewrap 必须使用绝对路径');
+    return {
+      command: bubblewrap,
+      args: [
+        '--die-with-parent',
+        '--new-session',
+        '--bind', '/', '/',
+        '--dev-bind', '/dev', '/dev',
+        '--proc', '/proc',
+        '--ro-bind', canonicalRoot, canonicalRoot,
+        '--', claudeBin, ...claudeArgs,
+      ],
+      profile: `bubblewrap:ro-bind:${canonicalRoot}`,
+    };
+  }
+  if (platform !== 'darwin') throw new Error(`当前平台 ${platform} 缺少已配置的 Claude 文件系统沙箱，拒绝无保护生成项目`);
   const profile = [
     '(version 1)',
     '(allow default)',
