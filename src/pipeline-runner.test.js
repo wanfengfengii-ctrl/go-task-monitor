@@ -3365,6 +3365,8 @@ test('Bug-scoped failures auto-continue while infrastructure failures still stop
   assert.match(pipeline, /markPipelineBugFailed\(current, bugIndex/);
   assert.match(pipeline, /auto_continue_after_failure/);
   assert.match(pipeline, /const infrastructureFailure = new Set\(\[/);
+  assert.match(pipeline, /'codex_infrastructure'/);
+  assert.match(pipeline, /if \(!infrastructureFailure && workflowVersion >= CURRENT_WORKFLOW_VERSION/);
   assert.match(pipeline, /if \(infrastructureFailure \|\| !\/\^bug\\d\+_\//);
   assert.match(pipeline, /current\.status = 'running';/);
   assert.match(pipeline, /current\.status = 'failed';/);

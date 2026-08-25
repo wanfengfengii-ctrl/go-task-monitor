@@ -486,6 +486,7 @@ test('pipeline failures classify the four recoverable production errors', () => 
     [{ status: 'failed', currentStage: 'project_validate', error: '项目与双架构 Docker 校验失败：no required module provides package yaml.v3' }, 'project_validation', false],
     [{ status: 'failed', currentStage: 'project_generate', error: "ENOENT: no such file or directory, open '/job/project/go.mod'" }, 'project_generation', true],
     [{ status: 'failed', currentStage: 'bug1_claude_fix', error: 'Claude 修复失败（exit=1）' }, 'claude_trajectory', false],
+    [{ status: 'failed', currentStage: 'bug1_test_author', error: 'Codex CLI失败（exit=none，signal=SIGTERM，已超时）：连续 6 分钟未产生子进程事件' }, 'codex_infrastructure', false],
   ];
   for (const [job, category, regenerate] of cases) {
     assert.equal(classifyPipelineFailure(job), category);

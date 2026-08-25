@@ -642,6 +642,22 @@ export function reactivateFailedPipelineBugsForManualRetry(job, at = new Date().
 
   for (const { bug, index, stage } of failed) {
     reactivatePipelineBug(job, index, { resetAttempts: false });
+    const exhaustedRetry = bug.stageAutoRetries?.[stage];
+    if (exhaustedRetry) {
+      bug.stageAutoRetryBudgetHistory = [...(bug.stageAutoRetryBudgetHistory || []), {
+        resetAt: at,
+        stage,
+        retries: exhaustedRetry,
+        reason: 'project_manual_retry',
+      }].slice(-10);
+      delete bug.stageAutoRetries[stage];
+      if (!Object.keys(bug.stageAutoRetries).length) delete bug.stageAutoRetries;
+    }
+    const failedStage = (job.stages || []).find((item) => item.id === stage);
+    if (failedStage) {
+      delete failedStage.retryCount;
+      delete failedStage.maxRetries;
+    }
     bug.workerExecution = {
       ...(bug.workerExecution || {}),
       status: 'fast_lane_queued',

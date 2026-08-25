@@ -10344,6 +10344,7 @@ async function runPipeline(jobFile) {
         'grader_infrastructure',
         'audit_infrastructure',
         'runner_infrastructure',
+        'codex_infrastructure',
         'git_infrastructure',
         'docker_infrastructure',
         'git_baseline_conflict',
@@ -10469,7 +10470,7 @@ async function runPipeline(jobFile) {
         await appendLog(jobFile, 'warn', `Bug ${bugIndex} 验证覆盖复核失败，保留现有证明并仅重试覆盖复核`, failedStage);
         throw error;
       }
-      if (workflowVersion >= CURRENT_WORKFLOW_VERSION && /^bug\d+_/.test(failedStage)) {
+      if (!infrastructureFailure && workflowVersion >= CURRENT_WORKFLOW_VERSION && /^bug\d+_/.test(failedStage)) {
         let stageRetry;
         await updateJob(jobFile, (current) => {
           stageRetry = queuePipelineBugStageRetry(current, bugIndex, {

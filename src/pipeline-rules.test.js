@@ -103,11 +103,11 @@ test('project-level manual retry queues failed V3 Bugs instead of starting an em
     finishedAt: '2026-08-25T00:00:00.000Z',
     bugs: [
       { bugIndex: 1, disposition: 'delivered' },
-      { bugIndex: 2, disposition: 'failed', failureStage: 'bug2_test_author', failureReason: 'timeout' },
+      { bugIndex: 2, disposition: 'failed', failureStage: 'bug2_test_author', failureReason: 'timeout', stageAutoRetries: { bug2_test_author: { retryCount: 3, maxRetries: 3, exhausted: true } } },
       { bugIndex: 3, disposition: 'failed', failureStage: 'bug3_platform_submit', failureReason: 'network' },
     ],
     stages: [
-      { id: 'bug2_test_author', bugIndex: 2, status: 'failed' },
+      { id: 'bug2_test_author', bugIndex: 2, status: 'failed', retryCount: 3, maxRetries: 3 },
       { id: 'bug3_platform_submit', bugIndex: 3, status: 'failed' },
     ],
   };
@@ -119,6 +119,9 @@ test('project-level manual retry queues failed V3 Bugs instead of starting an em
   assert.equal(job.bugs[0].disposition, 'delivered');
   assert.equal(job.bugs[1].disposition, undefined);
   assert.equal(job.bugs[1].workerExecution.status, 'fast_lane_queued');
+  assert.equal(job.bugs[1].stageAutoRetries, undefined);
+  assert.equal(job.bugs[1].stageAutoRetryBudgetHistory.length, 1);
+  assert.equal(job.stages[0].retryCount, undefined);
   assert.equal(job.bugs[2].workerExecution.currentStage, 'bug3_platform_submit');
   assert.equal(job.currentStage, 'bug2_test_author');
   assert.equal(job.error, '');

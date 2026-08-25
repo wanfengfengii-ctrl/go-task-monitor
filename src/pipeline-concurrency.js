@@ -23,6 +23,7 @@ export function classifyPipelineFailure(job = {}) {
   if (/\[system:audit_infrastructure\]|mutation-audit[\s\S]*(?:未记录\s*(?:PreToolUse|PostToolUse)|baseline.*missing)/i.test(error)) return 'audit_infrastructure';
   if (/\[system:runner_infrastructure\]/i.test(error)) return 'runner_infrastructure';
   if (/\[system:natural_bug_finder\]|自然 Bug 搜索基础设施失败|自然 Bug 搜索分区失败/i.test(error)) return 'natural_bug_finder_infrastructure';
+  if (/Codex CLI失败/i.test(error)) return 'codex_infrastructure';
   if (/\[system:git_infrastructure\]|(?:Connection closed by|Connection timed out|Could not resolve host|Failed to connect to)[^\n]*|fatal:\s+Could not read from remote repository/i.test(error)) return 'git_infrastructure';
   if (/\[system:docker_infrastructure\]|error waiting for container:\s*unexpected EOF|Docker (?:Desktop|daemon)|Cannot connect to the Docker daemon|context deadline exceeded|TLS handshake timeout|error during connect|no space left on device|connection reset by peer|unable to lease content|lease does not exist|failed to solve[^\n]*(?:rpc|connection)|failed to fetch anonymous token|(?:docker|buildx|failed to solve)[\s\S]{0,200}(?:i\/o timeout|unexpected EOF)|content digest[^\n]*not found|Docker[^\n]*(?:校验|build|构建)[\s\S]{0,200}(?:超时|未产生子进程事件)/i.test(error)) return 'docker_infrastructure';
   if (stage.endsWith('_verification_coverage')) return 'verification_coverage';
