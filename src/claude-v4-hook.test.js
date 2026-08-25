@@ -1,0 +1,233 @@
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import test from 'node:test';
+
+const hook = path.resolve(import.meta.dirname, '../scripts/claude-v4-hook.mjs');
+const sessionId = '4a158f08-9b97-4e0a-a6d5-f1bd2c70609e';
+
+function toolUse(id, name, input) {
+  return { type: 'assistant', sessionId, message: { model: 'model', content: [{ type: 'tool_use', id, name, input }] } };
+}
+
+function toolResult(id, isError = false) {
+  return { type: 'user', sessionId, message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content: '' }] } };
+}
+
+async function fixture({ includeFull }) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'claude-stop-hook-'));
+  const workspace = path.join(root, 'workspace');
+  const transcript = path.join(root, 'session.jsonl');
+  const audit = path.join(root, 'audit.jsonl');
+  await mkdir(workspace);
+  await writeFile(path.join(workspace, 'queue.go'), 'package queue\n\nfunc Pop() {}\n');
+  await writeFile(path.join(workspace, 'queue_test.go'), 'package queue\n');
+  const events = [
+    { type: 'user', sessionId, cwd: workspace, message: { role: 'user', content: '请修复队列问题。' } },
+    toolUse('read', 'Read', { file_path: path.join(workspace, 'queue.go') }), toolResult('read'),
+    toolUse('test', 'Write', { file_path: path.join(workspace, 'queue_test.go'), content: 'package queue' }), toolResult('test'),
+    toolUse('red', 'Bash', { command: "go test ./... -run '^TestModel_Queue$' -count=1" }), toolResult('red', true),
+    toolUse('fix', 'Edit', { file_path: path.join(workspace, 'queue.go') }), toolResult('fix'),
+    toolUse('green', 'Bash', { command: "go test ./... -run '^TestModel_Queue$' -count=1" }), toolResult('green'),
+    ...(includeFull ? [toolUse('full', 'Bash', { command: 'go test ./... -count=1' }), toolResult('full')] : []),
+    { type: 'assistant', sessionId, cwd: workspace, message: { model: 'model', content: [{ type: 'text', text: '修复完成。' }] } },
+    { type: 'last-prompt', sessionId, lastPrompt: '请修复队列问题。' },
+  ];
+  await writeFile(transcript, `${events.map((event) => JSON.stringify(event)).join('\n')}\n`);
+  const files = { 'workspace/queue.go': 'old-source' };
+  const withTest = { ...files, 'workspace/queue_test.go': 'new-test' };
+  const fixed = { ...withTest, 'workspace/queue.go': 'new-source' };
+  const auditRecords = [
+    { event: 'V4Baseline', files },
+    { event: 'PreToolUse', tool_use_id: 'test', tool_name: 'Write', files },
+    { event: 'PostToolUse', tool_use_id: 'test', tool_name: 'Write', files: withTest },
+    { event: 'PreToolUse', tool_use_id: 'red', tool_name: 'Bash', files: withTest },
+    { event: 'PostToolUseFailure', tool_use_id: 'red', tool_name: 'Bash', files: withTest },
+    { event: 'PreToolUse', tool_use_id: 'fix', tool_name: 'Edit', files: withTest },
+    { event: 'PostToolUse', tool_use_id: 'fix', tool_name: 'Edit', files: fixed },
+    { event: 'PreToolUse', tool_use_id: 'green', tool_name: 'Bash', files: fixed },
+    { event: 'PostToolUse', tool_use_id: 'green', tool_name: 'Bash', files: fixed },
+    ...(includeFull ? [
+      { event: 'PreToolUse', tool_use_id: 'full', tool_name: 'Bash', files: fixed },
+      { event: 'PostToolUse', tool_use_id: 'full', tool_name: 'Bash', files: fixed },
+    ] : []),
+  ];
+  await writeFile(audit, `${auditRecords.map((record) => JSON.stringify(record)).join('\n')}\n`);
+  return { root, workspace, transcript, audit };
+}
+
+function runStopHook(paths, stopHookActive = false) {
+  return spawnSync(process.execPath, [hook], {
+    input: JSON.stringify({
+      hook_event_name: 'Stop',
+      session_id: sessionId,
+      transcript_path: paths.transcript,
+      stop_hook_active: stopHookActive,
+    }),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      V4_TASK_TYPE: 'bugfix',
+      V4_WORKSPACE_ROOT: paths.workspace,
+      V4_TEMP_ROOT: paths.root,
+      V4_AUDIT_LOG: paths.audit,
+    },
+  });
+}
+
+test('bugfix Stop hook blocks completion until a direct full-suite test succeeds', async () => {
+  const paths = await fixture({ includeFull: false });
+  try {
+    const result = runStopHook(paths);
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.decision, 'block');
+    assert.match(output.reason, /go test \.\/\.\.\. -count=1/);
+    assert.match(output.reason, /不得使用管道/);
+  } finally {
+    await rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('bugfix Stop hook allows completion after direct green and full-suite evidence', async () => {
+  const paths = await fixture({ includeFull: true });
+  try {
+    const result = runStopHook(paths);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, '');
+  } finally {
+    await rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('bugfix Stop hook does not block repeatedly after an earlier Stop intervention', async () => {
+  const paths = await fixture({ includeFull: false });
+  try {
+    const result = runStopHook(paths, true);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, '');
+  } finally {
+    await rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('bugfix hook denies decisive validation commands that mask the Go exit status', async () => {
+  const paths = await fixture({ includeFull: false });
+  try {
+    const result = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_use_id: 'masked-full',
+        tool_name: 'Bash',
+        tool_input: { command: 'go test ./... -count=1 2>&1 | tail -20' },
+      }),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        V4_TASK_TYPE: 'bugfix',
+        V4_WORKSPACE_ROOT: paths.workspace,
+        V4_TEMP_ROOT: paths.root,
+        V4_AUDIT_LOG: paths.audit,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /掩盖真实退出码/);
+  } finally {
+    await rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnosis hook records denied source-writing Bash calls in the mutation audit', async () => {
+  const paths = await fixture({ includeFull: false });
+  try {
+    const result = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_use_id: 'diagnosis-write',
+        tool_name: 'Bash',
+        tool_input: { command: "printf 'package main' > /tmp/repro.go" },
+      }),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        V4_TASK_TYPE: 'diagnosis',
+        V4_WORKSPACE_ROOT: paths.workspace,
+        V4_TEMP_ROOT: paths.root,
+        V4_AUDIT_LOG: paths.audit,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, 'deny');
+    const records = (await readFile(paths.audit, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    const denied = records.find((record) => record.tool_use_id === 'diagnosis-write');
+    assert.equal(denied.event, 'PreToolUse');
+    assert.equal(denied.permission_decision, 'deny');
+  } finally {
+    await rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnosis hook denies generic filesystem and persistent configuration writes', async () => {
+  const paths = await fixture({ includeFull: false });
+  const commands = [
+    `printf probe > ${paths.workspace}/probe.txt`,
+    `mkdir ${paths.workspace}/probe-dir`,
+    `chmod u+w ${paths.workspace}/queue.go`,
+    'go env -w GOFLAGS=',
+  ];
+  try {
+    for (const [index, command] of commands.entries()) {
+      const result = spawnSync(process.execPath, [hook], {
+        input: JSON.stringify({
+          hook_event_name: 'PreToolUse',
+          tool_use_id: `generic-write-${index}`,
+          tool_name: 'Bash',
+          tool_input: { command },
+        }),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          V4_TASK_TYPE: 'diagnosis',
+          V4_WORKSPACE_ROOT: paths.workspace,
+          V4_TEMP_ROOT: paths.root,
+          V4_AUDIT_LOG: paths.audit,
+        },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, 'deny', command);
+    }
+  } finally {
+    await rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('mutation snapshots exclude Claude internal shell snapshot files', async () => {
+  const paths = await fixture({ includeFull: false });
+  try {
+    const shellSnapshots = path.join(paths.root, 'claude-config/shell-snapshots');
+    await mkdir(shellSnapshots, { recursive: true });
+    await writeFile(path.join(shellSnapshots, 'snapshot.sh'), '# internal shell state\n');
+    const result = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({ hook_event_name: 'V4Final' }),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        V4_TASK_TYPE: 'diagnosis',
+        V4_WORKSPACE_ROOT: paths.workspace,
+        V4_TEMP_ROOT: paths.root,
+        V4_AUDIT_LOG: paths.audit,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const records = (await readFile(paths.audit, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    const final = records.at(-1);
+    assert.equal(final.event, 'V4Final');
+    assert.equal(Object.keys(final.files).some((filename) => filename.includes('claude-config/shell-snapshots')), false);
+  } finally {
+    await rm(paths.root, { recursive: true, force: true });
+  }
+});

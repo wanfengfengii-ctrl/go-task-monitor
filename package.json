@@ -1,0 +1,28 @@
+{
+  "name": "go-task-monitor",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "api": "node server.mjs",
+    "api:deepseek": "bash scripts/start-api-deepseek.sh",
+    "build": "vite build",
+    "test": "node --test src/*.test.js",
+    "preflight": "node scripts/preflight.mjs && npm test && npm run build",
+    "preview": "vite preview --host 0.0.0.0",
+    "sync:export-fields": "node scripts/sync-label-export-records.mjs",
+    "validate:trajectories": "node scripts/validate-trajectories.mjs",
+    "validate:package": "node scripts/validate-go-package.mjs",
+    "pipeline:run": "node scripts/run-production-pipeline.mjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "lucide-react": "latest",
+    "xlsx": "latest"
+  },
+  "devDependencies": {}
+}
