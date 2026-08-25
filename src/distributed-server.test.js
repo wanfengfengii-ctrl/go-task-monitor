@@ -48,7 +48,18 @@ test('producer API leases one remote repair job and imports its task package', a
   const libraryRoot = path.join(workRoot, 'go-task-library');
   const jobDir = path.join(libraryRoot, 'pipeline-jobs', jobId);
   const tasksRoot = path.join(libraryRoot, 'tasks');
+  const validationRoot = path.join(libraryRoot, 'validation');
   await fsp.mkdir(jobDir, { recursive: true });
+  await fsp.mkdir(validationRoot, { recursive: true });
+  const activityAt = new Date().toISOString();
+  await fsp.writeFile(path.join(validationRoot, 'review_statuses.json'), `${JSON.stringify([
+    { taskId: 'go-task-library::go-1001-bug-01', status: 'qualified', updatedAt: activityAt },
+    { taskId: 'go-task-library::go-1001-bug-02', status: 'qualified', updatedAt: activityAt },
+  ], null, 2)}\n`, 'utf8');
+  await fsp.writeFile(path.join(validationRoot, 'platform_submissions.json'), `${JSON.stringify([
+    { taskId: 'go-task-library::go-1001-bug-01', bugId: 'go-1001-bug-01', status: 'submitted', submittedAt: activityAt, platformSubmissionId: 'submission-1' },
+    { taskId: 'go-task-library::go-1001-bug-02', bugId: 'go-1001-bug-02', status: 'failed', startedAt: activityAt, failedAt: activityAt, error: 'HTTP 503' },
+  ], null, 2)}\n`, 'utf8');
   const job = {
     id: jobId,
     status: 'waiting_resource',
@@ -107,6 +118,21 @@ test('producer API leases one remote repair job and imports its task package', a
   assert.equal(denied.response.status, 401);
   const registered = await requestJson('/api/pipeline/workers/register', 'POST', identity);
   assert.equal(registered.response.status, 200);
+  const deniedStats = await fetch(`${baseUrl}/api/pipeline/workers/submission-stats`, {
+    headers: { authorization: 'Bearer wrong-token' },
+  });
+  assert.equal(deniedStats.status, 401);
+  const statsResponse = await fetch(`${baseUrl}/api/pipeline/workers/submission-stats`, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      'x-go-pipeline-worker-id': identity.workerId,
+      'x-go-pipeline-worker-protocol': '1',
+    },
+  });
+  assert.equal(statsResponse.status, 200);
+  const stats = await statsResponse.json();
+  assert.equal(stats.timeZone, 'Asia/Shanghai');
+  assert.deepEqual(stats.today, { qualified: 2, uploaded: 1, failed: 1, submitting: 0, pendingUpload: 1 });
   const claimed = await requestJson('/api/pipeline/workers/claim', 'POST', identity);
   assert.equal(claimed.response.status, 200);
   assert.equal(claimed.payload.assignment.job.id, jobId);

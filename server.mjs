@@ -48,6 +48,7 @@ import {
 } from './src/review-rules.js';
 import { createPipelineStages, CURRENT_BUG_POLICY_VERSION, CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, CURRENT_WORKFLOW_POLICY_VERSION, CURRENT_WORKFLOW_VERSION, DEFAULT_BUG_COUNT, isPipelineBugDeliveryComplete, pipelineBugQuota, pipelineStageLayoutMatches, pipelineTaskOutcome, pipelineUserQueryReadiness, publicPipelineJob, reactivateFrozenVerificationFailures, reactivatePipelineBug, rewindPipelineBugAfterMissingTrajectory, upgradeSubmissionPlatformStageLayout, upgradeUnfinishedPipelineBugQuota, validatePipelineRequest } from './src/pipeline-rules.js';
 import {
+  buildSubmissionActivityStats,
   DEFAULT_SUBMISSION_PLATFORM_URL,
   findPlatformSubmissionByBugId,
   mergePlatformCookies,
@@ -4862,6 +4863,14 @@ async function submissionPlatformPublicState() {
   };
 }
 
+async function remoteWorkerSubmissionStats() {
+  const [submissionRecords, reviewRecords] = await Promise.all([
+    readSubmissionPlatformRecords(),
+    readReviewStatuses(),
+  ]);
+  return buildSubmissionActivityStats(submissionRecords, reviewRecords);
+}
+
 async function resumeSubmissionPlatformWaiters() {
   let resumed = 0;
   for (const visible of await listPipelineJobs()) {
@@ -7079,6 +7088,19 @@ const server = http.createServer(async (request, response) => {
   try {
     if (request.url === '/api/pipeline/workers' && request.method === 'GET') {
       return json(response, 200, await publicRemoteWorkerState());
+    }
+    if (request.url === '/api/pipeline/workers/submission-stats' && request.method === 'GET') {
+      try {
+        assertRemoteWorkerAuthorized(request);
+        normalizeRemoteWorkerIdentity({
+          workerId: request.headers['x-go-pipeline-worker-id'],
+          role: 'repair-worker',
+          protocolVersion: request.headers['x-go-pipeline-worker-protocol'],
+        });
+        return json(response, 200, await remoteWorkerSubmissionStats());
+      } catch (error) {
+        return json(response, error.statusCode || 400, { message: error.message });
+      }
     }
     if (request.url === '/api/pipeline/workers/register' && request.method === 'POST') {
       try {

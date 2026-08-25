@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  buildSubmissionActivityStats,
   extractPlatformFields,
   findPlatformSubmissionByBugId,
   mergePlatformCookies,
@@ -125,4 +126,22 @@ test('platform import state is imported only after a confirmed submission', () =
     submissionPlatformError: '',
   });
   assert.equal(platformImportState({ status: 'failed', error: 'HTTP 503' }).submissionPlatformImported, false);
+});
+
+test('daily submission activity uses Beijing calendar boundaries and qualified backlog', () => {
+  const stats = buildSubmissionActivityStats([
+    { taskId: 'task-1', bugId: 'bug-1', status: 'submitted', submittedAt: '2026-08-24T16:00:00.000Z', platformSubmissionId: 'submission-1' },
+    { taskId: 'task-2', bugId: 'bug-2', status: 'failed', startedAt: '2026-08-25T01:00:00.000Z', failedAt: '2026-08-25T01:01:00.000Z', error: 'HTTP 503' },
+    { taskId: 'task-old', bugId: 'bug-old', status: 'submitted', submittedAt: '2026-08-24T15:59:59.000Z' },
+  ], [
+    { taskId: 'task-1', status: 'qualified', updatedAt: '2026-08-24T16:00:00.000Z' },
+    { taskId: 'task-2', status: 'qualified', updatedAt: '2026-08-25T01:00:00.000Z' },
+    { taskId: 'task-old', status: 'qualified', updatedAt: '2026-08-24T15:59:59.000Z' },
+    { taskId: 'task-rejected', status: 'unqualified', updatedAt: '2026-08-25T02:00:00.000Z' },
+  ], { now: new Date('2026-08-25T04:00:00.000Z') });
+
+  assert.equal(stats.date, '2026-08-25');
+  assert.deepEqual(stats.today, { qualified: 2, uploaded: 1, failed: 1, submitting: 0, pendingUpload: 1 });
+  assert.deepEqual(stats.allTime, { qualified: 3, uploaded: 2, failed: 1, submitting: 0 });
+  assert.deepEqual(stats.recent.map((item) => item.taskId), ['task-2', 'task-1']);
 });

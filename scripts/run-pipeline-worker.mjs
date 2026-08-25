@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import {
   DISTRIBUTED_WORKER_PROTOCOL_VERSION,
+  formatWorkerSubmissionStats,
   hydrateRemoteRepairJob,
 } from '../src/distributed-workers.js';
 
@@ -25,10 +26,14 @@ const workerRoot = path.resolve(process.env.GO_PIPELINE_WORKER_ROOT || path.join
 const pollIntervalMs = Math.max(2_000, Number(process.env.GO_PIPELINE_WORKER_POLL_INTERVAL_MS || 10_000));
 const heartbeatIntervalMs = Math.max(5_000, Number(process.env.GO_PIPELINE_WORKER_HEARTBEAT_INTERVAL_MS || 15_000));
 const snapshotIntervalMs = Math.max(2_000, Number(process.env.GO_PIPELINE_WORKER_SNAPSHOT_INTERVAL_MS || 5_000));
+const statsIntervalMs = Math.max(30_000, Number(process.env.GO_PIPELINE_WORKER_STATS_INTERVAL_MS || 60_000));
 const pipelineRunnerPath = path.join(monitorRoot, 'scripts', 'run-production-pipeline.mjs');
 const jobsRoot = path.join(workerRoot, 'go-task-library', 'pipeline-jobs');
 const tasksRoot = path.join(workerRoot, 'go-task-library', 'tasks');
 const stopState = { requested: false, child: null };
+let submissionStatsBusy = false;
+let submissionStatsSignature = '';
+let submissionStatsError = '';
 
 function log(message) {
   process.stdout.write(`${new Date().toISOString()} ${message}\n`);
@@ -76,6 +81,8 @@ async function apiJson(pathname, { method = 'GET', body = null, timeoutMs = 2 * 
     method,
     headers: {
       authorization: `Bearer ${workerToken}`,
+      'x-go-pipeline-worker-id': workerId,
+      'x-go-pipeline-worker-protocol': String(DISTRIBUTED_WORKER_PROTOCOL_VERSION),
       ...(body ? { 'content-type': 'application/json' } : {}),
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -89,6 +96,23 @@ async function apiJson(pathname, { method = 'GET', body = null, timeoutMs = 2 * 
     throw error;
   }
   return payload;
+}
+
+async function refreshSubmissionStats({ force = false } = {}) {
+  if (submissionStatsBusy) return;
+  submissionStatsBusy = true;
+  try {
+    const snapshot = await apiJson('/api/pipeline/workers/submission-stats', { timeoutMs: 30_000 });
+    const signature = JSON.stringify({ date: snapshot.date, today: snapshot.today, allTime: snapshot.allTime });
+    if (force || signature !== submissionStatsSignature) log(formatWorkerSubmissionStats(snapshot));
+    submissionStatsSignature = signature;
+    submissionStatsError = '';
+  } catch (error) {
+    if (error.message !== submissionStatsError) log(`读取 A 数据统计暂时失败：${error.message}`);
+    submissionStatsError = error.message;
+  } finally {
+    submissionStatsBusy = false;
+  }
 }
 
 function workerEnvelope(version, extra = {}) {
@@ -409,18 +433,24 @@ async function main() {
     body: workerEnvelope(version),
   });
   log(`repair-worker ${workerId} 已连接 A 电脑，协议 V${DISTRIBUTED_WORKER_PROTOCOL_VERSION}，代码 ${version}`);
-  while (!stopState.requested) {
-    try {
-      const payload = await apiJson('/api/pipeline/workers/claim', {
-        method: 'POST',
-        body: workerEnvelope(version),
-      });
-      if (payload.assignment) await executeAssignment(version, payload.assignment);
-      else await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    } catch (error) {
-      log(`Worker 循环暂时失败：${error.message}`);
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  await refreshSubmissionStats({ force: true });
+  const submissionStatsTimer = setInterval(() => void refreshSubmissionStats(), statsIntervalMs);
+  try {
+    while (!stopState.requested) {
+      try {
+        const payload = await apiJson('/api/pipeline/workers/claim', {
+          method: 'POST',
+          body: workerEnvelope(version),
+        });
+        if (payload.assignment) await executeAssignment(version, payload.assignment);
+        else await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      } catch (error) {
+        log(`Worker 循环暂时失败：${error.message}`);
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      }
     }
+  } finally {
+    clearInterval(submissionStatsTimer);
   }
 }
 

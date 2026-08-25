@@ -2,9 +2,76 @@ import crypto from 'node:crypto';
 import { prepareExcelRecord } from './export-rules.js';
 
 export const DEFAULT_SUBMISSION_PLATFORM_URL = 'https://go.jzxhnh.com';
+export const SUBMISSION_ACTIVITY_TIME_ZONE = 'Asia/Shanghai';
 
 function text(value) {
   return String(value ?? '').trim();
+}
+
+function calendarDate(value, timeZone = SUBMISSION_ACTIVITY_TIME_ZONE) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function submissionActivityAt(record) {
+  if (record?.status === 'submitted') return record.submittedAt || record.reconciledAt || record.startedAt || '';
+  if (record?.status === 'failed') return record.failedAt || record.startedAt || '';
+  return record?.startedAt || '';
+}
+
+export function buildSubmissionActivityStats(submissionRecords = [], reviewRecords = [], {
+  now = new Date(),
+  timeZone = SUBMISSION_ACTIVITY_TIME_ZONE,
+} = {}) {
+  const date = calendarDate(now, timeZone);
+  const submissions = Array.isArray(submissionRecords) ? submissionRecords : [];
+  const reviews = Array.isArray(reviewRecords) ? reviewRecords : [];
+  const qualified = reviews.filter((record) => record?.status === 'qualified');
+  const qualifiedToday = qualified.filter((record) => calendarDate(record.updatedAt, timeZone) === date);
+  const submittedTaskIds = new Set(submissions
+    .filter((record) => record?.status === 'submitted')
+    .map((record) => text(record.taskId))
+    .filter(Boolean));
+  const activityToday = submissions.filter((record) => calendarDate(submissionActivityAt(record), timeZone) === date);
+  const recent = activityToday
+    .map((record) => ({
+      taskId: text(record.taskId),
+      bugId: text(record.bugId),
+      status: text(record.status) || 'unknown',
+      activityAt: submissionActivityAt(record) || null,
+      submissionId: text(record.platformSubmissionId),
+      error: text(record.error),
+    }))
+    .sort((left, right) => String(right.activityAt || '').localeCompare(String(left.activityAt || '')))
+    .slice(0, 20);
+
+  return {
+    date,
+    timeZone,
+    generatedAt: now instanceof Date ? now.toISOString() : new Date(now).toISOString(),
+    today: {
+      qualified: qualifiedToday.length,
+      uploaded: activityToday.filter((record) => record?.status === 'submitted').length,
+      failed: activityToday.filter((record) => record?.status === 'failed').length,
+      submitting: activityToday.filter((record) => record?.status === 'submitting').length,
+      pendingUpload: qualifiedToday.filter((record) => !submittedTaskIds.has(text(record.taskId))).length,
+    },
+    allTime: {
+      qualified: qualified.length,
+      uploaded: submissions.filter((record) => record?.status === 'submitted').length,
+      failed: submissions.filter((record) => record?.status === 'failed').length,
+      submitting: submissions.filter((record) => record?.status === 'submitting').length,
+    },
+    recent,
+  };
 }
 
 export function normalizePlatformFieldKey(value) {

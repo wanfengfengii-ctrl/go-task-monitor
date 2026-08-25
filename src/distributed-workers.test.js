@@ -4,6 +4,7 @@ import path from 'node:path';
 import {
   claimRemoteRepairJob,
   completeRemoteRepairJob,
+  formatWorkerSubmissionStats,
   hydrateRemoteRepairJob,
   mergeRemoteJobSnapshot,
   nodeRoleCanExecuteStage,
@@ -115,4 +116,12 @@ test('worker hydration rewrites every machine-local root and completion closes t
   });
   assert.equal(completed.status, 'passed');
   assert.equal(completed.remoteExecution.status, 'completed');
+});
+
+test('repair worker renders the controller daily submission summary', () => {
+  assert.equal(formatWorkerSubmissionStats({
+    date: '2026-08-25',
+    today: { qualified: 9, uploaded: 7, pendingUpload: 2, failed: 1, submitting: 1 },
+    allTime: { uploaded: 42 },
+  }), 'A 数据统计（2026-08-25，北京时间）：合格完成 9 条，上传成功 7 条，待上传 2 条，上传失败 1 条，处理中 1 条；累计上传 42 条');
 });

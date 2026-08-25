@@ -10,7 +10,7 @@
 
 ## 公共准备
 
-两台新电脑都克隆同一个私有系统仓库，并固定到同一提交。系统代码建议放在 `$HOME/apps`，运行数据放在 `$HOME/go-task-monitor-data`；两个目录不要互相包含，这样 Claude 沙箱可以保护系统代码而不阻止项目生成：
+两台新电脑都克隆同一个系统仓库，并固定到同一提交。系统代码建议放在 `$HOME/apps`，运行数据放在 `$HOME/go-task-monitor-data`；两个目录不要互相包含，这样 Claude 沙箱可以保护系统代码而不阻止项目生成：
 
 ```bash
 mkdir -p "$HOME/apps"
@@ -69,12 +69,13 @@ export GO_PIPELINE_WORKER_ROOT="$HOME/go-task-runtime/repair-b"
 export GO_PIPELINE_WORKER_TOKEN='<shared-token>'
 export GO_PIPELINE_RELEASE_ID='<release-commit>'
 export GO_PIPELINE_REMOTE_BUG_WORKER_LIMIT=4
+export GO_PIPELINE_WORKER_STATS_INTERVAL_MS=60000
 export GO_PIPELINE_CLAUDE_BIN="$(command -v claude)"
 export GO_PIPELINE_CODEX_BIN="$(command -v codex)"
 npm run worker:repair
 ```
 
-B 注册后会持续轮询。`GO_PIPELINE_WORKER_ROOT` 的父目录应只放流水线运行数据，不能直接设成 `$HOME`，否则隔离沙箱会同时隐藏用户目录里的 CLI。一个项目只能有一个有效租约；心跳默认每 15 秒发送，租约默认 90 秒过期。A 请求停止、B 掉线或租约被新 Worker 接管时，旧 Runner 会停止，已同步的阶段检查点可在同一台或替换 B 电脑上恢复。
+B 注册后会持续轮询，并在终端显示 A 电脑按北京时间统计的今日合格完成、上传成功、待上传、上传失败和处理中数量；默认每 60 秒读取一次，只在数字变化时输出。该接口只读且使用 Worker 共享密钥鉴权，平台账号和 Cookie 始终只保存在 A。`GO_PIPELINE_WORKER_ROOT` 的父目录应只放流水线运行数据，不能直接设成 `$HOME`，否则隔离沙箱会同时隐藏用户目录里的 CLI。一个项目只能有一个有效租约；心跳默认每 15 秒发送，租约默认 90 秒过期。A 请求停止、B 掉线或租约被新 Worker 接管时，旧 Runner 会停止，已同步的阶段检查点可在同一台或替换 B 电脑上恢复。
 
 ## 首次灰度
 

@@ -9,6 +9,12 @@ export function normalizePipelineNodeRole(value = '') {
   return PIPELINE_NODE_ROLES.has(normalized) ? normalized : 'all-in-one';
 }
 
+export function formatWorkerSubmissionStats(snapshot = {}) {
+  const today = snapshot.today || {};
+  const allTime = snapshot.allTime || {};
+  return `A 数据统计（${snapshot.date || '日期未知'}，北京时间）：合格完成 ${Number(today.qualified || 0)} 条，上传成功 ${Number(today.uploaded || 0)} 条，待上传 ${Number(today.pendingUpload || 0)} 条，上传失败 ${Number(today.failed || 0)} 条，处理中 ${Number(today.submitting || 0)} 条；累计上传 ${Number(allTime.uploaded || 0)} 条`;
+}
+
 export function pipelineStageExecutionRole(stageId = '') {
   const stage = String(stageId || '');
   if (!stage) return 'producer';
