@@ -14,7 +14,8 @@
     "sync:export-fields": "node scripts/sync-label-export-records.mjs",
     "validate:trajectories": "node scripts/validate-trajectories.mjs",
     "validate:package": "node scripts/validate-go-package.mjs",
-    "pipeline:run": "node scripts/run-production-pipeline.mjs"
+    "pipeline:run": "node scripts/run-production-pipeline.mjs",
+    "worker:repair": "node scripts/run-pipeline-worker.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",

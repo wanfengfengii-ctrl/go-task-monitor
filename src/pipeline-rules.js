@@ -859,7 +859,7 @@ export function pipelineStageLayoutMatches(job = {}) {
 
 export function publicPipelineJob(job) {
   const { jobDir, tasksRoot, request, ...visible } = job;
-  const privateKeys = new Set(['jobDir', 'tasksRoot', 'taskDir', 'goldDir', 'reportPath', 'outputPath', 'eventsPath', 'rawPath', 'filename', 'trajectory', 'verification_fixture_dir', 'verificationFixture', 'fixtureDir', 'directory']);
+  const privateKeys = new Set(['jobDir', 'tasksRoot', 'taskDir', 'bugBaseDir', 'goldDir', 'sourceDir', 'reportPath', 'outputPath', 'eventsPath', 'rawPath', 'filename', 'trajectory', 'verification_fixture_dir', 'verificationFixture', 'fixtureDir', 'directory']);
   const stripPrivatePaths = (value) => {
     if (Array.isArray(value)) return value.map(stripPrivatePaths);
     if (!value || typeof value !== 'object') return value;

@@ -123,10 +123,45 @@ import { DOCKER_RUN_CPU_LIMIT, explicitDockerVerifyCmds, packagedDockerVerifyCmd
 import { withFileLock } from './src/file-lock.js';
 import { validateManualRecoveryBundle } from './src/manual-recovery.js';
 import { hasCurrentArchivedExportPolicy, mergeArchivedTaskRecords } from './src/task-archive.js';
+import {
+  assertRemoteLeaseOwner,
+  claimRemoteRepairJob,
+  completeRemoteRepairJob,
+  DISTRIBUTED_WORKER_PROTOCOL_VERSION,
+  mergeRemoteJobSnapshot,
+  nodeRoleCanExecuteStage,
+  normalizePipelineNodeRole,
+  PIPELINE_NODE_ROLES,
+  remoteRepairClaimable,
+  renewRemoteRepairLease,
+} from './src/distributed-workers.js';
 
 const port = Number(process.env.GO_TASK_MONITOR_API_PORT || 4174);
+const apiHost = String(process.env.GO_TASK_MONITOR_API_HOST || '127.0.0.1').trim() || '127.0.0.1';
+const configuredPipelineNodeRole = String(process.env.GO_PIPELINE_NODE_ROLE || '').trim().toLowerCase();
+if (configuredPipelineNodeRole && !PIPELINE_NODE_ROLES.has(configuredPipelineNodeRole)) {
+  throw new Error(`GO_PIPELINE_NODE_ROLE 不合法：${configuredPipelineNodeRole}`);
+}
+const pipelineNodeRole = normalizePipelineNodeRole(configuredPipelineNodeRole);
+const remoteWorkerToken = String(process.env.GO_PIPELINE_WORKER_TOKEN || '').trim();
+const pipelineReleaseId = String(process.env.GO_PIPELINE_RELEASE_ID || '').trim();
+const configuredRemoteLeaseTtlMs = Number(process.env.GO_PIPELINE_REMOTE_LEASE_TTL_MS || 90_000);
+const REMOTE_LEASE_TTL_MS = Number.isFinite(configuredRemoteLeaseTtlMs)
+  ? Math.max(30_000, Math.min(10 * 60_000, configuredRemoteLeaseTtlMs))
+  : 90_000;
+const REMOTE_TASK_PACKAGE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const startupRecoveryEnabled = process.env.GO_TASK_MONITOR_STARTUP_RECOVERY !== '0';
+if (pipelineNodeRole === 'producer' && remoteWorkerToken.length < 32) {
+  throw new Error('producer 模式必须设置至少 32 字符的 GO_PIPELINE_WORKER_TOKEN');
+}
 const projectRoot = path.resolve(import.meta.dirname, '..');
 const workRoot = path.resolve(process.env.GO_TASK_MONITOR_WORK_ROOT || path.join(projectRoot, '.task_work'));
+if (pipelineNodeRole === 'producer') {
+  const workRootRelativeToProtectedCode = path.relative(projectRoot, workRoot);
+  if (!workRootRelativeToProtectedCode || (!workRootRelativeToProtectedCode.startsWith('..') && !path.isAbsolute(workRootRelativeToProtectedCode))) {
+    throw new Error('producer 的 GO_TASK_MONITOR_WORK_ROOT 必须放在系统代码父目录之外，避免 Claude 保护沙箱同时锁住运行数据');
+  }
+}
 const managedLibraryRoot = path.join(workRoot, 'go-task-library');
 const datastoreProtectionRoot = path.join(workRoot, '.go-task-monitor-protection');
 const datastoreSentinelPath = path.join(datastoreProtectionRoot, 'datastore-sentinel.json');
@@ -141,8 +176,8 @@ const pipelineSchedulerStatePath = path.join(pipelineRefillRoot, 'scheduler.json
 const pipelineWatchdogStatePath = path.join(pipelineRefillRoot, 'watchdog.json');
 const pipelineHealthStatePath = path.join(pipelineRefillRoot, 'health.json');
 const pipelineAlertsStatePath = path.join(pipelineRefillRoot, 'alerts.json');
+const remoteWorkersStatePath = path.join(pipelineRefillRoot, 'remote-workers.json');
 const submissionQualityStatePath = path.join(pipelineRefillRoot, 'submission-quality.json');
-const githubCliPath = process.env.GO_PIPELINE_GH_BIN || path.join(os.homedir(), '.local/bin/gh');
 function resolveCliPath(configured, command, candidates) {
   if (configured) return configured;
   for (const directory of String(process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
@@ -151,6 +186,10 @@ function resolveCliPath(configured, command, candidates) {
   }
   return candidates.find((candidate) => fs.existsSync(candidate)) || command;
 }
+
+const githubCliPath = resolveCliPath(process.env.GO_PIPELINE_GH_BIN, 'gh', [
+  path.join(os.homedir(), '.local/bin/gh'),
+]);
 
 const codexCliPath = resolveCliPath(process.env.GO_PIPELINE_CODEX_BIN, 'codex', [
   '/Applications/ChatGPT.app/Contents/Resources/codex',
@@ -171,11 +210,14 @@ const CODEX_INFERENCE_PROBE_TIMEOUT_MS = Number.isFinite(configuredCodexInferenc
   && configuredCodexInferenceProbeTimeoutMs > 0
   ? Math.max(15_000, configuredCodexInferenceProbeTimeoutMs)
   : 45_000;
-const claudeCliPath = resolveCliPath(process.env.GO_TASK_MONITOR_CLAUDE_BIN, 'claude', [
+const claudeCliPath = resolveCliPath(process.env.GO_TASK_MONITOR_CLAUDE_BIN || process.env.GO_PIPELINE_CLAUDE_BIN, 'claude', [
   path.join(os.homedir(), '.npm-global/bin/claude'),
   path.join(os.homedir(), '.local/bin/claude'),
 ]);
 const cloudUploadBaseUrl = process.env.GO_TASK_MONITOR_CLOUD_URL || 'https://upload.jzxhnh.com';
+const cloudEnvironmentAccount = String(process.env.GO_TASK_MONITOR_CLOUD_USERNAME || '').trim();
+const cloudEnvironmentPassword = String(process.env.GO_TASK_MONITOR_CLOUD_PASSWORD || '');
+const cloudEnvironmentLoginConfigured = Boolean(cloudEnvironmentAccount && cloudEnvironmentPassword);
 const CLOUD_CONTROL_REQUEST_TIMEOUT_MS = 30_000;
 const cloudUploadsPath = path.join(managedLibraryRoot, 'validation/trajectory_uploads.json');
 const cloudUploadsLockPath = `${cloudUploadsPath}.lock`;
@@ -327,6 +369,7 @@ let pipelineHealthState = { updatedAt: null, services: {} };
 let codexInferenceProbeHealth = null;
 let pipelineAlertTail = Promise.resolve();
 let pipelineResourceMaintenanceRunning = false;
+let remoteWorkerMutationTail = Promise.resolve();
 let dockerGraderCpuGuardRunning = false;
 let pipelineLastResourceMaintenanceAt = null;
 let pipelineResourceMaintenanceState = { status: 'idle', requestedAt: null, startedAt: null, finishedAt: null, retryAfter: null, reason: '', error: '' };
@@ -496,6 +539,221 @@ async function writePipelineJob(job) {
   await writePipelineJobContent(pipelineJobBackupFile(job.id), content);
   invalidatePipelineJobsCache();
   scheduleDatastoreEvent('pipeline');
+}
+
+function remoteWorkerAuthorized(request) {
+  if (!remoteWorkerToken) return false;
+  const supplied = String(request.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if (!supplied) return false;
+  const expectedHash = crypto.createHash('sha256').update(remoteWorkerToken).digest();
+  const suppliedHash = crypto.createHash('sha256').update(supplied).digest();
+  return crypto.timingSafeEqual(expectedHash, suppliedHash);
+}
+
+function assertRemoteWorkerAuthorized(request) {
+  if (pipelineNodeRole !== 'producer') {
+    const error = new Error('当前节点没有启用 producer 远程派单模式');
+    error.statusCode = 409;
+    throw error;
+  }
+  if (!remoteWorkerAuthorized(request)) {
+    const error = new Error('远程 Worker 认证失败');
+    error.statusCode = 401;
+    throw error;
+  }
+}
+
+function normalizeRemoteWorkerIdentity(value = {}) {
+  const workerId = String(value.workerId || '').trim();
+  const role = normalizePipelineNodeRole(value.role);
+  const protocolVersion = Number(value.protocolVersion || 0);
+  const codeVersion = String(value.codeVersion || '').trim();
+  if (!/^[a-z0-9][a-z0-9._-]{2,63}$/i.test(workerId)) throw new Error('workerId 必须是 3-64 位字母、数字、点、下划线或短横线');
+  if (role !== 'repair-worker') throw new Error('A/B 模式当前只接受 repair-worker');
+  if (protocolVersion !== DISTRIBUTED_WORKER_PROTOCOL_VERSION) {
+    throw new Error(`Worker 协议版本不兼容：需要 ${DISTRIBUTED_WORKER_PROTOCOL_VERSION}，收到 ${protocolVersion || 'none'}`);
+  }
+  if (pipelineReleaseId && codeVersion && codeVersion !== pipelineReleaseId) {
+    throw new Error(`Worker 代码版本不一致：A=${pipelineReleaseId}，B=${codeVersion || 'unknown'}`);
+  }
+  return { workerId, role, protocolVersion, codeVersion };
+}
+
+async function readRemoteWorkersState() {
+  try {
+    const value = JSON.parse(await fsp.readFile(remoteWorkersStatePath, 'utf8'));
+    return {
+      protocolVersion: DISTRIBUTED_WORKER_PROTOCOL_VERSION,
+      workers: Array.isArray(value.workers) ? value.workers : [],
+      updatedAt: value.updatedAt || null,
+    };
+  } catch {
+    return { protocolVersion: DISTRIBUTED_WORKER_PROTOCOL_VERSION, workers: [], updatedAt: null };
+  }
+}
+
+async function writeRemoteWorkersState(value) {
+  const stateValue = {
+    protocolVersion: DISTRIBUTED_WORKER_PROTOCOL_VERSION,
+    workers: Array.isArray(value.workers) ? value.workers.slice(-50) : [],
+    updatedAt: new Date().toISOString(),
+  };
+  await writePipelineJobContent(remoteWorkersStatePath, `${JSON.stringify(stateValue, null, 2)}\n`);
+  return stateValue;
+}
+
+async function recordRemoteWorker(identity, details = {}) {
+  const stateValue = await readRemoteWorkersState();
+  const observedAt = new Date().toISOString();
+  const previous = stateValue.workers.find((worker) => worker.workerId === identity.workerId);
+  const worker = {
+    ...(previous || {}),
+    workerId: identity.workerId,
+    role: identity.role,
+    protocolVersion: identity.protocolVersion,
+    status: details.status || previous?.status || 'online',
+    hostname: String(details.hostname || previous?.hostname || '').slice(0, 120),
+    platform: String(details.platform || previous?.platform || '').slice(0, 120),
+    codeVersion: String(details.codeVersion || previous?.codeVersion || '').slice(0, 120),
+    currentJobId: details.currentJobId === undefined ? previous?.currentJobId || '' : String(details.currentJobId || ''),
+    registeredAt: previous?.registeredAt || observedAt,
+    lastHeartbeatAt: observedAt,
+  };
+  stateValue.workers = [...stateValue.workers.filter((item) => item.workerId !== identity.workerId), worker];
+  await writeRemoteWorkersState(stateValue);
+  return worker;
+}
+
+function withRemoteWorkerMutation(action) {
+  const operation = remoteWorkerMutationTail.then(action);
+  remoteWorkerMutationTail = operation.catch(() => {});
+  return operation;
+}
+
+async function claimRemoteRepairAssignment(identity, details = {}) {
+  return withRemoteWorkerMutation(async () => {
+    if (pipelineReleaseId && identity.codeVersion !== pipelineReleaseId) {
+      throw new Error(`Worker 代码版本不一致：A=${pipelineReleaseId}，B=${identity.codeVersion || 'unknown'}`);
+    }
+    const visibleJobs = await listPipelineJobsFresh();
+    const jobs = (await Promise.all(visibleJobs.map((job) => readPipelineJob(job.id)))).filter(Boolean);
+    const nowMs = Date.now();
+    const candidate = jobs
+      .filter((job) => remoteRepairClaimable(job, nowMs))
+      .sort((left, right) => String(left.waitingResource?.queuedAt || left.updatedAt || left.createdAt || '')
+        .localeCompare(String(right.waitingResource?.queuedAt || right.updatedAt || right.createdAt || '')))[0];
+    if (!candidate) {
+      await recordRemoteWorker(identity, { ...details, status: 'idle', currentJobId: '' });
+      return null;
+    }
+    const leaseId = crypto.randomUUID();
+    const claimed = claimRemoteRepairJob(candidate, {
+      workerId: identity.workerId,
+      leaseId,
+      leaseTtlMs: REMOTE_LEASE_TTL_MS,
+    });
+    claimed.logs = [...(claimed.logs || []), {
+      at: claimed.remoteExecution.claimedAt,
+      level: 'info',
+      stageId: claimed.currentStage,
+      message: `B 电脑 ${identity.workerId} 已领取远程修复租约 ${leaseId}`,
+    }].slice(-300);
+    await writePipelineJob(claimed);
+    await recordRemoteWorker(identity, { ...details, status: 'busy', currentJobId: claimed.id });
+    return { leaseId, expiresAt: claimed.remoteExecution.expiresAt, job: claimed };
+  });
+}
+
+async function heartbeatRemoteRepairAssignment(jobId, identity, leaseId, details = {}) {
+  return withRemoteWorkerMutation(async () => {
+    const job = await readPipelineJob(jobId);
+    if (!job) throw new Error('远程租约对应的项目不存在');
+    const renewed = renewRemoteRepairLease(job, {
+      workerId: identity.workerId,
+      leaseId,
+      leaseTtlMs: REMOTE_LEASE_TTL_MS,
+      status: 'running',
+    });
+    await writePipelineJob(renewed);
+    await recordRemoteWorker(identity, { ...details, status: 'busy', currentJobId: jobId });
+    return {
+      expiresAt: renewed.remoteExecution.expiresAt,
+      cancelRequested: renewed.remoteExecution.status === 'cancel_requested',
+      cancelReason: renewed.remoteExecution.cancelReason || '',
+    };
+  });
+}
+
+async function acceptRemoteJobSnapshot(jobId, identity, leaseId, snapshot) {
+  return withRemoteWorkerMutation(async () => {
+    const current = await readPipelineJob(jobId);
+    if (!current) throw new Error('远程快照对应的项目不存在');
+    if (current.remoteExecution?.status === 'cancel_requested') {
+      const error = new Error('远程项目已经收到停止请求');
+      error.code = 'REMOTE_CANCEL_REQUESTED';
+      throw error;
+    }
+    let merged = mergeRemoteJobSnapshot(current, snapshot, {
+      workerId: identity.workerId,
+      leaseId,
+    });
+    merged = renewRemoteRepairLease(merged, {
+      workerId: identity.workerId,
+      leaseId,
+      leaseTtlMs: REMOTE_LEASE_TTL_MS,
+      status: 'running',
+    });
+    await writePipelineJob(merged);
+    await recordRemoteWorker(identity, { status: 'busy', currentJobId: jobId });
+    return merged;
+  });
+}
+
+async function finishRemoteRepairAssignment(jobId, identity, leaseId, snapshot, outcome) {
+  return withRemoteWorkerMutation(async () => {
+    const current = await readPipelineJob(jobId);
+    if (!current) throw new Error('远程完成回报对应的项目不存在');
+    assertRemoteLeaseOwner(current, identity.workerId, leaseId);
+    let merged = snapshot
+      ? mergeRemoteJobSnapshot(current, snapshot, { workerId: identity.workerId, leaseId })
+      : structuredClone(current);
+    const effectiveOutcome = outcome === 'passed' && snapshot?.status === 'passed'
+      ? 'passed'
+      : outcome === 'stopped' || current.remoteExecution?.status === 'cancel_requested'
+        ? 'stopped'
+        : 'failed';
+    merged = completeRemoteRepairJob(merged, {
+      workerId: identity.workerId,
+      leaseId,
+      outcome: effectiveOutcome,
+    });
+    if (effectiveOutcome === 'failed' && !merged.error) merged.error = '远程 repair-worker 异常结束';
+    merged.logs = [...(merged.logs || []), {
+      at: merged.finishedAt,
+      level: effectiveOutcome === 'passed' ? 'success' : effectiveOutcome === 'stopped' ? 'warn' : 'error',
+      stageId: merged.currentStage,
+      message: `B 电脑 ${identity.workerId} 远程修复结束：${effectiveOutcome}`,
+    }].slice(-300);
+    await writePipelineJob(merged);
+    await recordRemoteWorker(identity, { status: 'idle', currentJobId: '' });
+    if (pipelineAutoFillEnabled) void fillPipelineSlots();
+    return merged;
+  });
+}
+
+async function publicRemoteWorkerState() {
+  const stateValue = await readRemoteWorkersState();
+  const now = Date.now();
+  return {
+    enabled: pipelineNodeRole === 'producer',
+    nodeRole: pipelineNodeRole,
+    protocolVersion: DISTRIBUTED_WORKER_PROTOCOL_VERSION,
+    leaseTtlMs: REMOTE_LEASE_TTL_MS,
+    workers: stateValue.workers.map((worker) => ({
+      ...worker,
+      status: now - Date.parse(worker.lastHeartbeatAt || '') > REMOTE_LEASE_TTL_MS * 2 ? 'offline' : worker.status,
+    })),
+  };
 }
 
 async function writePipelineStopRequest(jobId, reason, source = 'monitor') {
@@ -898,7 +1156,7 @@ async function listPipelineJobsFresh() {
       const latestIncident = relatedIncidents.at(-1);
       const visible = {
         ...cached.visible,
-        processActive: Boolean(handle),
+        processActive: Boolean(handle) || ['leased', 'running', 'cancel_requested'].includes(String(job.remoteExecution?.status || '')),
         processPid: handle?.pid || null,
         processAdopted: Boolean(handle?.adopted),
         ...(latestIncident?.triage ? {
@@ -2360,6 +2618,9 @@ async function preparePipelineStart(jobId, { automatic = false, externalResume =
     throw new Error(`提交人 ${contributorId} 已触发项目质量事故熔断，不能继续运行该项目`);
   }
   const admittedStage = nextPipelineStage(job);
+  if (!nodeRoleCanExecuteStage(pipelineNodeRole, admittedStage)) {
+    throw new Error(`阶段 ${admittedStage} 等待 B 电脑 repair-worker，producer 不会在本机执行`);
+  }
   const resourceSlots = await activePipelineResourceSlotSnapshot();
   const startCapacity = pipelineStageStartCapacity(allJobs, admittedStage, effectiveMaxConcurrency, {
     activeLeaseCounts: resourceSlots.counts,
@@ -2424,14 +2685,19 @@ async function startPipelineJob(jobId, options = {}) {
   try {
     job = await preparePipelineStart(jobId, options);
     await fsp.rm(path.join(path.dirname(pipelineJobFile(jobId)), 'stop-request.json'), { force: true });
+    const runnerEnvironment = { ...process.env };
+    delete runnerEnvironment.GO_PIPELINE_WORKER_TOKEN;
+    delete runnerEnvironment.GO_TASK_MONITOR_CLOUD_USERNAME;
+    delete runnerEnvironment.GO_TASK_MONITOR_CLOUD_PASSWORD;
     child = spawn(process.execPath, [pipelineRunnerPath, pipelineJobFile(jobId)], {
       cwd: import.meta.dirname,
       env: {
-        ...process.env,
+        ...runnerEnvironment,
         GOTOOLCHAIN: process.env.GOTOOLCHAIN || 'local',
         GO_PIPELINE_CODEX_BIN: codexCliPath,
         GO_PIPELINE_CLAUDE_BIN: claudeCliPath,
         GO_PIPELINE_BUGFIX_MODEL: process.env.GO_PIPELINE_BUGFIX_MODEL || 'model_hub/glm-52-coding',
+        GO_PIPELINE_EXECUTION_ROLE: pipelineNodeRole,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
@@ -2654,8 +2920,11 @@ async function fillPipelineSlots() {
       // selection quota and then get filtered out afterwards; doing so can
       // leave the canary failed forever with an apparently idle scheduler.
       const rolloutCandidates = rolloutEligibleJobs(autofillEligibleJobs, rollout);
+      const roleEligibleCandidates = rolloutCandidates.filter((job) => (
+        nodeRoleCanExecuteStage(pipelineNodeRole, nextPipelineStage(job))
+      ));
       let candidates = selectPipelineAutofillCandidates(
-        rolloutCandidates,
+        roleEligibleCandidates,
         occupiedJobIds,
         availableCapacity,
         {
@@ -2736,6 +3005,22 @@ async function stopPipelineJob(jobId, { pauseScheduling = true, reason = 'user_s
     await writePipelineJob(job);
   }
   const handle = activePipelineProcesses.get(jobId);
+  if (!handle && ['leased', 'running', 'cancel_requested'].includes(String(job.remoteExecution?.status || ''))) {
+    const requestedAt = new Date().toISOString();
+    job.remoteExecution = {
+      ...job.remoteExecution,
+      status: 'cancel_requested',
+      cancelReason: reason,
+      cancelSource: source,
+      cancelRequestedAt: requestedAt,
+      updatedAt: requestedAt,
+    };
+    job.status = 'waiting_resource';
+    job.error = '已通知 B 电脑停止远程 Runner';
+    job.updatedAt = requestedAt;
+    await writePipelineJob(job);
+    return;
+  }
   if (!handle || !processIsAlive(handle.pid)) {
     job.status = 'stopped';
     job.finishedAt = new Date().toISOString();
@@ -3338,6 +3623,15 @@ async function controlPipelineScheduler(mode) {
       await writePipelineStopRequest(jobId, 'emergency_stop', 'scheduler_control').catch(() => {});
       await signalPipelineProcess(jobId, 'SIGTERM').catch((error) => addLog('warn', `紧急停止 ${jobId} 失败：${error.message}`));
     }
+    for (const visibleJob of await listPipelineJobsFresh()) {
+      const remote = visibleJob.remoteExecution || {};
+      if (!['leased', 'running', 'cancel_requested'].includes(String(remote.status || ''))) continue;
+      await stopPipelineJob(visibleJob.id, {
+        pauseScheduling: false,
+        reason: 'emergency_stop',
+        source: 'scheduler_control',
+      }).catch((error) => addLog('warn', `紧急停止远程项目 ${visibleJob.id} 失败：${error.message}`));
+    }
   }
   const labels = {
     running: '闭环调度已恢复',
@@ -3919,11 +4213,25 @@ async function runCloudKeychain(action, account, password = null) {
   });
 }
 
+async function readCloudCredential(account) {
+  if (cloudEnvironmentLoginConfigured && account === cloudEnvironmentAccount) {
+    return { found: true, data: Buffer.from(cloudEnvironmentPassword, 'utf8'), source: 'environment' };
+  }
+  if (process.platform !== 'darwin') return { found: false, data: Buffer.alloc(0), source: 'none' };
+  return runCloudKeychain('read', account);
+}
+
+async function cloudCredentialExists(account) {
+  if (cloudEnvironmentLoginConfigured && account === cloudEnvironmentAccount) return true;
+  if (process.platform !== 'darwin') return false;
+  return (await runCloudKeychain('exists', account)).found;
+}
+
 async function clearCloudSession({ forgetCredentials = false } = {}) {
   if (forgetCredentials) cloudAuthEpoch += 1;
   const accountToForget = cloudAutoLoginAccount || cloudConnectedAs;
   let credentialDeleteError = null;
-  if (forgetCredentials && accountToForget) {
+  if (forgetCredentials && accountToForget && process.platform === 'darwin') {
     try {
       await runCloudKeychain('delete', accountToForget);
     } catch (error) {
@@ -3981,17 +4289,19 @@ async function requestCloudLogin(username, password) {
 
 async function connectCloudUpload(username, password) {
   const previousAccount = cloudAutoLoginAccount;
-  await ensureCloudKeychainBinary();
   const cookie = await requestCloudLogin(username, password);
-  await runCloudKeychain('store', username, password);
-  if (previousAccount && previousAccount !== username) {
-    await runCloudKeychain('delete', previousAccount).catch((error) => addLog('warn', `旧云盘账号的钥匙串凭据未能删除：${error.message}`));
+  if (process.platform === 'darwin') {
+    await runCloudKeychain('store', username, password);
+    if (previousAccount && previousAccount !== username) {
+      await runCloudKeychain('delete', previousAccount).catch((error) => addLog('warn', `旧云盘账号的钥匙串凭据未能删除：${error.message}`));
+    }
   }
   cloudAuthEpoch += 1;
   cloudSessionCookie = cookie;
   cloudConnectedAs = username;
   cloudAutoLoginAccount = username;
-  cloudAutoLoginConfigured = true;
+  cloudAutoLoginConfigured = process.platform === 'darwin'
+    || (cloudEnvironmentLoginConfigured && username === cloudEnvironmentAccount && password === cloudEnvironmentPassword);
   cloudLastCheckedAt = new Date().toISOString();
   cloudLastRefreshedAt = cloudLastCheckedAt;
   cloudLastError = '';
@@ -4004,14 +4314,16 @@ async function refreshCloudLogin(reason = '会话失效') {
   const account = cloudAutoLoginAccount;
   const epoch = cloudAuthEpoch;
   const refresh = (async () => {
-    const stored = await runCloudKeychain('read', account);
+    const stored = await readCloudCredential(account);
     if (epoch !== cloudAuthEpoch || !cloudAutoLoginConfigured || cloudAutoLoginAccount !== account) {
       stored.data.fill(0);
       throw new Error('自动登录已被用户取消');
     }
     if (!stored.found || !stored.data.length) {
       cloudAutoLoginConfigured = false;
-      cloudLastError = 'macOS 钥匙串中没有找到云盘凭据，请重新连接一次';
+      cloudLastError = process.platform === 'darwin'
+        ? 'macOS 钥匙串中没有找到云盘凭据，请重新连接一次'
+        : '未配置 GO_TASK_MONITOR_CLOUD_USERNAME/GO_TASK_MONITOR_CLOUD_PASSWORD，不能自动恢复云盘登录';
       await persistCloudSession();
       throw new Error(cloudLastError);
     }
@@ -4091,19 +4403,24 @@ async function maintainCloudSession({ force = false } = {}) {
 }
 
 async function restoreCloudSession() {
-  const saved = JSON.parse(await fsp.readFile(cloudSessionPath, 'utf8'));
+  const saved = JSON.parse(await fsp.readFile(cloudSessionPath, 'utf8').catch((error) => {
+    if (error.code === 'ENOENT') return '{}';
+    throw error;
+  }));
   cloudSessionCookie = String(saved?.cookie || '');
   cloudConnectedAs = String(saved?.connectedAs || '');
-  cloudAutoLoginAccount = String(saved?.autoLoginAccount || saved?.connectedAs || '');
+  cloudAutoLoginAccount = cloudEnvironmentLoginConfigured
+    ? cloudEnvironmentAccount
+    : String(saved?.autoLoginAccount || saved?.connectedAs || '');
   cloudLastCheckedAt = saved?.lastCheckedAt || null;
   cloudLastRefreshedAt = saved?.lastRefreshedAt || null;
   cloudLastError = String(saved?.lastError || '');
   if (cloudAutoLoginAccount) {
     try {
-      cloudAutoLoginConfigured = (await runCloudKeychain('exists', cloudAutoLoginAccount)).found;
+      cloudAutoLoginConfigured = await cloudCredentialExists(cloudAutoLoginAccount);
     } catch (error) {
       cloudAutoLoginConfigured = false;
-      cloudLastError = `无法检查 macOS 钥匙串：${error.message}`;
+      cloudLastError = `无法检查云盘自动登录凭据：${error.message}`;
     }
   }
   if (!cloudSessionCookie) {
@@ -5581,6 +5898,155 @@ async function readBuffer(request, maxBytes = 512 * 1024 * 1024) {
   return Buffer.concat(chunks);
 }
 
+async function streamRequestToFile(request, filename, maxBytes) {
+  const declaredBytes = Number(request.headers['content-length'] || 0);
+  if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+    throw new Error(`远程任务包不能超过 ${Math.floor(maxBytes / 1024 / 1024)} MB`);
+  }
+  await fsp.mkdir(path.dirname(filename), { recursive: true });
+  const output = fs.createWriteStream(filename, { flags: 'wx', mode: 0o600 });
+  let totalBytes = 0;
+  try {
+    for await (const chunk of request) {
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) throw new Error(`远程任务包不能超过 ${Math.floor(maxBytes / 1024 / 1024)} MB`);
+      if (!output.write(chunk)) await new Promise((resolve) => output.once('drain', resolve));
+    }
+    await new Promise((resolve, reject) => {
+      output.once('error', reject);
+      output.end(resolve);
+    });
+    return totalBytes;
+  } catch (error) {
+    output.destroy();
+    await fsp.rm(filename, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+function validateRemoteTaskArchiveListing(stdout, taskName) {
+  const entries = String(stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!entries.length) throw new Error('远程任务包为空');
+  for (const entry of entries) {
+    if (entry.includes('\\') || entry.startsWith('/') || /^[A-Za-z]:/.test(entry)) throw new Error(`远程任务包包含绝对路径：${entry}`);
+    const normalized = entry.replace(/^\.\//, '').replace(/\/+$/, '');
+    const parts = normalized.split('/');
+    if (parts.some((part) => !part || part === '.' || part === '..')) throw new Error(`远程任务包包含越界路径：${entry}`);
+    if (parts[0] !== taskName) throw new Error(`远程任务包根目录必须是 ${taskName}`);
+  }
+  return entries;
+}
+
+async function assertNoSymbolicLinks(root) {
+  for (const entry of await fsp.readdir(root, { withFileTypes: true })) {
+    const filename = path.join(root, entry.name);
+    const stat = await fsp.lstat(filename);
+    if (stat.isSymbolicLink()) throw new Error(`远程任务包不能包含符号链接：${path.relative(root, filename)}`);
+    if (stat.isDirectory()) await assertNoSymbolicLinks(filename);
+  }
+}
+
+async function importRemoteTaskPackage(request, jobId, taskName, identity, leaseId) {
+  if (!/^pipeline-[a-z0-9-]+$/i.test(jobId)) throw new Error('pipeline id 不合法');
+  if (!/^[a-z0-9][a-z0-9._-]{2,160}$/i.test(taskName) || path.basename(taskName) !== taskName) throw new Error('taskName 不合法');
+  const job = await readPipelineJob(jobId);
+  if (!job) throw new Error('远程任务包对应的项目不存在');
+  const lease = assertRemoteLeaseOwner(job, identity.workerId, leaseId);
+  if (lease.status === 'cancel_requested') {
+    const error = new Error('远程项目已经收到停止请求');
+    error.code = 'REMOTE_CANCEL_REQUESTED';
+    throw error;
+  }
+  const importRoot = await fsp.mkdtemp(path.join(pipelineRefillRoot, 'remote-task-import-'));
+  const archivePath = path.join(importRoot, 'task.tar.gz');
+  const extractionRoot = path.join(importRoot, 'extracted');
+  try {
+    const bytes = await streamRequestToFile(request, archivePath, REMOTE_TASK_PACKAGE_MAX_BYTES);
+    if (!bytes) throw new Error('远程任务包为空');
+    const listing = await runCapturedCommand('tar', ['-tzf', archivePath], { cwd: importRoot, timeoutMs: 2 * 60_000 });
+    if (listing.exitCode !== 0) throw new Error(`远程任务包目录读取失败：${compactCapturedOutput(listing).slice(-1000)}`);
+    validateRemoteTaskArchiveListing(listing.stdout, taskName);
+    const verbose = await runCapturedCommand('tar', ['-tvzf', archivePath], { cwd: importRoot, timeoutMs: 2 * 60_000 });
+    if (verbose.exitCode !== 0 || String(verbose.stdout || '').split(/\r?\n/).some((line) => /^[lh]/.test(line) || / link to /.test(line))) {
+      throw new Error('远程任务包包含不允许的链接条目');
+    }
+    await fsp.mkdir(extractionRoot, { recursive: true });
+    const extracted = await runCapturedCommand('tar', ['-xzf', archivePath, '-C', extractionRoot], { cwd: importRoot, timeoutMs: 10 * 60_000 });
+    if (extracted.exitCode !== 0) throw new Error(`远程任务包解压失败：${compactCapturedOutput(extracted).slice(-1000)}`);
+    const extractedTask = path.join(extractionRoot, taskName);
+    const taskStat = await fsp.stat(extractedTask).catch(() => null);
+    if (!taskStat?.isDirectory()) throw new Error('远程任务包缺少任务根目录');
+    await assertNoSymbolicLinks(extractedTask);
+    const metadata = JSON.parse(await fsp.readFile(path.join(extractedTask, 'public.json'), 'utf8'));
+    if (String(metadata.pipeline_job_id || '') !== jobId) throw new Error('远程任务包的 pipeline_job_id 不匹配');
+    const knownTask = (job.bugs || []).some((bug) => bug.task?.taskName === taskName);
+    if (!knownTask) throw new Error('远程任务包不属于当前项目');
+    await fsp.mkdir(tasksRoot, { recursive: true });
+    const target = path.join(tasksRoot, taskName);
+    const backup = path.join(importRoot, 'previous-task');
+    const hadPrevious = Boolean(await fsp.stat(target).catch(() => null));
+    if (hadPrevious) await fsp.rename(target, backup);
+    try {
+      await fsp.rename(extractedTask, target);
+    } catch (error) {
+      if (hadPrevious) await fsp.rename(backup, target).catch(() => {});
+      throw error;
+    }
+    await fsp.rm(backup, { recursive: true, force: true });
+    invalidateTaskDiscoveryCache({ graceMs: 0 });
+    scheduleDatastoreEvent('data');
+    return { taskName, bytes, taskDir: target };
+  } finally {
+    await fsp.rm(importRoot, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function sendRemoteTaskPackage(response, jobId, taskName, identity, leaseId) {
+  const job = await readPipelineJob(jobId);
+  if (!job) throw new Error('远程任务包对应的项目不存在');
+  const lease = assertRemoteLeaseOwner(job, identity.workerId, leaseId);
+  if (lease.status === 'cancel_requested') {
+    const error = new Error('远程项目已经收到停止请求');
+    error.code = 'REMOTE_CANCEL_REQUESTED';
+    throw error;
+  }
+  if (!/^[a-z0-9][a-z0-9._-]{2,160}$/i.test(taskName) || path.basename(taskName) !== taskName) throw new Error('taskName 不合法');
+  const taskDir = path.join(tasksRoot, taskName);
+  if (!await fsp.stat(taskDir).catch(() => null)) {
+    const error = new Error('A 电脑尚未保存这个任务检查点');
+    error.statusCode = 404;
+    throw error;
+  }
+  const exportRoot = await fsp.mkdtemp(path.join(pipelineRefillRoot, 'remote-task-export-'));
+  const archivePath = path.join(exportRoot, `${taskName}.tar.gz`);
+  try {
+    const packed = await runCapturedCommand('tar', [
+      '-czf', archivePath,
+      '--exclude=.verification-cache',
+      '--exclude=node_modules',
+      '-C', tasksRoot,
+      taskName,
+    ], { cwd: tasksRoot, timeoutMs: 20 * 60_000 });
+    if (packed.exitCode !== 0) throw new Error(`远程任务检查点压缩失败：${compactCapturedOutput(packed).slice(-1000)}`);
+    const stat = await fsp.stat(archivePath);
+    response.writeHead(200, {
+      'content-type': 'application/gzip',
+      'content-length': String(stat.size),
+      'content-disposition': `attachment; filename="${taskName}.tar.gz"`,
+      'cache-control': 'no-store',
+    });
+    await new Promise((resolve, reject) => {
+      const input = fs.createReadStream(archivePath);
+      input.once('error', reject);
+      response.once('error', reject);
+      response.once('finish', resolve);
+      input.pipe(response);
+    });
+  } finally {
+    await fsp.rm(exportRoot, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 function json(response, status, value) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   response.end(JSON.stringify(value));
@@ -6182,6 +6648,124 @@ async function downloadTaskPackageEvidence(taskId, response) {
 
 const server = http.createServer(async (request, response) => {
   try {
+    if (request.url === '/api/pipeline/workers' && request.method === 'GET') {
+      return json(response, 200, await publicRemoteWorkerState());
+    }
+    if (request.url === '/api/pipeline/workers/register' && request.method === 'POST') {
+      try {
+        assertRemoteWorkerAuthorized(request);
+        const body = await readJson(request);
+        const identity = normalizeRemoteWorkerIdentity(body);
+        const worker = await recordRemoteWorker(identity, {
+          status: 'online',
+          hostname: body.hostname,
+          platform: body.platform,
+          codeVersion: body.codeVersion,
+          currentJobId: '',
+        });
+        return json(response, 200, { protocolVersion: DISTRIBUTED_WORKER_PROTOCOL_VERSION, leaseTtlMs: REMOTE_LEASE_TTL_MS, worker });
+      } catch (error) {
+        return json(response, error.statusCode || 409, { message: error.message });
+      }
+    }
+    if (request.url === '/api/pipeline/workers/claim' && request.method === 'POST') {
+      try {
+        assertRemoteWorkerAuthorized(request);
+        const body = await readJson(request);
+        const identity = normalizeRemoteWorkerIdentity(body);
+        const assignment = await claimRemoteRepairAssignment(identity, {
+          hostname: body.hostname,
+          platform: body.platform,
+          codeVersion: body.codeVersion,
+        });
+        return json(response, 200, { protocolVersion: DISTRIBUTED_WORKER_PROTOCOL_VERSION, assignment });
+      } catch (error) {
+        return json(response, error.statusCode || 409, { message: error.message });
+      }
+    }
+    const remoteHeartbeat = request.url.match(/^\/api\/pipeline\/workers\/jobs\/([^/?]+)\/heartbeat$/);
+    if (remoteHeartbeat && request.method === 'POST') {
+      try {
+        assertRemoteWorkerAuthorized(request);
+        const body = await readJson(request);
+        const identity = normalizeRemoteWorkerIdentity(body);
+        const result = await heartbeatRemoteRepairAssignment(
+          decodeURIComponent(remoteHeartbeat[1]), identity, String(body.leaseId || ''), body,
+        );
+        return json(response, 200, result);
+      } catch (error) {
+        return json(response, error.statusCode || (error.code === 'REMOTE_LEASE_LOST' ? 409 : 400), { message: error.message, code: error.code || '' });
+      }
+    }
+    const remoteSnapshot = request.url.match(/^\/api\/pipeline\/workers\/jobs\/([^/?]+)\/snapshot$/);
+    if (remoteSnapshot && request.method === 'PUT') {
+      try {
+        assertRemoteWorkerAuthorized(request);
+        const body = await readJson(request);
+        const identity = normalizeRemoteWorkerIdentity(body);
+        const job = await acceptRemoteJobSnapshot(
+          decodeURIComponent(remoteSnapshot[1]), identity, String(body.leaseId || ''), body.job,
+        );
+        return json(response, 200, { accepted: true, updatedAt: job.updatedAt });
+      } catch (error) {
+        return json(response, error.statusCode || (['REMOTE_LEASE_LOST', 'REMOTE_CANCEL_REQUESTED'].includes(error.code) ? 409 : 400), { message: error.message, code: error.code || '' });
+      }
+    }
+    const remoteComplete = request.url.match(/^\/api\/pipeline\/workers\/jobs\/([^/?]+)\/complete$/);
+    if (remoteComplete && request.method === 'POST') {
+      try {
+        assertRemoteWorkerAuthorized(request);
+        const body = await readJson(request);
+        const identity = normalizeRemoteWorkerIdentity(body);
+        const job = await finishRemoteRepairAssignment(
+          decodeURIComponent(remoteComplete[1]), identity, String(body.leaseId || ''), body.job, String(body.outcome || ''),
+        );
+        return json(response, 200, { accepted: true, status: job.status });
+      } catch (error) {
+        return json(response, error.statusCode || (error.code === 'REMOTE_LEASE_LOST' ? 409 : 400), { message: error.message, code: error.code || '' });
+      }
+    }
+    const remoteTaskPackage = request.url.match(/^\/api\/pipeline\/workers\/jobs\/([^/?]+)\/tasks\/([^/?]+)\/package$/);
+    if (remoteTaskPackage && request.method === 'GET') {
+      try {
+        assertRemoteWorkerAuthorized(request);
+        const identity = normalizeRemoteWorkerIdentity({
+          workerId: request.headers['x-go-pipeline-worker-id'],
+          role: 'repair-worker',
+          protocolVersion: request.headers['x-go-pipeline-worker-protocol'],
+        });
+        await sendRemoteTaskPackage(
+          response,
+          decodeURIComponent(remoteTaskPackage[1]),
+          decodeURIComponent(remoteTaskPackage[2]),
+          identity,
+          String(request.headers['x-go-pipeline-lease-id'] || ''),
+        );
+        return;
+      } catch (error) {
+        return json(response, error.statusCode || (error.code === 'REMOTE_LEASE_LOST' ? 409 : 400), { message: error.message, code: error.code || '' });
+      }
+    }
+    if (remoteTaskPackage && request.method === 'PUT') {
+      try {
+        assertRemoteWorkerAuthorized(request);
+        const identity = normalizeRemoteWorkerIdentity({
+          workerId: request.headers['x-go-pipeline-worker-id'],
+          role: 'repair-worker',
+          protocolVersion: request.headers['x-go-pipeline-worker-protocol'],
+        });
+        const result = await importRemoteTaskPackage(
+          request,
+          decodeURIComponent(remoteTaskPackage[1]),
+          decodeURIComponent(remoteTaskPackage[2]),
+          identity,
+          String(request.headers['x-go-pipeline-lease-id'] || ''),
+        );
+        return json(response, 200, { imported: true, taskName: result.taskName, bytes: result.bytes });
+      } catch (error) {
+        return json(response, error.statusCode || (error.code === 'REMOTE_LEASE_LOST' ? 409 : 400), { message: error.message, code: error.code || '' });
+      }
+    }
     if (request.url === '/api/pipeline/repository/next' && request.method === 'GET') {
       try {
         return json(response, 200, await getSequentialRepositoryStatus());
@@ -6211,6 +6795,7 @@ const server = http.createServer(async (request, response) => {
         budget: currentPipelineBudget(jobs),
         resourcePolicy,
         resourceMaintenance: pipelineResourceMaintenanceState,
+        distributedWorkers: await publicRemoteWorkerState(),
         performance: pipelinePerformanceSnapshot(jobs, {
           workflowVersion: CURRENT_WORKFLOW_VERSION,
           verificationPolicyVersion: CURRENT_VERIFICATION_POLICY_VERSION,
@@ -6830,7 +7415,7 @@ async function upgradePersistedPipelineBugQuotas() {
 
 server.on('error', (error) => {
   if (error?.code === 'EADDRINUSE') {
-    console.error(`Go task monitor API 已在 127.0.0.1:${port} 运行，当前实例退出`);
+    console.error(`Go task monitor API 已在 ${apiHost}:${port} 运行，当前实例退出`);
     process.exitCode = 0;
     return;
   }
@@ -6838,10 +7423,12 @@ server.on('error', (error) => {
   process.exitCode = 1;
 });
 
-server.listen(port, '127.0.0.1', () => {
-  console.log(`Go task monitor API listening on http://127.0.0.1:${port}`);
-  void startDatastoreWatcher();
-  void restoreRuntimeAfterRestart().catch((error) => addLog('warn', `恢复系统运行状态失败：${error.message}`));
+server.listen(port, apiHost, () => {
+  console.log(`Go task monitor API listening on http://${apiHost}:${port} (${pipelineNodeRole})`);
+  if (startupRecoveryEnabled) {
+    void startDatastoreWatcher();
+    void restoreRuntimeAfterRestart().catch((error) => addLog('warn', `恢复系统运行状态失败：${error.message}`));
+  }
 });
 
 setInterval(() => { void autoUploadCompletedTrajectories(); }, 30_000).unref();

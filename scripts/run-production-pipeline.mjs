@@ -46,6 +46,13 @@ import {
 } from '../src/pipeline-rules.js';
 import { beginBugAttempt, finishBugAttempt, nextIncompleteBugIndex, normalizeBugExecution, takeBugRetryQueue } from '../src/bug-workbench.js';
 import { nextPipelineStage, pipelineResourcePolicy, pipelineStageHealthBlockers, pipelineStageRequiredServices, pipelineStageResourceProfile, pipelineStructuredCodexLimit } from '../src/pipeline-operations.js';
+import {
+  DISTRIBUTED_WORKER_PROTOCOL_VERSION,
+  normalizePipelineNodeRole,
+  PIPELINE_NODE_ROLES,
+  pipelineStageExecutionRole,
+  prepareRemoteRepairHandoff,
+} from '../src/distributed-workers.js';
 import { assertProtectedSnapshotPath, claudeGenerationSandbox, criticalSnapshotTarOptions } from '../src/data-protection.js';
 import { assessProjectComplexity, PROJECT_COMPLEXITY_LIMITS } from '../src/project-complexity.js';
 import {
@@ -98,7 +105,8 @@ const trajectoryValidatorPath = path.join(monitorRoot, 'scripts/validate-traject
 const taskRunnerPath = path.join(monitorRoot, 'run_one_claude.sh');
 const verificationRunnerPath = path.join(monitorRoot, 'run_verify_claude.sh');
 const codexBin = process.env.GO_PIPELINE_CODEX_BIN || 'codex';
-const claudeBin = process.env.GO_PIPELINE_CLAUDE_BIN || '/Users/niuyuhang/.npm-global/bin/claude';
+const claudeBin = process.env.GO_PIPELINE_CLAUDE_BIN
+  || (process.platform === 'darwin' ? '/Users/niuyuhang/.npm-global/bin/claude' : 'claude');
 const maxCommandOutput = 2 * 1024 * 1024;
 // The monitor's cloud uploader may perform four 90-second requests plus
 // backoff and an authentication refresh.  Keep the caller deadline longer
@@ -121,6 +129,14 @@ export const DOCKER_RUN_CPU_LIMIT = Math.max(1, Math.min(4,
   Number.isFinite(configuredDockerRunCpuLimit) ? configuredDockerRunCpuLimit : 4));
 const MAX_INJECTION_SLOT_ATTEMPTS = 3;
 const monitorApiUrl = process.env.GO_TASK_MONITOR_API_URL || `http://127.0.0.1:${process.env.GO_TASK_MONITOR_API_PORT || 4174}`;
+const configuredPipelineExecutionRole = String(process.env.GO_PIPELINE_EXECUTION_ROLE || '').trim().toLowerCase();
+if (configuredPipelineExecutionRole && !PIPELINE_NODE_ROLES.has(configuredPipelineExecutionRole)) {
+  throw new Error(`GO_PIPELINE_EXECUTION_ROLE 不合法：${configuredPipelineExecutionRole}`);
+}
+const pipelineExecutionRole = normalizePipelineNodeRole(configuredPipelineExecutionRole);
+const remoteWorkerId = String(process.env.GO_PIPELINE_WORKER_ID || '').trim();
+const remoteWorkerToken = String(process.env.GO_PIPELINE_WORKER_TOKEN || '').trim();
+const remoteWorkerLeaseId = String(process.env.GO_PIPELINE_REMOTE_LEASE_ID || '').trim();
 // Project generation is deliberately not bounded by a wall-clock deadline.
 // A large generated project can spend a long time compiling and repairing its
 // own tests; terminating the Claude session while it is making progress only
@@ -530,6 +546,21 @@ export function projectBugWorkerCeiling({
 }
 
 async function currentProjectBugWorkerLimit(jobId = '') {
+  if (pipelineExecutionRole === 'repair-worker') {
+    const configured = Math.max(1, Math.min(4, Number(process.env.GO_PIPELINE_REMOTE_BUG_WORKER_LIMIT || 4)));
+    const resources = {
+      freeMemoryBytes: os.freemem(),
+      totalMemoryBytes: os.totalmem(),
+      memoryAvailablePercent: (os.freemem() / Math.max(1, os.totalmem())) * 100,
+      loadRatio: os.loadavg()[0] / Math.max(1, os.cpus().length),
+    };
+    return adaptiveProjectBugWorkerLimit({
+      configuredMax: configured,
+      configuredMin: 1,
+      resources,
+      activeRunnerCount: await activePipelineRunnerCount(),
+    });
+  }
   const [pipelineSnapshot, resources] = await Promise.all([
     fetch(`${monitorApiUrl}/api/pipeline/jobs`, { signal: AbortSignal.timeout(5_000) })
       .then(async (response) => {
@@ -572,9 +603,13 @@ const DEFAULT_PROJECT_GENERATOR_PROVIDER = 'claude';
 const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic';
 const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-pro[1m]';
 const DEFAULT_BUGFIX_MODEL = 'model_hub/glm-52-coding';
-const PROJECT_GENERATOR_SECRET_ENV_NAMES = [
+const CHILD_SECRET_ENV_NAMES = [
   'GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN',
   'GO_PIPELINE_PROJECT_GENERATOR_API_KEY',
+  'GO_PIPELINE_WORKER_TOKEN',
+  'GO_PIPELINE_REMOTE_LEASE_ID',
+  'GO_TASK_MONITOR_CLOUD_USERNAME',
+  'GO_TASK_MONITOR_CLOUD_PASSWORD',
 ];
 
 export function projectGeneratorConfig(environment = process.env) {
@@ -2252,7 +2287,7 @@ function runCommand(command, args, options = {}) {
     let progressLastChangedAt = startedAt;
     let activeWorkStartedAt = 0;
     const childEnvironment = { ...process.env, ...(options.env || {}) };
-    for (const name of PROJECT_GENERATOR_SECRET_ENV_NAMES) delete childEnvironment[name];
+    for (const name of CHILD_SECRET_ENV_NAMES) delete childEnvironment[name];
     for (const name of options.unsetEnv || []) delete childEnvironment[name];
     const child = spawn(command, args, {
       cwd: options.cwd,
@@ -7620,12 +7655,113 @@ export async function restoreVerificationEvidenceFromManifests(jobFile, bugIndex
   return { restored, reset };
 }
 
+const remoteTaskSyncTails = new Map();
+
+function remoteWorkerRequestHeaders(extra = {}) {
+  return {
+    authorization: `Bearer ${remoteWorkerToken}`,
+    'x-go-pipeline-worker-id': remoteWorkerId,
+    'x-go-pipeline-worker-protocol': String(DISTRIBUTED_WORKER_PROTOCOL_VERSION),
+    'x-go-pipeline-lease-id': remoteWorkerLeaseId,
+    ...extra,
+  };
+}
+
+function assertRemoteWorkerRuntime() {
+  if (pipelineExecutionRole !== 'repair-worker') return false;
+  if (!remoteWorkerId || !remoteWorkerToken || !remoteWorkerLeaseId) {
+    throw new Error('repair-worker 缺少 GO_PIPELINE_WORKER_ID、GO_PIPELINE_WORKER_TOKEN 或远程租约');
+  }
+  return true;
+}
+
+async function pushRemoteJobSnapshot(jobFile = activeJobFile) {
+  if (!assertRemoteWorkerRuntime()) return { skipped: true };
+  const snapshot = await readJson(jobFile);
+  const response = await fetch(`${monitorApiUrl}/api/pipeline/workers/jobs/${encodeURIComponent(snapshot.id)}/snapshot`, {
+    method: 'PUT',
+    headers: remoteWorkerRequestHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({
+      workerId: remoteWorkerId,
+      role: 'repair-worker',
+      protocolVersion: DISTRIBUTED_WORKER_PROTOCOL_VERSION,
+      leaseId: remoteWorkerLeaseId,
+      job: snapshot,
+    }),
+    signal: AbortSignal.timeout(2 * 60_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.message || `远程项目快照同步失败（HTTP ${response.status}）`);
+    error.code = payload.code || 'REMOTE_SNAPSHOT_FAILED';
+    throw error;
+  }
+  return payload;
+}
+
+async function remoteTaskDirForName(taskName) {
+  if (!activeJobFile) return '';
+  const job = await readJson(activeJobFile, null);
+  const task = (job?.bugs || []).find((bug) => bug.task?.taskName === taskName)?.task;
+  return String(task?.taskDir || '');
+}
+
+async function syncRemoteTaskPackage(taskDir) {
+  if (!assertRemoteWorkerRuntime()) return { skipped: true };
+  const resolvedTaskDir = path.resolve(taskDir);
+  const taskName = path.basename(resolvedTaskDir);
+  const previous = remoteTaskSyncTails.get(resolvedTaskDir) || Promise.resolve();
+  const operation = previous.then(async () => {
+    const job = await readJson(activeJobFile);
+    await pushRemoteJobSnapshot(activeJobFile);
+    const archiveRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-pipeline-remote-task-'));
+    const archivePath = path.join(archiveRoot, `${taskName}.tar.gz`);
+    try {
+      const packed = await runCommand('tar', [
+        '-czf', archivePath,
+        '--exclude=.verification-cache',
+        '--exclude=node_modules',
+        '-C', path.dirname(resolvedTaskDir),
+        taskName,
+      ], { cwd: path.dirname(resolvedTaskDir), timeoutMs: 20 * 60_000 });
+      if (packed.exitCode !== 0) throw commandFailure('远程任务包压缩', packed);
+      const stat = await fsp.stat(archivePath);
+      const response = await fetch(
+        `${monitorApiUrl}/api/pipeline/workers/jobs/${encodeURIComponent(job.id)}/tasks/${encodeURIComponent(taskName)}/package`,
+        {
+          method: 'PUT',
+          headers: remoteWorkerRequestHeaders({
+            'content-type': 'application/gzip',
+            'content-length': String(stat.size),
+          }),
+          body: fs.createReadStream(archivePath),
+          duplex: 'half',
+          signal: AbortSignal.timeout(30 * 60_000),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.message || `远程任务包同步失败（HTTP ${response.status}）`);
+      return payload;
+    } finally {
+      await fsp.rm(archiveRoot, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+  const queued = operation.catch(() => {});
+  remoteTaskSyncTails.set(resolvedTaskDir, queued);
+  try {
+    return await operation;
+  } finally {
+    if (remoteTaskSyncTails.get(resolvedTaskDir) === queued) remoteTaskSyncTails.delete(resolvedTaskDir);
+  }
+}
+
 async function qualifyTask(job, task, { verificationFinalize = false } = {}) {
+  await syncRemoteTaskPackage(task.taskDir);
   const taskId = managedTaskId(task.taskName);
   const bugIndex = Number((job.bugs || []).find((bug) => bug.task?.taskName === task.taskName)?.bugIndex);
   const response = await fetch(`${monitorApiUrl}/api/tasks/review`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: remoteWorkerRequestHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({
       tasks: [taskId],
       status: 'qualified',
@@ -7672,10 +7808,12 @@ async function cleanupVerificationCache(taskDir) {
 }
 
 async function uploadQualifiedTrajectory(taskName, { pipelineJobId = '', bugIndex = null } = {}) {
+  const remoteTaskDir = await remoteTaskDirForName(taskName);
+  if (remoteTaskDir) await syncRemoteTaskPackage(remoteTaskDir);
   const taskId = managedTaskId(taskName);
   const response = await fetch(`${monitorApiUrl}/api/cloud/upload`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: remoteWorkerRequestHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({
       tasks: [taskId],
       source: 'pipeline-verification-finalize',
@@ -7843,10 +7981,12 @@ async function runBugfixProofStages(jobFile, bugIndex, projectDir) {
 }
 
 async function uploadVerificationProof(taskName, artifactKind) {
+  const remoteTaskDir = await remoteTaskDirForName(taskName);
+  if (remoteTaskDir) await syncRemoteTaskPackage(remoteTaskDir);
   const taskId = managedTaskId(taskName);
   const response = await fetch(`${monitorApiUrl}/api/cloud/upload-proof`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: remoteWorkerRequestHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({ taskId, artifactKind }),
     signal: AbortSignal.timeout(PIPELINE_CLOUD_UPLOAD_TIMEOUT_MS),
   });
@@ -7889,6 +8029,7 @@ export async function finalizeVerificationResult(taskDir, mainSessionId) {
   if (new Set(sessions).size !== sessions.length) throw new Error('主轨迹、pre_fix 和 post_fix 必须使用互不重复的新 Session');
   metadata.verify_result = JSON.stringify(result);
   await writeJsonAtomic(publicPath, metadata);
+  await syncRemoteTaskPackage(taskDir);
   return result;
 }
 
@@ -8980,6 +9121,10 @@ async function publishV3GitBaselines(jobFile, projectDir) {
 async function runPipeline(jobFile) {
   activeJobFile = jobFile;
   let job = await readJson(jobFile);
+  if (pipelineExecutionRole === 'repair-worker'
+    && pipelineStageExecutionRole(job.currentStage) !== 'repair-worker') {
+    throw new Error(`repair-worker 不能从 A 电脑阶段 ${job.currentStage || '(empty)'} 启动`);
+  }
   const policyMigration = migrateWorkflowPolicyVersion(job);
   if (policyMigration.changed) {
     await updateJob(jobFile, (current) => {
@@ -8996,9 +9141,11 @@ async function runPipeline(jobFile) {
   // Do not resurrect the retired private-fixture recovery path.  A stopped
   // task is resumed from its persisted August 21 checkpoint or by an explicit
   // operator action; it is never sent back to a Codex fixture Session.
-  await restoreUnfilledBugSlotsForInjection(jobFile);
+  if (pipelineExecutionRole !== 'repair-worker') await restoreUnfilledBugSlotsForInjection(jobFile);
   job = await readJson(jobFile);
-  const quotaUpgrade = upgradeUnfinishedPipelineBugQuota(job);
+  const quotaUpgrade = pipelineExecutionRole === 'repair-worker'
+    ? { changed: false }
+    : upgradeUnfinishedPipelineBugQuota(job);
   if (quotaUpgrade.changed) {
     job = await updateJob(jobFile, (current) => {
       Object.assign(current, upgradeUnfinishedPipelineBugQuota(current).job);
@@ -9062,6 +9209,7 @@ async function runPipeline(jobFile) {
   const projectDir = path.join(jobDir, 'project');
   await repairMissingPipelineCloneUrl(jobFile, projectDir, job.request);
 
+  if (pipelineExecutionRole !== 'repair-worker') {
   // Project planning is a one-time checkpoint.  A stale scheduler cursor or
   // a resumed Bug must not invoke Sol again after generation/validation has
   // already consumed the original plan.
@@ -9296,6 +9444,44 @@ async function runPipeline(jobFile) {
     } catch (error) {
       throw new Error(`已发布 main 基线不合格，停止自动重试：${error.message}`);
     }
+  }
+
+  if (pipelineExecutionRole === 'producer') {
+    const published = await readJson(jobFile);
+    const remoteStage = String((published.stages || []).find((stage) => (
+      pipelineStageExecutionRole(stage.id) === 'repair-worker'
+        && !['passed', 'skipped'].includes(stage.status)
+    ))?.id || '');
+    const handedOffAt = now();
+    if (!remoteStage) {
+      await updateJob(jobFile, (current) => {
+        const summary = pipelineProjectDeliverySummary(current);
+        current.status = summary.passed ? 'passed' : 'failed';
+        current.repositoryDisposition = summary.passed ? 'delivered' : 'failed';
+        current.currentStage = null;
+        current.finishedAt = handedOffAt;
+        current.error = summary.passed
+          ? ''
+          : '项目没有形成可交给 B 电脑修复的合格 Bug，已停止在 A 电脑';
+      });
+      return;
+    }
+    await updateJob(jobFile, (current) => {
+      Object.assign(current, prepareRemoteRepairHandoff(current, remoteStage, handedOffAt));
+      current.logs = [...(current.logs || []), {
+        at: handedOffAt,
+        level: 'success',
+        stageId: remoteStage,
+        message: `Git 基线已发布，项目已交给 B 电脑 repair-worker，从 ${remoteStage} 继续`,
+      }].slice(-200);
+    });
+    await fsp.appendFile(
+      path.join(jobDir, 'pipeline.log'),
+      `${handedOffAt} [success] [${remoteStage}] Git 基线已发布，等待 B 电脑 repair-worker 领取\n`,
+      'utf8',
+    );
+    return;
+  }
   }
 
   job = await readJson(jobFile);
