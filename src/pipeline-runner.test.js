@@ -362,6 +362,7 @@ test('a saved repair checkpoint still waits for post-Claude test authoring', asy
 });
 
 test('bugfix repair checkpoint requires a non-test workspace change', async () => {
+  const { bugfixRepairMeetsPolicy } = await import('../scripts/run-production-pipeline.mjs');
   const root = await mkdtemp(path.join(os.tmpdir(), 'bugfix-repair-diff-'));
   const baseline = path.join(root, 'baseline');
   const fixed = path.join(root, 'fixed');
@@ -375,15 +376,38 @@ test('bugfix repair checkpoint requires a non-test workspace change', async () =
     assert.deepEqual(await inspectBugfixRepairWorkspace(baseline, fixed), {
       valid: false,
       changedNonTestFiles: [],
+      changedProductionFiles: [],
+      changedProductionLines: 0,
     });
     await writeFile(path.join(fixed, 'service.go'), 'package repaired\n');
-    assert.deepEqual(await inspectBugfixRepairWorkspace(baseline, fixed), {
+    const shallowRepair = await inspectBugfixRepairWorkspace(baseline, fixed);
+    assert.deepEqual(shallowRepair, {
       valid: true,
       changedNonTestFiles: ['service.go'],
+      changedProductionFiles: ['service.go'],
+      changedProductionLines: 2,
     });
+    assert.equal(bugfixRepairMeetsPolicy(shallowRepair, 0), true);
+    assert.equal(bugfixRepairMeetsPolicy(shallowRepair, 1), false);
+    await writeFile(path.join(fixed, 'service.go'), 'package repaired\n\nfunc Enabled() bool { return true }\n');
+    const substantiveRepair = await inspectBugfixRepairWorkspace(baseline, fixed);
+    assert.equal(substantiveRepair.changedProductionLines >= 3, true);
+    assert.equal(bugfixRepairMeetsPolicy(substantiveRepair, 1), true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('new bugfix repair policy is assigned only to newly created jobs and enforced before checkpoint reuse', async () => {
+  const [server, pipeline, runner] = await Promise.all([
+    readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8'),
+    readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8'),
+    readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8'),
+  ]);
+  assert.match(server, /bugfixRepairPolicyVersion:\s*CURRENT_BUGFIX_REPAIR_POLICY_VERSION/);
+  assert.match(pipeline, /bugfix_repair_policy_version:\s*Number\(job\.bugfixRepairPolicyVersion \|\| 0\)/);
+  assert.match(pipeline, /repairCheckpointReusable[\s\S]{0,240}bugfixRepairMeetsPolicy/);
+  assert.match(runner, /bugfix Claude production patch changes \$\{repair_changed_lines:-0\} lines; at least 3 are required/);
 });
 
 test('a published Green commit restores a reset bugfix workspace', async () => {

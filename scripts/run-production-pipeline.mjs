@@ -26,8 +26,10 @@ import { classifyPipelineFailure, projectPlanCheckpointConsumed, shouldRegenerat
 import { classifyTrajectoryAttemptFailure, goldTestNamespace, isSystemTrajectoryFailure } from '../src/grader-guards.js';
 import {
   createPipelineStages,
+  CURRENT_BUGFIX_REPAIR_POLICY_VERSION,
   CURRENT_WORKFLOW_VERSION,
   CURRENT_WORKFLOW_POLICY_VERSION,
+  MIN_BUGFIX_PRODUCTION_CHANGED_LINES,
   PARALLEL_BUG_WORKFLOW_VERSION,
   isPipelineBugDeliveryComplete,
   isSkippedPipelineBug,
@@ -3297,7 +3299,40 @@ export async function inspectBugfixRepairWorkspace(baselineDir, fixedDir) {
     ...[...fixed].filter(([filename, hash]) => baseline.get(filename) !== hash).map(([filename]) => filename),
     ...[...baseline.keys()].filter((filename) => !fixed.has(filename)),
   ])].sort();
-  return { valid: changedNonTestFiles.length > 0, changedNonTestFiles };
+  let numstat = '';
+  try {
+    ({ stdout: numstat } = await execFileAsync('git', [
+      'diff', '--no-index', '--numstat', '--', baselineDir, fixedDir,
+    ], { maxBuffer: 16 * 1024 * 1024 }));
+  } catch (error) {
+    if (Number(error?.code) !== 1) throw error;
+    numstat = String(error?.stdout || '');
+  }
+  const isProductionSourcePath = (filename) => (
+    /\.(?:go|c|cc|cpp|h|hpp|rs|java|kt|kts|py|rb|php|js|jsx|mjs|cjs|ts|tsx|vue|svelte|css|scss|sass|less|html|sql|sh)$/i.test(filename)
+    && !/(?:_test\.go|(?:^|\/)testdata\/|(?:^|\/)[^/]*\.(?:test|spec)\.[^/]+)$/i.test(filename)
+  );
+  const changedProductionFiles = changedNonTestFiles.filter(isProductionSourcePath);
+  let changedProductionLines = 0;
+  for (const line of String(numstat || '').split(/\r?\n/).filter(Boolean)) {
+    const [added, removed, filename = ''] = line.split('\t');
+    if (!/^\d+$/.test(added) || !/^\d+$/.test(removed)) continue;
+    if (!/\.(?:go|c|cc|cpp|h|hpp|rs|java|kt|kts|py|rb|php|js|jsx|mjs|cjs|ts|tsx|vue|svelte|css|scss|sass|less|html|sql|sh)(?:\}|$)/i.test(filename)) continue;
+    if (/(?:_test\.go|(?:^|\/)testdata\/|(?:^|\/)[^/]*\.(?:test|spec)\.[^/]+)(?:\}|$)/i.test(filename)) continue;
+    changedProductionLines += Number(added) + Number(removed);
+  }
+  return {
+    valid: changedNonTestFiles.length > 0,
+    changedNonTestFiles,
+    changedProductionFiles,
+    changedProductionLines,
+  };
+}
+
+export function bugfixRepairMeetsPolicy(inspection, policyVersion = 0) {
+  if (!inspection?.valid) return false;
+  if (Number(policyVersion || 0) < CURRENT_BUGFIX_REPAIR_POLICY_VERSION) return true;
+  return Number(inspection.changedProductionLines || 0) >= MIN_BUGFIX_PRODUCTION_CHANGED_LINES;
 }
 
 export async function restorePublishedBugfixWorkspace(task) {
@@ -3307,7 +3342,14 @@ export async function restorePublishedBugfixWorkspace(task) {
   const workspaceDir = path.join(taskDir, 'workspace');
   const current = await inspectBugfixRepairWorkspace(pristineDir, workspaceDir)
     .catch(() => ({ valid: false, changedNonTestFiles: [] }));
-  if (current.valid) return { restored: false, reason: 'workspace_valid', changedNonTestFiles: current.changedNonTestFiles };
+  if (bugfixRepairMeetsPolicy(current, task.bugfixRepairPolicyVersion)) {
+    return {
+      restored: false,
+      reason: 'workspace_valid',
+      changedNonTestFiles: current.changedNonTestFiles,
+      changedProductionLines: current.changedProductionLines,
+    };
+  }
 
   const layout = await readJson(path.join(taskDir, '.git-layout.json'), null);
   const layoutDir = path.resolve(String(layout?.repository || ''));
@@ -3335,7 +3377,9 @@ export async function restorePublishedBugfixWorkspace(task) {
     if (testSha !== layout.test_sha256) throw new Error('恢复的 Green 回归测试哈希不一致');
     await copyWithoutGit(cloneDir, replacementDir);
     const inspection = await inspectBugfixRepairWorkspace(pristineDir, replacementDir);
-    if (!inspection.valid) throw new Error('已发布 Green 提交不包含有效生产补丁');
+    if (!bugfixRepairMeetsPolicy(inspection, task.bugfixRepairPolicyVersion)) {
+      throw new Error(`已发布 Green 提交生产代码改动 ${inspection.changedProductionLines} 行，少于 ${MIN_BUGFIX_PRODUCTION_CHANGED_LINES} 行`);
+    }
 
     const historyRoot = path.join(path.dirname(path.dirname(taskDir)), 'retry-history', path.basename(taskDir));
     const archivedWorkspace = path.join(historyRoot, `workspace-before-green-recovery-${now().replace(/[:.]/g, '-')}`);
@@ -3358,10 +3402,13 @@ export async function restorePublishedBugfixWorkspace(task) {
 }
 
 async function assertBugfixRepairWorkspace(task, fixedDir = path.join(task.taskDir, 'workspace'), baselineDir = path.join(task.taskDir, 'pristine')) {
-  if (task.taskType !== 'bugfix') return { valid: true, changedNonTestFiles: [] };
+  if (task.taskType !== 'bugfix') return { valid: true, changedNonTestFiles: [], changedProductionFiles: [], changedProductionLines: 0 };
   const inspection = await inspectBugfixRepairWorkspace(baselineDir, fixedDir);
-  if (inspection.valid) return inspection;
-  const error = new Error('INVALID_REPAIR_OUTPUT=1: Bugfix Claude 修复未产生任何非测试文件变更，不能保存检查点或进入独立测试编写');
+  if (bugfixRepairMeetsPolicy(inspection, task.bugfixRepairPolicyVersion)) return inspection;
+  const detail = inspection.valid
+    ? `Bugfix Claude 模型生产代码改动 ${inspection.changedProductionLines} 行，少于 ${MIN_BUGFIX_PRODUCTION_CHANGED_LINES} 行`
+    : 'Bugfix Claude 修复未产生任何非测试文件变更';
+  const error = new Error(`INVALID_REPAIR_OUTPUT=1: ${detail}，不能保存检查点或进入独立测试编写`);
   error.code = 'INVALID_REPAIR_OUTPUT';
   throw error;
 }
@@ -3495,7 +3542,11 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
   const task = job.bugs?.find((item) => Number(item.bugIndex) === Number(bugIndex))?.task;
   if (!task?.taskDir) throw new Error(`Bug ${bugIndex} 缺少任务目录，不能生成回归测试`);
   const taskDir = task.taskDir;
-  await assertBugfixRepairWorkspace({ ...task, taskType: 'bugfix' }, fixedDir, bugBaseDir);
+  await assertBugfixRepairWorkspace({
+    ...task,
+    taskType: 'bugfix',
+    bugfixRepairPolicyVersion: Number(job.bugfixRepairPolicyVersion || 0),
+  }, fixedDir, bugBaseDir);
   const existing = job.bugs?.find((item) => Number(item.bugIndex) === Number(bugIndex))?.verificationTestAuthor;
   if (existing?.sourceDir && existing?.testFile && existing?.sha256) {
     const bytes = await fsp.readFile(path.join(existing.sourceDir, existing.testFile)).catch(() => null);
@@ -7317,6 +7368,7 @@ async function createTask({ job, jobFile, bugIndex, bug, bugRecord, gold, goldDi
     language: 'Go',
     workflow_version: workflowVersion,
     workflow_policy_version: Number(job.workflowPolicyVersion || 0),
+    bugfix_repair_policy_version: Number(job.bugfixRepairPolicyVersion || 0),
     verification_policy_version: verificationPolicyVersion,
     verification_coverage_policy_version: 0,
     verification_coverage_checklist_policy_version: VERIFICATION_COVERAGE_CHECKLIST_VERSION,
@@ -7931,7 +7983,10 @@ export async function prepareTrajectoryRetry(job, task, checkpointSignal = '') {
         path.join(task.taskDir, '.repair-checkpoint/workspace'),
       ).catch(() => ({ valid: false, changedNonTestFiles: [] }))
     : { valid: true, changedNonTestFiles: [] };
-  const repairCheckpointReusable = !repairCheckpointExists || repairInspection.valid;
+  const repairCheckpointReusable = !repairCheckpointExists || bugfixRepairMeetsPolicy(
+    repairInspection,
+    retryMetadata.bugfix_repair_policy_version,
+  );
   const explicitReuseLevel = requestedReuseLevel === 1 && !repairCheckpointReusable ? 0 : requestedReuseLevel;
   // Only the saved checkpoint is durable. Failure details are deliberately
   // ignored so a fresh Claude Session starts from the original user report.
@@ -8695,7 +8750,11 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
     initialJob = await readJson(jobFile);
     bugRecord = initialJob.bugs.find((item) => item.bugIndex === bugIndex);
   }
-  const task = { ...bugRecord.task, taskType: initialJob.request.taskType };
+  const task = {
+    ...bugRecord.task,
+    taskType: initialJob.request.taskType,
+    bugfixRepairPolicyVersion: Number(initialJob.bugfixRepairPolicyVersion || 0),
+  };
   await sanitizeModelFacingDiagnosisTask(task, bugRecord);
   if (bugRecord.trajectoryDisposition === 'skipped_pending_verification') {
     return {
@@ -8902,7 +8961,14 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
       if (!trajectoryCapture?.isFile()) {
         throw new Error(`ENOENT: Claude runner exited successfully without required trajectory capture '${trajectoryCapturePath}'`);
       }
-      await setStage(jobFile, claudeStage, 'passed', { attempt });
+      const repairInspection = await assertBugfixRepairWorkspace(task);
+      await setStage(jobFile, claudeStage, 'passed', {
+        attempt,
+        changedProductionLines: repairInspection.changedProductionLines,
+        minimumChangedProductionLines: task.bugfixRepairPolicyVersion >= CURRENT_BUGFIX_REPAIR_POLICY_VERSION
+          ? MIN_BUGFIX_PRODUCTION_CHANGED_LINES
+          : 0,
+      });
 
       const validationStage = `bug${bugIndex}_trajectory_validate`;
       failedStage = validationStage;

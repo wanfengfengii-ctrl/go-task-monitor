@@ -47,7 +47,7 @@ import {
   normalizeDiagnosisGitMetadata,
   resolvePinnedGoVersion,
 } from './src/review-rules.js';
-import { createPipelineStages, CURRENT_BUG_POLICY_VERSION, CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, CURRENT_WORKFLOW_POLICY_VERSION, CURRENT_WORKFLOW_VERSION, DEFAULT_BUG_COUNT, isPipelineBugDeliveryComplete, pipelineBugQuota, pipelineStageLayoutMatches, pipelineTaskOutcome, pipelineUserQueryReadiness, publicPipelineJob, reactivateFailedPipelineBugsForManualRetry, reactivateFrozenVerificationFailures, reactivatePipelineBug, rewindPipelineBugAfterMissingTrajectory, upgradeSubmissionPlatformStageLayout, upgradeUnfinishedPipelineBugQuota, validatePipelineRequest } from './src/pipeline-rules.js';
+import { createPipelineStages, CURRENT_BUG_POLICY_VERSION, CURRENT_BUGFIX_REPAIR_POLICY_VERSION, CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, CURRENT_WORKFLOW_POLICY_VERSION, CURRENT_WORKFLOW_VERSION, DEFAULT_BUG_COUNT, isPipelineBugDeliveryComplete, pipelineBugQuota, pipelineStageLayoutMatches, pipelineTaskOutcome, pipelineUserQueryReadiness, publicPipelineJob, reactivateFailedPipelineBugsForManualRetry, reactivateFrozenVerificationFailures, reactivatePipelineBug, rewindPipelineBugAfterMissingTrajectory, upgradeSubmissionPlatformStageLayout, upgradeUnfinishedPipelineBugQuota, validatePipelineRequest } from './src/pipeline-rules.js';
 import {
   buildPlatformReviewSnapshot,
   buildSubmissionActivityStats,
@@ -1335,6 +1335,7 @@ async function createPipelineJob(input) {
     id,
     workflowVersion: CURRENT_WORKFLOW_VERSION,
     workflowPolicyVersion: CURRENT_WORKFLOW_POLICY_VERSION,
+    bugfixRepairPolicyVersion: CURRENT_BUGFIX_REPAIR_POLICY_VERSION,
     verificationPolicyVersion: CURRENT_VERIFICATION_POLICY_VERSION,
     submissionPlatformPolicyVersion: CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION,
     // The semantic verify_cmds coverage review is retired. V5 independent

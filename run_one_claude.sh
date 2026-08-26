@@ -68,6 +68,7 @@ fi
 task_type=""
 workflow_version=""
 workflow_policy_version=""
+bugfix_repair_policy_version="0"
 verification_policy_version=""
 new_private_fixture_flow=0
 post_claude_codex_flow=0
@@ -285,6 +286,20 @@ bugfix_workspace_has_non_test_change() {
     return 1
   fi
   return 0
+}
+
+bugfix_workspace_production_changed_lines() {
+  local baseline="$1"
+  local candidate="$2"
+  { git diff --no-index --numstat -- "$baseline" "$candidate" 2>/dev/null || true; } \
+    | awk -F '\t' '
+      $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ \
+        && $3 ~ /\.(go|c|cc|cpp|h|hpp|rs|java|kt|kts|py|rb|php|js|jsx|mjs|cjs|ts|tsx|vue|svelte|css|scss|sass|less|html|sql|sh)(}|$)/ \
+        && $3 !~ /_test\.go(}|$)/ \
+        && $3 !~ /(^|\/)testdata\// \
+        && $3 !~ /(^|\/)[^/]*\.(test|spec)\.[^/]+(}|$)/ { total += $1 + $2 }
+      END { print total + 0 }
+    '
 }
 
 bugfix_workspace_tests_unchanged() {
@@ -705,6 +720,7 @@ export TMPDIR="$GOTMPDIR"
 task_type="$(jq -r '.task_type // empty' "$task_dir/public.json")"
 workflow_version="$(jq -r '.workflow_version // 1' "$task_dir/public.json")"
 workflow_policy_version="$(jq -r '.workflow_policy_version // 0' "$task_dir/public.json")"
+bugfix_repair_policy_version="$(jq -r '.bugfix_repair_policy_version // 0' "$task_dir/public.json")"
 verification_policy_version="$(jq -r '.verification_policy_version // 0' "$task_dir/public.json")"
 if [[ "$task_type" != "bugfix" && "$task_type" != "diagnosis" ]]; then
   echo "unsupported task type: $task_type" >&2
@@ -776,16 +792,18 @@ defer_model_tests=0
 checkpoint_context_matches() {
   local metadata="$1"
   [[ -s "$metadata" ]] || return 1
-  local saved_task_type saved_workflow saved_policy saved_verification_policy saved_prompt saved_pristine
+  local saved_task_type saved_workflow saved_policy saved_repair_policy saved_verification_policy saved_prompt saved_pristine
   saved_task_type="$(jq -r '.task_type // empty' "$metadata")"
   saved_workflow="$(jq -r '.workflow_version // empty' "$metadata")"
   saved_policy="$(jq -r '.workflow_policy_version // 0' "$metadata")"
+  saved_repair_policy="$(jq -r '.bugfix_repair_policy_version // 0' "$metadata")"
   saved_verification_policy="$(jq -r '.verification_policy_version // 0' "$metadata")"
   saved_prompt="$(jq -r '.prompt_sha256 // empty' "$metadata")"
   saved_pristine="$(jq -r '.pristine_sha256 // empty' "$metadata")"
   [[ "$saved_task_type" == "$task_type" \
     && "$saved_workflow" == "$workflow_version" \
     && "$saved_policy" == "$workflow_policy_version" \
+    && "$saved_repair_policy" == "$bugfix_repair_policy_version" \
     && "$saved_verification_policy" == "$verification_policy_version" \
     && "$saved_prompt" == "$(current_prompt_sha256)" \
     && "$saved_pristine" == "$(current_pristine_sha256)" ]]
@@ -803,6 +821,7 @@ write_checkpoint_metadata() {
     --arg task_type "$task_type" \
     --arg workflow_version "$workflow_version" \
     --arg workflow_policy_version "$workflow_policy_version" \
+    --arg bugfix_repair_policy_version "$bugfix_repair_policy_version" \
     --arg verification_policy_version "$verification_policy_version" \
     --arg claude_code_version "${claude_code_version:-}" \
     --arg prompt_sha256 "$(current_prompt_sha256)" \
@@ -815,6 +834,7 @@ write_checkpoint_metadata() {
       task_type: $task_type,
       workflow_version: ($workflow_version | tonumber),
       workflow_policy_version: ($workflow_policy_version | tonumber),
+      bugfix_repair_policy_version: ($bugfix_repair_policy_version | tonumber),
       verification_policy_version: ($verification_policy_version | tonumber),
       claude_code_version: $claude_code_version,
       prompt_sha256: $prompt_sha256,
@@ -858,6 +878,15 @@ restore_repair_checkpoint() {
     && ! bugfix_workspace_has_non_test_change "$sandbox_pristine" "$repair_checkpoint/workspace"; then
     echo "discarding unchanged bugfix repair checkpoint for session $session_id" >&2
     return 1
+  fi
+  if [[ "$task_type" == "bugfix" && "$bugfix_repair_policy_version" =~ ^[0-9]+$ \
+    && "$bugfix_repair_policy_version" -ge 1 ]]; then
+    local checkpoint_changed_lines
+    checkpoint_changed_lines="$(bugfix_workspace_production_changed_lines "$sandbox_pristine" "$repair_checkpoint/workspace")"
+    if [[ ! "$checkpoint_changed_lines" =~ ^[0-9]+$ || "$checkpoint_changed_lines" -lt 3 ]]; then
+      echo "discarding bugfix repair checkpoint with ${checkpoint_changed_lines:-0} changed production lines for session $session_id" >&2
+      return 1
+    fi
   fi
   if [[ "$task_type" == "bugfix" ]] \
     && ! bugfix_workspace_tests_unchanged "$sandbox_pristine" "$repair_checkpoint/workspace"; then
@@ -1228,6 +1257,9 @@ if [[ "$task_type" == "diagnosis" ]]; then
   append_system_prompt+=" This is a read-only diagnosis task. Investigate the reported behavior and provide an evidence-based conclusion without modifying any file. Derive the diagnosis only from production implementation, configuration, and public runtime output. Do not open, search, list, or quote any *_test.go, testdata, *.test.*, or *.spec.* source, even after locating the implementation; you may run an explicitly public reproduction command without reading its test source. The workspace is intentionally read-only. Once the implementation cause is located, stop and report the relevant call chain, state transition, and root cause; do not attempt a fix. Never invoke Edit, Write, NotebookEdit, shell redirection, chmod, or any other file-mutation command."
 else
   append_system_prompt+=" This is a bugfix task. After locating the implementation cause, stop exploratory reading and make the smallest appropriate production fix requested by the user immediately; do not keep surveying tests or unrelated modules merely for completeness. Do not stop after diagnosis or merely suggest a patch. A Session with no non-test workspace change is rejected unless the deterministic public-test retry instructions below explicitly allow a contract-conflict conclusion. You may run a focused pre-existing test, but do not create, delete, or modify any *_test.go file or anything under testdata; tests are immutable in this Session and are authored independently after you exit."
+  if [[ "$bugfix_repair_policy_version" =~ ^[0-9]+$ && "$bugfix_repair_policy_version" -ge 1 ]]; then
+    append_system_prompt+=" The completed repair must change at least 3 production source lines, counting additions and deletions but excluding tests. Do not satisfy this requirement with comments, formatting, dead code, or unrelated edits; use the smallest coherent implementation that naturally meets the reported behavior."
+  fi
   if [[ -n "$retry_context_paths" ]]; then
     append_system_prompt+=" This is an infrastructure-only retry. Prior read-only exploration already reached these likely relevant production files: $retry_context_paths. Start from those files, avoid restarting repository discovery or reading tests, and make the smallest production edit as soon as the direct cause is visible."
   fi
@@ -1419,6 +1451,15 @@ if [[ "$task_type" == "bugfix" ]] \
   echo "INVALID_REPAIR_OUTPUT=1" >&2
   echo "bugfix Claude Session completed without a non-test workspace patch" >&2
   exit 43
+fi
+if [[ "$task_type" == "bugfix" && "$bugfix_repair_policy_version" =~ ^[0-9]+$ \
+  && "$bugfix_repair_policy_version" -ge 1 ]]; then
+  repair_changed_lines="$(bugfix_workspace_production_changed_lines "$sandbox_pristine" "$sandbox_workspace")"
+  if [[ ! "$repair_changed_lines" =~ ^[0-9]+$ || "$repair_changed_lines" -lt 3 ]]; then
+    echo "INVALID_REPAIR_OUTPUT=1" >&2
+    echo "bugfix Claude production patch changes ${repair_changed_lines:-0} lines; at least 3 are required" >&2
+    exit 43
+  fi
 fi
 if [[ "$task_type" == "bugfix" ]] \
   && ! bugfix_workspace_tests_unchanged "$sandbox_pristine" "$sandbox_workspace"; then
