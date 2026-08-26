@@ -1949,8 +1949,8 @@ async function waitForUserQueryReviews(jobFile) {
   throw new PipelineUserQueryReviewWaitError(stageId);
 }
 
-async function yieldToCentralScheduler(jobFile, stageId, reason = 'stage_transition') {
-  const profile = pipelineStageResourceProfile(stageId);
+async function yieldToCentralScheduler(jobFile, stageId, reason = 'stage_transition', resourceProfile = null) {
+  const profile = resourceProfile || pipelineStageResourceProfile(stageId);
   let queuedAt = now();
   await updateJob(jobFile, (job) => {
     if (job.waitingResource?.stageId === stageId && job.waitingResource?.queuedAt) queuedAt = job.waitingResource.queuedAt;
@@ -2066,8 +2066,9 @@ async function acquireStageResourceSlot(jobFile, stageId, {
   preserveJobCursor = false,
   waiterKey = '',
   workerStageId = '',
+  resourceProfileStageId = '',
 } = {}) {
-  const profile = pipelineStageResourceProfile(stageId);
+  const profile = pipelineStageResourceProfile(resourceProfileStageId || stageId);
   if (!profile.pool || !profile.limit) return async () => {};
   const jobsRoot = path.dirname(path.dirname(path.resolve(jobFile)));
   const libraryRoot = path.dirname(jobsRoot);
@@ -2217,7 +2218,7 @@ async function acquireStageResourceSlot(jobFile, stageId, {
     return null;
   }
   if (fairWaiterPath) await fsp.rm(fairWaiterPath, { force: true }).catch(() => {});
-  await yieldToCentralScheduler(jobFile, stageId, 'pool_full');
+  await yieldToCentralScheduler(jobFile, stageId, 'pool_full', profile);
   }
 }
 
@@ -2327,6 +2328,7 @@ async function runStage(jobFile, stageId, action) {
   if (['passed', 'skipped'].includes(current?.status)) return current.result || null;
   const bugScoped = Number(job.workflowVersion || 1) >= CURRENT_WORKFLOW_VERSION && /^bug\d+_/.test(stageId);
   let releaseResource = async () => {};
+  let releaseBootstrapResource = async () => {};
   let resourceReleased = false;
   const releaseStageResource = async () => {
     if (resourceReleased) return;
@@ -2338,6 +2340,11 @@ async function runStage(jobFile, stageId, action) {
   try {
     await assertSchedulerAdmission(jobFile, stageId);
     await assertStagePrerequisites(jobFile, stageId);
+    if (['project_generate', 'project_validate'].includes(stageId)) {
+      releaseBootstrapResource = await acquireStageResourceSlot(jobFile, stageId, {
+        resourceProfileStageId: 'project_bootstrap',
+      });
+    }
     releaseResource = await acquireStageResourceSlot(jobFile, stageId, { waitForCapacity: bugScoped });
     await setStage(jobFile, stageId, 'running');
     await appendLog(jobFile, 'info', `开始：${current?.label || stageId}`, stageId);
@@ -2376,6 +2383,7 @@ async function runStage(jobFile, stageId, action) {
     throw error;
   } finally {
     await releaseStageResource();
+    await releaseBootstrapResource().catch(() => {});
   }
 }
 
@@ -9233,7 +9241,7 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
         await updateJob(jobFile, (current) => {
           const bug = current.bugs.find((item) => item.bugIndex === bugIndex);
           Object.assign(bug, finishBugAttempt(bug, {
-            status: 'failed',
+            status: 'system',
             stage: failedStage,
             sessionId: attemptSessionId,
             failureCategory,

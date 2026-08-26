@@ -65,6 +65,10 @@ export function classifyTrajectoryAttemptFailure(message = '') {
   if (/FAILURE_CLASS=git_publication|validated checkpoint Git publication failed|(?:green_branch|red_branch|test_model_fix_branch) must be bug/i.test(value)) return 'git_infrastructure';
   if (/invalid_json_schema|Invalid schema for response_format|response_format.*schema/i.test(value)) return 'codex_infrastructure';
   if (/post-fix compile preflight failed[\s\S]*go\.mod requires go >= [^\n]+\(running go [^\n]+GOTOOLCHAIN=local\)|FAST_VERIFICATION_GATE: fixed Go [^\n]+ is not installed locally/i.test(value)) return 'runner_infrastructure';
+  // Runner-owned shell helpers execute after the model exits. Host awk/shell
+  // parser failures here are orchestration defects and must never spend one of
+  // the bounded model attempts or cause the Bug to be skipped.
+  if (/Claude 修复失败（exit=\d+）：[\s\S]*(?:\bawk:\s*(?:nonterminated|unterminated|syntax error|illegal statement|bailing out)|(?:runner-snapshots\/[^\n]+\.sh|run_(?:one|verify)_claude\.sh)[^\n]*(?:syntax error|unexpected (?:token|EOF)))/i.test(value)) return 'runner_infrastructure';
   if (/ENOENT[\s\S]*(?:trajectory|runner-manifest|mutation-audit|claude-v4-hook|run_docker\.sh)|run_one_claude\.sh[^\n]*syntax error|runner-snapshots\/[^\n]+\.sh:\s*line\s+\d+:\s*(?:rg:\s*command not found|[^\n]*Permission denied)/i.test(value)) return 'runner_infrastructure';
   if (/trajectory already exists|bug_index must be an integer from 1 to 5|bug_index must be a positive integer|Claude task runner already active/i.test(value)) return 'runner_infrastructure';
   if (/go-task-git-publish[^\n]*(?:Permission denied|Operation not permitted)|(?:Permission denied|Operation not permitted)[\s\S]*go-task-git-publish/i.test(value)) return 'git_infrastructure';

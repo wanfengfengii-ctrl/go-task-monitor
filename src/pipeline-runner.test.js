@@ -433,6 +433,44 @@ test('new bugfix repair policy is assigned only to newly created jobs and enforc
   assert.match(runner, /bugfix Claude production patch changes \$\{repair_changed_lines:-0\} lines; at least 3 are required/);
 });
 
+test('project generation and validation share one bootstrap lane before their normal pools', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  const start = pipeline.indexOf('async function runStage(jobFile, stageId, action)');
+  const end = pipeline.indexOf('\n\nasync function pipelineHasStage', start);
+  const runStageSource = pipeline.slice(start, end);
+  assert.match(runStageSource, /\['project_generate', 'project_validate'\]\.includes\(stageId\)/);
+  assert.match(runStageSource, /resourceProfileStageId:\s*'project_bootstrap'/);
+  assert.ok(runStageSource.indexOf("resourceProfileStageId: 'project_bootstrap'") < runStageSource.indexOf('releaseResource = await acquireStageResourceSlot'));
+});
+
+test('bugfix production line gate executes with the host awk and excludes tests', async () => {
+  const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
+  const functionStart = runner.indexOf('bugfix_workspace_production_changed_lines() {');
+  const functionEnd = runner.indexOf('\n\nbugfix_workspace_tests_unchanged() {', functionStart);
+  const root = await mkdtemp(path.join(os.tmpdir(), 'bugfix-production-lines-'));
+  const baseline = path.join(root, 'baseline');
+  const fixed = path.join(root, 'fixed');
+  assert.notEqual(functionStart, -1);
+  assert.notEqual(functionEnd, -1);
+  try {
+    await Promise.all([mkdir(baseline), mkdir(fixed)]);
+    await Promise.all([
+      writeFile(path.join(baseline, 'service.go'), 'package sample\n'),
+      writeFile(path.join(fixed, 'service.go'), 'package repaired\n\nfunc Enabled() bool { return true }\n'),
+      writeFile(path.join(fixed, 'service_test.go'), 'package repaired\n\nfunc TestPadding() {}\n'),
+    ]);
+    const script = [
+      runner.slice(functionStart, functionEnd),
+      `bugfix_workspace_production_changed_lines ${shellSingleQuote(baseline)} ${shellSingleQuote(fixed)}`,
+    ].join('\n');
+    const result = spawnSync('/bin/bash', ['-c', script], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), '4');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('a published Green commit restores a reset bugfix workspace', async () => {
   const library = await mkdtemp(path.join(os.tmpdir(), 'published-green-workspace-'));
   const taskDir = path.join(library, 'tasks', 'sample-task');

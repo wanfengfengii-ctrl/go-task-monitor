@@ -827,6 +827,7 @@ async function activePipelineResourceSlotSnapshot() {
   const pools = await fsp.readdir(slotsRoot, { withFileTypes: true }).catch(() => []);
   const counts = Object.fromEntries([
     'codex-structured',
+    'project-bootstrap',
     'project-generation',
     'compute-analysis',
     'compute-repair',

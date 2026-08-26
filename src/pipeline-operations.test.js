@@ -334,6 +334,7 @@ test('daily project and trajectory counters are unlimited by default', () => {
 
 test('pipeline stages reserve capacity according to their resource cost', () => {
   assert.deepEqual(pipelineStageResourceProfile('project_plan'), { pool: 'codex-structured', limit: 4, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('project_bootstrap'), { pool: 'project-bootstrap', limit: 1, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('codex_injection_plan'), { pool: 'codex-structured', limit: 4, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('codex_injection'), { pool: 'codex-structured', limit: 4, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('project_generate'), { pool: 'project-generation', limit: 4, weight: 1 });
@@ -350,6 +351,39 @@ test('pipeline stages reserve capacity according to their resource cost', () => 
     { status: 'queued', currentStage: 'bug1_cloud_upload' },
     { status: 'failed', currentStage: 'bug2_cloud_upload' },
   ]), 2);
+});
+
+test('one bootstrap lane serializes project generation and validation while Bugs keep running', () => {
+  const jobs = [
+    { status: 'running', currentStage: 'project_validate' },
+    { status: 'running', currentStage: 'bug2_claude_fix' },
+  ];
+  assert.deepEqual(pipelineResourcePoolState(jobs, 4)['project-bootstrap'], {
+    pool: 'project-bootstrap', limit: 1, occupied: 1, available: 0,
+  });
+  assert.deepEqual(pipelineStageStartCapacity(jobs, 'project_generate', 4), {
+    allowed: false,
+    pool: 'project-bootstrap',
+    occupied: 1,
+    limit: 1,
+    available: 0,
+  });
+  assert.equal(pipelineStageStartCapacity([jobs[1]], 'project_generate', 4).allowed, true);
+});
+
+test('live bootstrap leases remain authoritative during stage handoff', () => {
+  const capacity = pipelineStageStartCapacity([
+    { status: 'running', currentStage: 'bug1_claude_fix' },
+  ], 'project_validate', 4, {
+    activeLeaseCounts: { 'project-bootstrap': 1, 'compute-docker': 0 },
+  });
+  assert.deepEqual(capacity, {
+    allowed: false,
+    pool: 'project-bootstrap',
+    occupied: 1,
+    limit: 1,
+    available: 0,
+  });
 });
 
 test('occupied weight follows the next pending stage instead of a stale completed stage', () => {

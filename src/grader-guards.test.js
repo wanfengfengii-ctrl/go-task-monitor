@@ -28,6 +28,13 @@ test('trajectory attempt failures distinguish system faults from model output', 
   assert.equal(classifyTrajectoryAttemptFailure('/task-monitor/run_one_claude.sh: line 184: syntax error near unexpected token'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('/pipeline-jobs/job/artifacts/runner-snapshots/bug6-claude-attempt-1.sh: line 398: rg: command not found'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('/pipeline-jobs/job/artifacts/runner-snapshots/bug6-claude-attempt-1.sh: line 586: /Users/niuyuhang/Documents/New: Permission denied'), 'runner_infrastructure');
+  assert.equal(classifyTrajectoryAttemptFailure([
+    'Claude 修复失败（exit=2）：',
+    'CLAUDE_PROGRESS',
+    'awk: nonterminated character class (^|\\/)[^',
+    ' source line number 2',
+  ].join('\n')), 'runner_infrastructure');
+  assert.equal(classifyTrajectoryAttemptFailure('Claude 修复失败（exit=2）：\nrunner-snapshots/bug2.sh: line 297: syntax error near unexpected token'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('Claude 修复失败（exit=none，signal=SIGTERM）：\n运行被调度器终止'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('人工停止（SIGINT），本次尝试已停止'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('trajectory already exists in /tmp/task/trajectory'), 'runner_infrastructure');

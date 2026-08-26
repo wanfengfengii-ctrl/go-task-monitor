@@ -122,6 +122,7 @@ export function pipelineStructuredCodexLimit({
 
 export function pipelineStageResourceProfile(stageId = '') {
   const stage = String(stageId || '');
+  if (stage === 'project_bootstrap') return { pool: 'project-bootstrap', limit: 1, weight: 1 };
   if (stage.endsWith('_user_query_review')) return { pool: '', limit: 0, weight: 0 };
   if (stage === 'project_plan' || stage === 'codex_injection_plan' || stage === 'codex_injection'
     || stage.endsWith('_test_author')) {
@@ -184,6 +185,7 @@ export function pipelineResourcePoolState(jobs = [], effectiveMaxConcurrency = 4
   const effectiveMax = Math.max(0, Number(effectiveMaxConcurrency) || 0);
   const definitions = [
     ['codex-structured', 'project_plan'],
+    ['project-bootstrap', 'project_bootstrap'],
     ['project-generation', 'project_generate'],
     ['compute-analysis', 'bug1_bug_discovery'],
     ['compute-repair', 'bug1_claude_fix'],
@@ -196,7 +198,7 @@ export function pipelineResourcePoolState(jobs = [], effectiveMaxConcurrency = 4
     // The global limit counts project runners, while compute pools count Bug
     // workers inside those runners. Preserve internal capacity once a project
     // is admitted; project bootstrap pools still follow the project limit.
-    const projectBootstrapPool = pool === 'project-generation';
+    const projectBootstrapPool = ['project-bootstrap', 'project-generation'].includes(pool);
     const limit = effectiveMax === 0
       ? 0
       : projectBootstrapPool
@@ -230,6 +232,9 @@ export function pipelineResourcePoolState(jobs = [], effectiveMaxConcurrency = 4
     for (const stageId of resourceStages) {
       const profile = pipelineStageResourceProfile(stageId);
       if (profile.pool && pools[profile.pool]) pools[profile.pool].occupied += 1;
+      if (['project_generate', 'project_validate'].includes(stageId)) {
+        pools['project-bootstrap'].occupied += 1;
+      }
     }
   }
   for (const pool of Object.values(pools)) {
@@ -241,7 +246,9 @@ export function pipelineResourcePoolState(jobs = [], effectiveMaxConcurrency = 4
       ? activeLeaseCounts.get(pool.pool)
       : activeLeaseCounts?.[pool.pool];
     const authoritativeOccupied = hasLeaseCount && Number.isFinite(Number(leaseCount))
-      ? Math.max(0, Number(leaseCount))
+      ? pool.pool === 'project-bootstrap'
+        ? Math.max(contenders, Math.max(0, Number(leaseCount)))
+        : Math.max(0, Number(leaseCount))
       : contenders;
     pool.occupied = Math.min(pool.limit, authoritativeOccupied);
     pool.available = Math.max(0, pool.limit - pool.occupied);
@@ -268,9 +275,23 @@ export function pipelineStageStartCapacity(jobs = [], stageId = '', effectiveMax
     };
   }
 
+  const resourcePools = pipelineResourcePoolState(jobs, effectiveMaxConcurrency, activeLeaseCounts);
+  if (['project_generate', 'project_validate'].includes(String(stageId || ''))) {
+    const bootstrap = resourcePools['project-bootstrap'];
+    if (!bootstrap?.available) {
+      return {
+        allowed: false,
+        pool: 'project-bootstrap',
+        occupied: bootstrap?.occupied || 0,
+        limit: bootstrap?.limit || 0,
+        available: bootstrap?.available || 0,
+      };
+    }
+  }
+
   const profile = pipelineStageResourceProfile(stageId);
   if (profile.pool) {
-    const pool = pipelineResourcePoolState(jobs, effectiveMaxConcurrency, activeLeaseCounts)[profile.pool];
+    const pool = resourcePools[profile.pool];
     const requestedLane = profile.pool === 'compute-heavy' ? pipelineHeavyLane(stageId) : '';
     if (requestedLane && pool?.available) {
       const activeInLane = (jobs || []).filter((job) => ['queued', 'running'].includes(job?.status)

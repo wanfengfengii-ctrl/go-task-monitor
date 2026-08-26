@@ -269,6 +269,7 @@ test('trajectory attempt budget is global per bug across pipeline restarts', () 
 test('stopped trajectory attempts do not consume model budget', () => {
   const bug = { attempts: [
     { status: 'stopped', action: 'user_stopped' },
+    { status: 'system', failureCategory: 'runner_infrastructure' },
     { status: 'failed' },
   ] };
   assert.equal(countedBugTrajectoryAttempts(bug), 1);

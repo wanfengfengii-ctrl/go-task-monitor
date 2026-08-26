@@ -294,10 +294,10 @@ bugfix_workspace_production_changed_lines() {
   { git diff --no-index --numstat -- "$baseline" "$candidate" 2>/dev/null || true; } \
     | awk -F '\t' '
       $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ \
-        && $3 ~ /\.(go|c|cc|cpp|h|hpp|rs|java|kt|kts|py|rb|php|js|jsx|mjs|cjs|ts|tsx|vue|svelte|css|scss|sass|less|html|sql|sh)(}|$)/ \
-        && $3 !~ /_test\.go(}|$)/ \
+        && $3 ~ /\.(go|c|cc|cpp|h|hpp|rs|java|kt|kts|py|rb|php|js|jsx|mjs|cjs|ts|tsx|vue|svelte|css|scss|sass|less|html|sql|sh)([}]|$)/ \
+        && $3 !~ /_test\.go([}]|$)/ \
         && $3 !~ /(^|\/)testdata\// \
-        && $3 !~ /(^|\/)[^/]*\.(test|spec)\.[^/]+(}|$)/ { total += $1 + $2 }
+        && $3 !~ /(^|\/)[^\/]*\.(test|spec)\.[^\/]+([}]|$)/ { total += $1 + $2 }
       END { print total + 0 }
     '
 }
