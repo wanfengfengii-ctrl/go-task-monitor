@@ -32,6 +32,7 @@ import {
   MIN_BUGFIX_PRODUCTION_CHANGED_LINES,
   PARALLEL_BUG_WORKFLOW_VERSION,
   isPipelineBugDeliveryComplete,
+  isShallowBugfixRepairFailure,
   isSkippedPipelineBug,
   pipelineProjectDeliverySummary,
   markPipelineBugFailed,
@@ -8958,6 +8959,7 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
   if (bugRecord.trajectoryDisposition === 'skipped_pending_verification') {
     return {
       skipped: true,
+      terminal: bugRecord.trajectorySkipTerminal === true,
       bugIndex,
       reason: bugRecord.trajectorySkipReason || `轨迹累计 ${MAX_BUG_TRAJECTORY_ATTEMPTS} 次仍未完成采集登记`,
     };
@@ -9042,15 +9044,25 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
   }
   const attemptOffset = countedBugTrajectoryAttempts(bugRecord);
   const remainingAttempts = remainingBugTrajectoryAttempts(bugRecord);
-  const skipExhaustedBug = async () => {
-    const reason = `轨迹累计 ${MAX_BUG_TRAJECTORY_ATTEMPTS} 次仍未完成采集登记，已自动跳过并继续下一个 Bug`;
-    // Keep the Bug pending until independent verification evidence has been
-    // uploaded and finalized. Marking it skipped here would make the outer
-    // pipeline bypass cloud_upload/verification_finalize forever.
-    await updateJob(jobFile, (current) => markPipelineTrajectorySkippedPendingVerification(current, bugIndex, reason, now()));
-    await appendLog(jobFile, 'warn', `${reason}；先完成可用的独立验证证明`, `bug${bugIndex}_trajectory_validate`);
-    return { skipped: true, bugIndex, reason };
+  const skipTrajectoryBug = async (reason, { terminal = false } = {}) => {
+    // Non-terminal exhaustion can still finalize independent evidence. A
+    // deterministic shallow repair bypasses delivery and is skipped outright.
+    await updateJob(jobFile, (current) => {
+      markPipelineTrajectorySkippedPendingVerification(current, bugIndex, reason, now());
+      const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+      if (currentBug) currentBug.trajectorySkipTerminal = terminal;
+    });
+    await appendLog(
+      jobFile,
+      'warn',
+      terminal ? reason : `${reason}；先完成可用的独立验证证明`,
+      `bug${bugIndex}_trajectory_validate`,
+    );
+    return { skipped: true, terminal, bugIndex, reason };
   };
+  const skipExhaustedBug = () => skipTrajectoryBug(
+    `轨迹累计 ${MAX_BUG_TRAJECTORY_ATTEMPTS} 次仍未完成采集登记，已自动跳过并继续下一个 Bug`,
+  );
   if (remainingAttempts === 0) return skipExhaustedBug();
   if (attemptOffset > 0) {
     const retryPreparation = await prepareTrajectoryRetry(initialJob, task);
@@ -9290,6 +9302,10 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
         const execution = normalizeBugExecution(current.bugExecution);
         current.bugExecution = { ...execution, status: 'fast_lane_failed', currentAttempt: 0, currentStage: failedStage, updatedAt: now(), lastHeartbeatAt: now() };
       });
+      if (isShallowBugfixRepairFailure(feedback)) {
+        const reason = `Bugfix 生产修复不足 ${MIN_BUGFIX_PRODUCTION_CHANGED_LINES} 行，按规则直接跳过当前 Bug，不再重复运行 Claude`;
+        return skipTrajectoryBug(reason, { terminal: true });
+      }
       if (attempt >= MAX_BUG_TRAJECTORY_ATTEMPTS) return skipExhaustedBug();
       await appendLog(
         jobFile,
@@ -10707,6 +10723,11 @@ async function runPipeline(jobFile) {
         const postTrajectoryTask = postTrajectoryJob.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex))?.task;
         if (postTrajectoryTask?.taskDir) await ensureDiagnosisWorkspaceUnchanged(postTrajectoryTask.taskDir);
       }
+      if (verifiedTask.skipped && verifiedTask.terminal) {
+        await updateJob(jobFile, (current) => markPipelineBugSkipped(current, bugIndex, verifiedTask.reason, now()));
+        await appendLog(jobFile, 'warn', `Bug ${bugIndex} 命中确定性浅修复门禁，已跳过全部后续交付阶段`, `bug${bugIndex}_claude_fix`);
+        return;
+      }
       if (verifiedTask.skipped) {
         const skippedTask = preparedBug.task;
         const skippedMetadata = skippedTask?.taskDir
@@ -11030,6 +11051,29 @@ async function runPipeline(jobFile) {
           current.finishedAt = null;
         });
         await appendLog(jobFile, 'warn', `Bug ${bugIndex} 的修复轨迹确认候选题与公开契约冲突，已保留证据并跳过该候选`, conflictStage);
+        return;
+      }
+
+      if (isShallowBugfixRepairFailure(error)) {
+        const skipStage = `bug${bugIndex}_claude_fix`;
+        const reason = `Bugfix 生产修复不足 ${MIN_BUGFIX_PRODUCTION_CHANGED_LINES} 行，按规则直接跳过当前 Bug，不再重复运行 Claude`;
+        await updateJob(jobFile, (current) => {
+          markPipelineBugSkipped(current, bugIndex, reason, failedAt);
+          const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+          if (currentBug) currentBug.workerExecution = {
+            ...(currentBug.workerExecution || {}),
+            status: 'fast_lane_completed',
+            currentStage: skipStage,
+            currentAttempt: 0,
+            updatedAt: failedAt,
+            lastAction: 'shallow_repair_skipped',
+            blockedReason: '',
+          };
+          current.status = 'running';
+          current.error = '';
+          current.finishedAt = null;
+        });
+        await appendLog(jobFile, 'warn', `Bug ${bugIndex} 的生产修复不足 ${MIN_BUGFIX_PRODUCTION_CHANGED_LINES} 行，已直接跳过并释放修复槽位`, skipStage);
         return;
       }
 

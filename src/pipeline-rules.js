@@ -26,6 +26,16 @@ export const MIN_BUGFIX_PRODUCTION_CHANGED_LINES = 3;
 export const CURRENT_VERIFICATION_POLICY_VERSION = 5;
 export const CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION = 1;
 export const CURRENT_BUG_POLICY_VERSION = BUG_POLICY_VERSION;
+
+export function isShallowBugfixRepairFailure(value) {
+  const text = value instanceof Error
+    ? `${value.code || ''}\n${value.message || ''}`
+    : String(value || '');
+  if (!/INVALID_REPAIR_OUTPUT(?:=1)?/i.test(text)) return false;
+  return /production patch changes\s+\d+\s+lines;\s+at least\s+3\s+(?:are\s+)?required/i.test(text)
+    || /模型生产代码改动\s*\d+\s*行，?少于\s*3\s*行/u.test(text);
+}
+
 export const PIPELINE_PROJECT_STAGES = [
   ['project_plan', 'Sol 规划并扩写项目文档'],
   ['project_generate', 'Claude 生成项目'],
@@ -590,6 +600,7 @@ export function reactivatePipelineBug(job, bugIndex, { resetAttempts = false } =
   delete bug.trajectoryDisposition;
   delete bug.trajectorySkipReason;
   delete bug.trajectorySkippedAt;
+  delete bug.trajectorySkipTerminal;
   delete job.retryBlockedReason;
   if (!invalidatedIncompleteDelivery) invalidatePipelineVerificationAfterMissingTestAuthor(job, normalizedIndex);
   if (resetAttempts) {

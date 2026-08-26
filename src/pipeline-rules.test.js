@@ -9,6 +9,7 @@ import {
   CURRENT_WORKFLOW_VERSION,
   DEFAULT_BUG_COUNT,
   isPipelineBugDeliveryComplete,
+  isShallowBugfixRepairFailure,
   isSkippedPipelineBug,
   markPipelineBugFailed,
   markPipelineBugSkipped,
@@ -35,6 +36,19 @@ import {
   reactivateFailedPipelineBugsForManualRetry,
   rewindPipelineBugAfterMissingTrajectory,
 } from './pipeline-rules.js';
+
+test('sub-three-line Bugfix repair failures are recognized as deterministic skips', () => {
+  assert.equal(isShallowBugfixRepairFailure(
+    'INVALID_REPAIR_OUTPUT=1: bugfix Claude production patch changes 1 lines; at least 3 required',
+  ), true);
+  assert.equal(isShallowBugfixRepairFailure(
+    new Error('INVALID_REPAIR_OUTPUT=1: Bugfix Claude 模型生产代码改动 2 行，少于 3 行，不能保存检查点'),
+  ), true);
+  assert.equal(isShallowBugfixRepairFailure(
+    'INVALID_REPAIR_OUTPUT=1: bugfix Claude Session completed without a non-test workspace patch',
+  ), false);
+  assert.equal(isShallowBugfixRepairFailure('Claude API timeout'), false);
+});
 
 test('user-query readiness does not treat a partial parallel Bug batch as complete', () => {
   const stages = [];
@@ -85,12 +99,14 @@ test('reactivating a skipped Bug clears stale trajectory disposition', () => {
       trajectoryDisposition: 'skipped_pending_verification',
       trajectorySkipReason: 'old system failure',
       trajectorySkippedAt: '2026-08-20T00:00:00Z',
+      trajectorySkipTerminal: true,
     }],
     stages: [{ id: 'bug3_claude_fix', bugIndex: 3, status: 'skipped', reason: 'old system failure' }],
   };
   reactivatePipelineBug(job, 3);
   assert.equal(job.bugs[0].disposition, undefined);
   assert.equal(job.bugs[0].trajectoryDisposition, undefined);
+  assert.equal(job.bugs[0].trajectorySkipTerminal, undefined);
   assert.equal(job.stages[0].status, 'pending');
   assert.equal(job.stages[0].reason, undefined);
 });
