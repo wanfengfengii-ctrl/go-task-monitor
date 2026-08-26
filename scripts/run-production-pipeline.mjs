@@ -3401,6 +3401,176 @@ export async function restorePublishedBugfixWorkspace(task) {
   }
 }
 
+async function treeContentFingerprint(root) {
+  const entries = (await readWorkspaceEntries(root)).sort((left, right) => (
+    Buffer.compare(Buffer.from(`./${left.path}`), Buffer.from(`./${right.path}`))
+  ));
+  const hash = crypto.createHash('sha256');
+  for (const entry of entries) {
+    const filename = `./${entry.path}`;
+    const fileHash = crypto.createHash('sha256').update(entry.content).digest('hex');
+    hash.update(filename);
+    hash.update(Buffer.from([0]));
+    hash.update(`${fileHash}  ${filename}\n`);
+  }
+  return hash.digest('hex');
+}
+
+// A completed local G2 layout and its immutable trajectory can outlive the
+// runner checkpoint that originally joined them. Rebuild only the pre-Docker
+// repair checkpoint after validating every durable binding, so recovery still
+// executes Docker and Git publication without starting Claude again.
+export async function recoverBugfixRepairCheckpointFromLayout(taskDir) {
+  const resolvedTaskDir = path.resolve(String(taskDir || ''));
+  const metadata = await readJson(path.join(resolvedTaskDir, 'public.json'), null);
+  const layout = await readJson(path.join(resolvedTaskDir, '.git-layout.json'), null);
+  const trajectoryDir = path.join(resolvedTaskDir, 'trajectory');
+  const manifest = await readJson(path.join(trajectoryDir, 'runner-manifest.json'), null);
+  const sessionId = String(metadata?.test_model_fix_session_id || '');
+  const repository = path.resolve(String(layout?.repository || ''));
+  const expectedRepository = path.join(resolvedTaskDir, '.git-layout');
+  if (metadata?.task_type !== 'bugfix'
+    || !/^[0-9a-f-]{36}$/i.test(sessionId)
+    || manifest?.task_type !== 'bugfix'
+    || String(manifest?.session_id || '') !== sessionId
+    || repository !== expectedRepository
+    || !layout?.green_branch
+    || !/^[a-f0-9]{40}$/i.test(String(layout?.green_commit || ''))
+    || String(layout.green_commit) !== String(metadata?.test_model_fix_commit || '')
+    || !safeVerificationTestPath(String(layout?.test_file || ''))
+    || !/^[a-f0-9]{64}$/i.test(String(layout?.test_sha256 || ''))
+    || String(layout.test_sha256) !== String(metadata?.verification_test_sha256 || '')) {
+    return { recovered: false, reason: 'durable_binding_incomplete' };
+  }
+
+  const deliveryName = String(manifest.delivery_filename || '');
+  const rawName = String(manifest.raw_filename || '');
+  if (!deliveryName || path.basename(deliveryName) !== deliveryName
+    || !rawName || path.basename(rawName) !== rawName) {
+    return { recovered: false, reason: 'trajectory_manifest_paths_invalid' };
+  }
+  const trajectoryFiles = {
+    stream: path.join(trajectoryDir, 'trajectory.stream.jsonl'),
+    raw: path.join(trajectoryDir, rawName),
+    delivery: path.join(trajectoryDir, deliveryName),
+    audit: path.join(trajectoryDir, 'mutation-audit.jsonl'),
+    runnerManifest: path.join(trajectoryDir, 'runner-manifest.json'),
+    session: path.join(trajectoryDir, 'session_id.txt'),
+    validator: path.join(trajectoryDir, `validator-${sessionId}.json`),
+  };
+  const stats = await Promise.all(Object.values(trajectoryFiles).map((filename) => fsp.stat(filename).catch(() => null)));
+  if (!stats.every((value) => value?.isFile())) return { recovered: false, reason: 'trajectory_artifacts_incomplete' };
+  const validator = await readJson(trajectoryFiles.validator, null);
+  const validatorReport = validator?.reports?.find((item) => String(item?.stats?.sessionId || '') === sessionId);
+  const trajectorySession = inspectClaudeSessionMetadata(await fsp.readFile(trajectoryFiles.stream, 'utf8'));
+  if (String(await fsp.readFile(trajectoryFiles.session, 'utf8')).trim() !== sessionId
+    || trajectorySession.sessionId !== sessionId
+    || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(String(trajectorySession.claudeCodeVersion || ''))
+    || validator?.ok !== true
+    || validatorReport?.ok !== true) {
+    return { recovered: false, reason: 'trajectory_validation_invalid' };
+  }
+  const [streamSha, rawSha, deliverySha, auditSha] = await Promise.all([
+    sha256File(trajectoryFiles.stream),
+    sha256File(trajectoryFiles.raw),
+    sha256File(trajectoryFiles.delivery),
+    sha256File(trajectoryFiles.audit),
+  ]);
+  if (streamSha !== manifest.stream_sha256
+    || rawSha !== manifest.raw_sha256
+    || deliverySha !== manifest.delivery_sha256
+    || auditSha !== manifest.audit_sha256) {
+    return { recovered: false, reason: 'trajectory_hash_mismatch' };
+  }
+
+  const localGreen = await git(repository, ['rev-parse', `refs/heads/${layout.green_branch}`], '读取恢复用 Green 提交')
+    .then((result) => result.stdout.trim())
+    .catch(() => '');
+  if (localGreen !== layout.green_commit) return { recovered: false, reason: 'green_branch_drifted' };
+
+  const temporary = path.join(resolvedTaskDir, `.repair-checkpoint-recovery-${process.pid}-${crypto.randomUUID()}`);
+  const cloneDir = path.join(resolvedTaskDir, `.repair-layout-clone-${process.pid}-${crypto.randomUUID()}`);
+  const checkpointRoot = path.join(resolvedTaskDir, '.repair-checkpoint');
+  try {
+    await runRequired('恢复 Green 修复工作区', 'git', [
+      'clone', '--quiet', '--branch', layout.green_branch, '--single-branch', repository, cloneDir,
+    ], { cwd: resolvedTaskDir, timeoutMs: 10 * 60 * 1000 });
+    const clonedCommit = (await git(cloneDir, ['rev-parse', 'HEAD'], '校验恢复用 Green 提交')).stdout.trim();
+    if (clonedCommit !== layout.green_commit) return { recovered: false, reason: 'green_clone_mismatch' };
+    if (await sha256File(path.join(cloneDir, layout.test_file)) !== layout.test_sha256) {
+      return { recovered: false, reason: 'verification_test_hash_mismatch' };
+    }
+    for (const testFile of metadata.verification_test_files || []) {
+      if (!safeVerificationTestPath(String(testFile || ''))) return { recovered: false, reason: 'verification_test_path_invalid' };
+      await fsp.rm(path.join(cloneDir, testFile), { force: true });
+    }
+    const repairInspection = await inspectBugfixRepairWorkspace(
+      path.join(resolvedTaskDir, 'pristine'),
+      cloneDir,
+    );
+    if (!repairInspection.valid) return { recovered: false, reason: 'repair_patch_missing' };
+    const pristineTests = await readWorkspaceEntries(path.join(resolvedTaskDir, 'pristine'));
+    const pristineTestPaths = new Set(pristineTests.filter((entry) => entry.path.endsWith('_test.go')).map((entry) => entry.path));
+    const addedRepairTests = (await readWorkspaceEntries(cloneDir)).filter((entry) => (
+      entry.path.endsWith('_test.go') && !pristineTestPaths.has(entry.path)
+    ));
+    for (const entry of addedRepairTests) {
+      if (!safeVerificationTestPath(entry.path) || !/\bfunc\s+TestModel_/.test(entry.content.toString('utf8'))) {
+        return { recovered: false, reason: 'repair_changed_repository_tests' };
+      }
+      await fsp.rm(path.join(cloneDir, entry.path), { force: true });
+    }
+    const repairTests = await readWorkspaceEntries(cloneDir);
+    const testManifest = (entries) => entries
+      .filter((entry) => entry.path.endsWith('_test.go'))
+      .map((entry) => `${entry.path}:${crypto.createHash('sha256').update(entry.content).digest('hex')}`)
+      .sort();
+    if (JSON.stringify(testManifest(pristineTests)) !== JSON.stringify(testManifest(repairTests))) {
+      return { recovered: false, reason: 'repair_changed_repository_tests' };
+    }
+
+    await fsp.mkdir(path.join(temporary, 'workspace'), { recursive: true });
+    await copyWithoutGit(cloneDir, path.join(temporary, 'workspace'));
+    await Promise.all([
+      fsp.copyFile(trajectoryFiles.stream, path.join(temporary, 'trajectory.stream.jsonl')),
+      fsp.copyFile(trajectoryFiles.raw, path.join(temporary, 'raw.native.jsonl')),
+      fsp.copyFile(trajectoryFiles.delivery, path.join(temporary, 'trajectory.jsonl')),
+      fsp.copyFile(trajectoryFiles.audit, path.join(temporary, 'mutation-audit.jsonl')),
+      fsp.copyFile(trajectoryFiles.runnerManifest, path.join(temporary, 'runner-manifest.json')),
+    ]);
+    const checkpointMetadata = {
+      version: 1,
+      stage: 'claude_repair_complete',
+      session_id: sessionId,
+      test_author_session_id: String(metadata.verification_test_author_session_id || ''),
+      task_type: 'bugfix',
+      workflow_version: Number(metadata.workflow_version || 0),
+      workflow_policy_version: Number(metadata.workflow_policy_version || 0),
+      verification_policy_version: Number(metadata.verification_policy_version || 0),
+      claude_code_version: trajectorySession.claudeCodeVersion,
+      prompt_sha256: await sha256File(path.join(resolvedTaskDir, 'PROMPT.md')),
+      pristine_sha256: await treeContentFingerprint(path.join(resolvedTaskDir, 'pristine')),
+      recovered_from_green_commit: layout.green_commit,
+      saved_at: now(),
+    };
+    await writeJsonAtomic(path.join(temporary, 'checkpoint.json'), checkpointMetadata);
+    if (await fsp.stat(checkpointRoot).catch(() => null)) {
+      await makeTreeWritable(checkpointRoot).catch(() => {});
+      await fsp.rm(checkpointRoot, { recursive: true, force: true });
+    }
+    await fsp.rename(temporary, checkpointRoot);
+    return {
+      recovered: true,
+      sessionId,
+      greenCommit: layout.green_commit,
+      changedNonTestFiles: repairInspection.changedNonTestFiles,
+    };
+  } finally {
+    await fsp.rm(temporary, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(cloneDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function assertBugfixRepairWorkspace(task, fixedDir = path.join(task.taskDir, 'workspace'), baselineDir = path.join(task.taskDir, 'pristine')) {
   if (task.taskType !== 'bugfix') return { valid: true, changedNonTestFiles: [], changedProductionFiles: [], changedProductionLines: 0 };
   const inspection = await inspectBugfixRepairWorkspace(baselineDir, fixedDir);
@@ -3976,40 +4146,47 @@ async function prepareV3BugfixGitLayout(jobFile, bugIndex, fixedDir, testFile) {
   if (existing?.green_commit && existing?.red_commit && existing?.repository) {
     const testBytes = await fsp.readFile(path.join(fixedDir, testFile));
     const testSha = crypto.createHash('sha256').update(testBytes).digest('hex');
-    const [localGreen, localRed] = await Promise.all([
-      git(layoutDir, ['rev-parse', `refs/heads/${existing.green_branch}`]).then((result) => result.stdout.trim()),
-      git(layoutDir, ['rev-parse', `refs/heads/${existing.red_branch}`]).then((result) => result.stdout.trim()),
-    ]);
-    if (localGreen !== existing.green_commit || localRed !== existing.red_commit
-      || existing.bug_base_commit !== bugBaseCommit || existing.test_file !== testFile
-      || existing.test_sha256 !== testSha) {
-      throw new Error(`Bug ${bugIndex} 已有 Git 布局与当前 G1、测试或分支提交不一致`);
-    }
     const publicationPassed = job.stages?.find((stage) => stage.id === `bug${bugIndex}_git_publication`)?.status === 'passed';
-    if (publicationPassed) {
-      const [remoteGreen, remoteRed] = await Promise.all([
-        remoteHead(job.request.cloneUrl, existing.green_branch, layoutDir),
-        remoteHead(job.request.cloneUrl, existing.red_branch, layoutDir),
-      ]);
-      if (remoteGreen !== existing.green_commit || remoteRed !== existing.red_commit) {
-        throw new Error(`Bug ${bugIndex} 已通过的 Git 发布阶段与远端红绿分支头不一致`);
+    const [localGreen, localRed] = await Promise.all([
+      git(layoutDir, ['rev-parse', `refs/heads/${existing.green_branch}`]).then((result) => result.stdout.trim()).catch(() => ''),
+      git(layoutDir, ['rev-parse', `refs/heads/${existing.red_branch}`]).then((result) => result.stdout.trim()).catch(() => ''),
+    ]);
+    const layoutMatches = localGreen === existing.green_commit && localRed === existing.red_commit
+      && existing.bug_base_commit === bugBaseCommit && existing.test_file === testFile
+      && existing.test_sha256 === testSha;
+    if (!layoutMatches) {
+      if (publicationPassed) {
+        throw new Error(`Bug ${bugIndex} 已通过的 Git 布局与当前 G1、测试或分支提交不一致`);
       }
+      await appendLog(jobFile, 'warn', `Bug ${bugIndex} 未发布的旧 Git 布局与当前修复或测试不一致，自动重建本地布局`, `bug${bugIndex}_git_publication`);
+      await fsp.rm(layoutDir, { recursive: true, force: true });
+      await fsp.rm(layoutMetaPath, { force: true });
+    } else {
+      if (publicationPassed) {
+        const [remoteGreen, remoteRed] = await Promise.all([
+          remoteHead(job.request.cloneUrl, existing.green_branch, layoutDir),
+          remoteHead(job.request.cloneUrl, existing.red_branch, layoutDir),
+        ]);
+        if (remoteGreen !== existing.green_commit || remoteRed !== existing.red_commit) {
+          throw new Error(`Bug ${bugIndex} 已通过的 Git 发布阶段与远端红绿分支头不一致`);
+        }
+      }
+      await updatePublicMetadata(taskDir, (metadata) => Object.assign(metadata, {
+        git_commit_layout_policy_version: GIT_COMMIT_LAYOUT_POLICY_VERSION,
+        test_model_fix_commit: existing.green_commit,
+        test_model_fix_pushed: publicationPassed,
+        test_model_fix_branch: existing.green_branch,
+        test_model_fix_session_id: repairSessionId,
+        test_model_fix_base_commit: bugBaseCommit,
+        green_fix_commit: existing.green_commit,
+        red_commit: existing.red_commit,
+        red_pushed: publicationPassed,
+        red_branch: existing.red_branch,
+        repo_url: `${String(metadata.repository || '').replace(/\.git$/, '').replace(/\/$/, '')}/tree/${existing.green_branch}`,
+        verification_test_sha256: testSha,
+      }));
+      return { ...existing, reused: true, published: publicationPassed };
     }
-    await updatePublicMetadata(taskDir, (metadata) => Object.assign(metadata, {
-      git_commit_layout_policy_version: GIT_COMMIT_LAYOUT_POLICY_VERSION,
-      test_model_fix_commit: existing.green_commit,
-      test_model_fix_pushed: publicationPassed,
-      test_model_fix_branch: existing.green_branch,
-      test_model_fix_session_id: repairSessionId,
-      test_model_fix_base_commit: bugBaseCommit,
-      green_fix_commit: existing.green_commit,
-      red_commit: existing.red_commit,
-      red_pushed: publicationPassed,
-      red_branch: existing.red_branch,
-      repo_url: `${String(metadata.repository || '').replace(/\.git$/, '').replace(/\/$/, '')}/tree/${existing.green_branch}`,
-      verification_test_sha256: testSha,
-    }));
-    return { ...existing, reused: true, published: publicationPassed };
   }
   await fsp.rm(layoutDir, { recursive: true, force: true });
   await runRequired('冻结本地 G1/G2/R1 Git 布局', 'git', ['clone', '--quiet', '--no-hardlinks', bugBaseDir, layoutDir], { cwd: taskDir, timeoutMs: 10 * 60 * 1000 });
@@ -4899,6 +5076,7 @@ export function inspectClaudeSessionMetadata(rawJsonl) {
   return {
     sessionId: result.session_id || extractSessionId(rawJsonl),
     model: init.model || result.model || '',
+    claudeCodeVersion: init.claude_code_version || '',
     apiRetries: events.filter((event) => event.type === 'system' && event.subtype === 'api_retry').length,
   };
 }
@@ -7112,9 +7290,22 @@ export function packagedDockerVerifyCmds(identifier, taskType) {
 export function publicTargetCommandForTask(taskType, gold, publicReproductionCommand = '', concurrency = false) {
   const repeatCount = concurrency ? DETERMINISTIC_TEST_RUNS : 1;
   if (taskType === 'bugfix') return `go test ${concurrency ? '-race ' : ''}${gold.test_package} -run '^${gold.test_name}$' -count=${repeatCount} -v`;
-  const command = publicReproductionCommand
+  let command = publicReproductionCommand
     ? reproduciblePublicCommand(publicReproductionCommand, 'diagnosis')
     : `go test ${concurrency ? '-race ' : ''}${gold?.test_package || ''} -run '^${gold?.test_name || ''}$' -count=${repeatCount} -v`;
+  if (concurrency && publicReproductionCommand) {
+    // Discovery may supply a valid focused Go test without the stronger
+    // concurrency flags. Normalize that command before it becomes public
+    // evidence. HTTP/CLI scenarios are deferred to the independent test
+    // author because they cannot satisfy the required race proof by themselves.
+    if (!/\bgo\s+test\b/i.test(command) || !/\s-run(?:=|\s)/i.test(command)) return '';
+    command = command
+      .replace(/\s+-race(?=\s|$)/gi, '')
+      .replace(/\s+-count(?:=|\s+)\d+/gi, '')
+      .trim()
+      .replace(/\bgo\s+test\b/i, (value) => `${value} -race`);
+    command = `${command} -count=${DETERMINISTIC_TEST_RUNS}`;
+  }
   const issues = directPublicVerifyCommandIssues([command], 'diagnosis', { concurrency });
   if (issues.length) throw new Error(`diagnosis 的公开复现命令不合格：${issues.join('；')}`);
   return command;
@@ -9250,6 +9441,18 @@ async function runPostClaudeDelivery(jobFile, bugIndex, { releaseResource = asyn
     if (requiredStats[0]?.isDirectory() && requiredStats.slice(1).every((value) => value?.isFile())) {
       hasReusableCheckpoint = true;
       break;
+    }
+  }
+  if (expectedSessionId && !hasReusableCheckpoint) {
+    const recovered = await recoverBugfixRepairCheckpointFromLayout(task.taskDir);
+    if (recovered.recovered) {
+      hasReusableCheckpoint = true;
+      await appendLog(
+        jobFile,
+        'success',
+        `Bug ${bugIndex} 已从可信 Green/轨迹重建修复检查点，继续 Docker/Git，未重新运行 Claude`,
+        `bug${bugIndex}_docker_validation`,
+      );
     }
   }
   if (!expectedSessionId || !hasReusableCheckpoint) {

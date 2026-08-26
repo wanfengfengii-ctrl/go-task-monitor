@@ -6,7 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { adaptiveBugSourceWorkerLimit, applyInjectionInfrastructureFailures, applyInjectionPreparationFailures, approvedInjectionCandidateMismatch, assertGoldTestsUsePublicBehavior, bugCandidatePoolSchema, bugCandidateReviewSchema, bugNarrativeLanguageInstruction, bugSchema, bugSchemaForPolicy, buildPreparedVerifyResult, bugfixEffort, bugfixModel, bugWorkerOrder, canonicalizeGoldDescriptor, changedTestFiles, claudeProjectArgs, codexFailureMessage, codexSandboxArgs, codexStreamRecoveryConfigArgs, createCodexStreamRecoveryMonitor, createCurrentQualityReviewBundle, createDockerGraderScript, createOrphanDiagnosisRedSnapshot, createProjectDockerEnvironment, criticalDatastoreFiles, discoveryRootCauseDescriptor, elasticProjectBugWorkerLimit, ensureDiagnosisWorkspaceUnchanged, existingDiagnosisVerificationPlan, explicitDockerVerifyCmds, extractFailedGoTestNames, finalizeVerificationResult, goModVersion, hasDurableTrajectoryReuseCheckpoint, injectionPlanningBatch, inspectBugfixRepairWorkspace, inspectClaudeSessionMetadata, inspectDiagnosisWorkspace, isGoldCheckpointSemanticFailure, isRecoverableInjectionCandidateFailure, isRetryableInjectionInfrastructureFailure, materializeVerificationTest, modelFacingDiagnosisQuery, NATURAL_BUG_MIN_REVIEW_SCORE, naturalBugCandidateSeedResult, naturalBugFinderFailureCount, NaturalBugFinderInfrastructureError, normalizeBugCandidateFinders, normalizedPipelineCloneUrl, normalizeDiagnosisVerificationTests, numberedBugId, numberedGreenBranch, numberedRedBranch, numberedModelFixBranch, packagedDockerVerifyCmds, persistVerificationManifest, pipelineHealthPathForJob, pipelineTasksRootForJob, prepareTrajectoryRetry, prepareVerificationProofInputs, projectBugWorkerCeiling, projectGenerationPrompt, projectGeneratorConfig, projectGeneratorGatewayEnvironment, projectGeneratorSessionMismatch, projectGoEnvironment, promotePublishedVerificationFixture, publicTargetCommandForTask, readJson, recoverGoldCheckpoint, rejectGoldCheckpoint, remainingProjectGenerationTimeout, removeGeneratedBuildArtifacts, removeGeneratedCompilerArtifacts, resolveGoldTestPackage, restoreArchivedTrajectoryArtifacts, restorePublishedBugfixWorkspace, restoreVerificationEvidenceFromManifests, retainValidInjectionPlanCandidates, runAdaptiveBoundedWorkers, runCommand, safeDiagnosisPublicReproductionCommand, safeSlug, sanitizeModelFacingDiagnosisTask, selectReviewedBugCandidates, shellSingleQuote, snapshotRunnerScript, syncAuthoredVerificationMetadata, terminateProcessTree, validateDiscoveredBug, validateGoldTestDescriptor, validateInjectedBugWorktree, verificationCoverageSchema, writeGrader, migrateWorkflowPolicyVersion } from '../scripts/run-production-pipeline.mjs';
+import { adaptiveBugSourceWorkerLimit, applyInjectionInfrastructureFailures, applyInjectionPreparationFailures, approvedInjectionCandidateMismatch, assertGoldTestsUsePublicBehavior, bugCandidatePoolSchema, bugCandidateReviewSchema, bugNarrativeLanguageInstruction, bugSchema, bugSchemaForPolicy, buildPreparedVerifyResult, bugfixEffort, bugfixModel, bugWorkerOrder, canonicalizeGoldDescriptor, changedTestFiles, claudeProjectArgs, codexFailureMessage, codexSandboxArgs, codexStreamRecoveryConfigArgs, createCodexStreamRecoveryMonitor, createCurrentQualityReviewBundle, createDockerGraderScript, createOrphanDiagnosisRedSnapshot, createProjectDockerEnvironment, criticalDatastoreFiles, discoveryRootCauseDescriptor, elasticProjectBugWorkerLimit, ensureDiagnosisWorkspaceUnchanged, existingDiagnosisVerificationPlan, explicitDockerVerifyCmds, extractFailedGoTestNames, finalizeVerificationResult, goModVersion, hasDurableTrajectoryReuseCheckpoint, injectionPlanningBatch, inspectBugfixRepairWorkspace, inspectClaudeSessionMetadata, inspectDiagnosisWorkspace, isGoldCheckpointSemanticFailure, isRecoverableInjectionCandidateFailure, isRetryableInjectionInfrastructureFailure, materializeVerificationTest, modelFacingDiagnosisQuery, NATURAL_BUG_MIN_REVIEW_SCORE, naturalBugCandidateSeedResult, naturalBugFinderFailureCount, NaturalBugFinderInfrastructureError, normalizeBugCandidateFinders, normalizedPipelineCloneUrl, normalizeDiagnosisVerificationTests, numberedBugId, numberedGreenBranch, numberedRedBranch, numberedModelFixBranch, packagedDockerVerifyCmds, persistVerificationManifest, pipelineHealthPathForJob, pipelineTasksRootForJob, prepareTrajectoryRetry, prepareVerificationProofInputs, projectBugWorkerCeiling, projectGenerationPrompt, projectGeneratorConfig, projectGeneratorGatewayEnvironment, projectGeneratorSessionMismatch, projectGoEnvironment, promotePublishedVerificationFixture, publicTargetCommandForTask, readJson, recoverBugfixRepairCheckpointFromLayout, recoverGoldCheckpoint, rejectGoldCheckpoint, remainingProjectGenerationTimeout, removeGeneratedBuildArtifacts, removeGeneratedCompilerArtifacts, resolveGoldTestPackage, restoreArchivedTrajectoryArtifacts, restorePublishedBugfixWorkspace, restoreVerificationEvidenceFromManifests, retainValidInjectionPlanCandidates, runAdaptiveBoundedWorkers, runCommand, safeDiagnosisPublicReproductionCommand, safeSlug, sanitizeModelFacingDiagnosisTask, selectReviewedBugCandidates, shellSingleQuote, snapshotRunnerScript, syncAuthoredVerificationMetadata, terminateProcessTree, validateDiscoveredBug, validateGoldTestDescriptor, validateInjectedBugWorktree, verificationCoverageSchema, writeGrader, migrateWorkflowPolicyVersion } from '../scripts/run-production-pipeline.mjs';
 import { reopenBug } from '../scripts/reopen-skipped-bug.mjs';
 import { reopenQualityRejectedBug } from '../scripts/reopen-quality-rejected-diagnosis.mjs';
 import { orderStageResourceWaiters, stageResourceWaiterId } from '../scripts/run-production-pipeline.mjs';
@@ -355,6 +355,29 @@ test('diagnosis task preparation defers unsafe scenarios to the independent test
   );
 });
 
+test('diagnosis task preparation strengthens focused concurrency commands and defers HTTP scenarios', () => {
+  assert.equal(
+    publicTargetCommandForTask(
+      'diagnosis',
+      {},
+      'go test ./internal/app -run TestDeviceRetryAndRestartRecovery -count=1',
+      true,
+    ),
+    'go test -race ./internal/app -run TestDeviceRetryAndRestartRecovery -count=20',
+  );
+  assert.equal(
+    publicTargetCommandForTask('diagnosis', {}, 'curl -s http://127.0.0.1:8080/v1/tasks/task-1', true),
+    '',
+  );
+});
+
+test('unpublished stale Git layouts are rebuilt while published layouts remain immutable', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  assert.match(pipeline, /if \(!layoutMatches\) \{\s+if \(publicationPassed\) \{[\s\S]+?已通过的 Git 布局/);
+  assert.match(pipeline, /未发布的旧 Git 布局与当前修复或测试不一致，自动重建本地布局/);
+  assert.match(pipeline, /fsp\.rm\(layoutMetaPath, \{ force: true \}\)/);
+});
+
 test('a saved repair checkpoint still waits for post-Claude test authoring', async () => {
   const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
   assert.match(runner, /verification_test_overlay_now" != "repository-tests" \]\]; then\s+post_claude_codex_flow=1/);
@@ -454,6 +477,100 @@ test('a published Green commit restores a reset bugfix workspace', async () => {
     assert.equal(await readFile(path.join(workspace, 'service.go'), 'utf8'), 'package repaired\n');
     const history = await readdir(path.join(library, 'retry-history', 'sample-task'));
     assert.equal(history.some((name) => name.startsWith('workspace-before-green-recovery-')), true);
+  } finally {
+    await rm(library, { recursive: true, force: true });
+  }
+});
+
+test('a validated Green layout rebuilds a missing repair checkpoint without its authored test', async () => {
+  const library = await mkdtemp(path.join(os.tmpdir(), 'repair-checkpoint-recovery-'));
+  const taskDir = path.join(library, 'tasks', 'sample-task');
+  const pristine = path.join(taskDir, 'pristine');
+  const layoutDir = path.join(taskDir, '.git-layout');
+  const trajectoryDir = path.join(taskDir, 'trajectory');
+  const sessionId = '8840fa4c-4a99-4810-8a4f-40620655c5fd';
+  const testFile = 'internal/service/model_repair_test.go';
+  const testSource = 'package service\nfunc TestModel_Repair(t *testing.T) {}\n';
+  const runGit = (...args) => {
+    const result = spawnSync('git', args, { cwd: layoutDir, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  const sha = (content) => createHash('sha256').update(content).digest('hex');
+  try {
+    await Promise.all([
+      mkdir(path.join(pristine, 'internal/service'), { recursive: true }),
+      mkdir(path.join(layoutDir, 'internal/service'), { recursive: true }),
+      mkdir(trajectoryDir, { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(path.join(pristine, 'internal/service/service.go'), 'package service\nconst fixed = false\n'),
+      writeFile(path.join(pristine, 'internal/service/existing_test.go'), 'package service\n'),
+      writeFile(path.join(layoutDir, 'internal/service/service.go'), 'package service\nconst fixed = true\n'),
+      writeFile(path.join(layoutDir, 'internal/service/existing_test.go'), 'package service\n'),
+      writeFile(path.join(layoutDir, testFile), testSource),
+      writeFile(path.join(taskDir, 'PROMPT.md'), 'repair the service\n'),
+    ]);
+    runGit('init', '-q');
+    runGit('checkout', '-q', '-b', 'bug9_green');
+    runGit('add', '-A');
+    runGit('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-q', '-m', 'green');
+    const greenCommit = runGit('rev-parse', 'HEAD');
+    const stream = `${JSON.stringify({ type: 'system', subtype: 'init', session_id: sessionId, claude_code_version: '2.1.228' })}\n${JSON.stringify({ type: 'result', subtype: 'success', session_id: sessionId })}\n`;
+    const raw = '{"type":"result","subtype":"success"}\n';
+    const delivery = '{"role":"assistant","content":"fixed"}\n';
+    const audit = '';
+    const manifest = {
+      session_id: sessionId,
+      task_type: 'bugfix',
+      raw_filename: `raw.native.${sessionId}.jsonl`,
+      delivery_filename: `trajectory_${sessionId}.jsonl`,
+      stream_sha256: sha(stream),
+      raw_sha256: sha(raw),
+      delivery_sha256: sha(delivery),
+      audit_sha256: sha(audit),
+    };
+    await Promise.all([
+      writeFile(path.join(taskDir, '.git-layout.json'), JSON.stringify({
+        repository: layoutDir,
+        green_branch: 'bug9_green',
+        green_commit: greenCommit,
+        test_file: testFile,
+        test_sha256: sha(testSource),
+      })),
+      writeFile(path.join(taskDir, 'public.json'), JSON.stringify({
+        task_type: 'bugfix',
+        workflow_version: 3,
+        workflow_policy_version: 4,
+        verification_policy_version: 5,
+        verification_test_overlay: 'repository-tests',
+        verification_test_files: [testFile],
+        verification_test_sha256: sha(testSource),
+        test_model_fix_session_id: sessionId,
+        test_model_fix_commit: greenCommit,
+      })),
+      writeFile(path.join(trajectoryDir, 'trajectory.stream.jsonl'), stream),
+      writeFile(path.join(trajectoryDir, manifest.raw_filename), raw),
+      writeFile(path.join(trajectoryDir, manifest.delivery_filename), delivery),
+      writeFile(path.join(trajectoryDir, 'mutation-audit.jsonl'), audit),
+      writeFile(path.join(trajectoryDir, 'runner-manifest.json'), JSON.stringify(manifest)),
+      writeFile(path.join(trajectoryDir, 'session_id.txt'), `${sessionId}\n`),
+      writeFile(path.join(trajectoryDir, `validator-${sessionId}.json`), JSON.stringify({
+        ok: true,
+        reports: [{ ok: true, stats: { sessionId } }],
+      })),
+    ]);
+
+    const result = await recoverBugfixRepairCheckpointFromLayout(taskDir);
+
+    assert.equal(result.recovered, true);
+    assert.equal(result.greenCommit, greenCommit);
+    assert.equal(await readFile(path.join(taskDir, '.repair-checkpoint/workspace/internal/service/service.go'), 'utf8'), 'package service\nconst fixed = true\n');
+    await assert.rejects(readFile(path.join(taskDir, `.repair-checkpoint/workspace/${testFile}`), 'utf8'), { code: 'ENOENT' });
+    const checkpoint = JSON.parse(await readFile(path.join(taskDir, '.repair-checkpoint/checkpoint.json'), 'utf8'));
+    assert.equal(checkpoint.session_id, sessionId);
+    assert.equal(checkpoint.claude_code_version, '2.1.228');
+    assert.equal(checkpoint.recovered_from_green_commit, greenCommit);
   } finally {
     await rm(library, { recursive: true, force: true });
   }

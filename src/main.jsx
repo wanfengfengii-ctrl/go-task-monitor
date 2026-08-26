@@ -1625,6 +1625,7 @@ function App() {
                 const userQueryReadiness = pipelineUserQueryReadiness(job);
                 const requestedBugCount = userQueryReadiness.requestedBugCount;
                 const bugsByIndex = new Map((job.bugs || []).map((bug) => [Number(bug.bugIndex), bug]));
+                const notApplicableBugIndexes = new Set((job.notApplicableBugIndexes || []).map(Number));
                 const displayBugs = Array.from({ length: requestedBugCount }, (_, offset) => {
                   const bugIndex = offset + 1;
                   return bugsByIndex.get(bugIndex) || {
@@ -1632,7 +1633,7 @@ function App() {
                     discovery: { found: false, user_query: '' },
                     workbench: {},
                   };
-                });
+                }).filter((bug) => !notApplicableBugIndexes.has(Number(bug.bugIndex)));
                 const passedStages = stages.filter((stage) => stage.status === 'passed').length;
                 const activeWorkbenchBugs = (job.bugs || []).filter((bug) => ['fast_lane_running', 'fast_lane_queued', 'fast_lane_switching'].includes(bug.workbench?.status));
                 const activeWorkbenchBug = activeWorkbenchBugs[0];

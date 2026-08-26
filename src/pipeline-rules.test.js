@@ -837,6 +837,32 @@ test('public pipeline job does not expose clone credentials or local job directo
   assert.equal(visible.bugs[0].task.taskName, 'visible-name');
 });
 
+test('historical repair placeholders are not exposed or counted as skipped Bugs', () => {
+  const job = {
+    id: 'historical-repair',
+    status: 'stopped',
+    request: { bugCount: 3 },
+    bugs: [
+      { bugIndex: 1, disposition: 'skipped', failureDisposition: 'historical_recovery_placeholder' },
+      { bugIndex: 2, disposition: 'delivered' },
+      { bugIndex: 3, disposition: 'skipped', skipReason: '候选题与公开契约冲突' },
+    ],
+    stages: [
+      { id: 'bug1_delivery_ready', bugIndex: 1, status: 'skipped' },
+      { id: 'bug2_delivery_ready', bugIndex: 2, status: 'passed' },
+      { id: 'bug3_delivery_ready', bugIndex: 3, status: 'skipped' },
+    ],
+  };
+  const summary = pipelineProjectDeliverySummary(job);
+  assert.deepEqual(summary.notApplicableBugIndexes, [1]);
+  assert.deepEqual(summary.skippedBugIndexes, [3]);
+
+  const visible = publicPipelineJob(job);
+  assert.deepEqual(visible.notApplicableBugIndexes, [1]);
+  assert.deepEqual(visible.bugs.map((bug) => bug.bugIndex), [2, 3]);
+  assert.deepEqual(visible.stages.map((stage) => stage.bugIndex), [2, 3]);
+});
+
 test('public pipeline job shows the current stage failure when the top-level error is empty', () => {
   const visible = publicPipelineJob({
     id: 'job-stage-error',

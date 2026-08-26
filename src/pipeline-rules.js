@@ -135,6 +135,10 @@ export function isSkippedPipelineBug(bug) {
   return bug?.disposition === 'skipped' || bug?.disposition === 'failed' || bug?.failureDisposition === 'auto_continued';
 }
 
+export function isHistoricalRepairPlaceholderBug(bug) {
+  return bug?.failureDisposition === 'historical_recovery_placeholder';
+}
+
 export function isPipelineBugDeliveryComplete(job, bugIndex) {
   const normalizedIndex = Number(bugIndex);
   return (job?.stages || []).some((stage) => stage.id === `bug${normalizedIndex}_delivery_ready` && stage.status === 'passed');
@@ -146,10 +150,12 @@ export function pipelineProjectDeliverySummary(job = {}) {
   const deliveredBugIndexes = [];
   const failedBugIndexes = [];
   const skippedBugIndexes = [];
+  const notApplicableBugIndexes = [];
   const incompleteBugIndexes = [];
   for (let bugIndex = 1; bugIndex <= requested; bugIndex += 1) {
     const bug = bugByIndex.get(bugIndex);
     if (isPipelineBugDeliveryComplete(job, bugIndex)) deliveredBugIndexes.push(bugIndex);
+    else if (isHistoricalRepairPlaceholderBug(bug)) notApplicableBugIndexes.push(bugIndex);
     else if (bug?.disposition === 'failed' || bug?.failureDisposition === 'auto_continued') failedBugIndexes.push(bugIndex);
     else if (bug?.disposition === 'skipped') skippedBugIndexes.push(bugIndex);
     else incompleteBugIndexes.push(bugIndex);
@@ -159,6 +165,7 @@ export function pipelineProjectDeliverySummary(job = {}) {
     deliveredBugIndexes,
     failedBugIndexes,
     skippedBugIndexes,
+    notApplicableBugIndexes,
     incompleteBugIndexes,
     passed: requested > 0 && deliveredBugIndexes.length === requested,
   };
@@ -1023,7 +1030,12 @@ export function publicPipelineJob(job) {
     execution.blockedReason = '';
   }
   const workbenchJob = { ...job, bugExecution: execution };
-  const publicBugs = (visible.bugs || []).map((bug) => {
+  const historicalPlaceholderBugIndexes = (visible.bugs || [])
+    .filter(isHistoricalRepairPlaceholderBug)
+    .map((bug) => Number(bug.bugIndex))
+    .filter(Number.isInteger);
+  const historicalPlaceholderBugIndexSet = new Set(historicalPlaceholderBugIndexes);
+  const publicBugs = (visible.bugs || []).filter((bug) => !isHistoricalRepairPlaceholderBug(bug)).map((bug) => {
     const summary = summarizeBugAttempts(bug);
     return {
       ...bug,
@@ -1038,8 +1050,11 @@ export function publicPipelineJob(job) {
       lastFailure: summary.lastFailure || null,
     };
   });
+  const publicStages = (visible.stages || [])
+    .filter((stage) => !historicalPlaceholderBugIndexSet.has(Number(stage.bugIndex)));
   return {
-    ...stripPrivatePaths({ ...visible, bugs: publicBugs, bugExecution: execution }),
+    ...stripPrivatePaths({ ...visible, bugs: publicBugs, stages: publicStages, bugExecution: execution }),
+    notApplicableBugIndexes: historicalPlaceholderBugIndexes,
     bugWorkbench: {
       ...execution,
       nextBugIndex: nextIncompleteBugIndex(workbenchJob, execution.selectedBugIndex || 1),
