@@ -809,7 +809,7 @@ export function bugSchemaForPolicy(version = 0) {
   return Number(version || 0) >= BUG_DIFFICULTY_POLICY_VERSION ? bugSchema : legacyBugSchema;
 }
 
-export const NATURAL_BUG_BATCH_VERSION = 2;
+export const NATURAL_BUG_BATCH_VERSION = 3;
 // Candidate plans are intentionally lightweight. Bump the plan version so an
 // older plan cannot re-enter the revised injection pipeline.
 export const INJECTION_PLAN_VERSION = 6;
@@ -879,12 +879,34 @@ export function bugCandidateReviewSchema(maxCandidates = 20) {
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['bug_id', 'approved', 'score', 'summary', 'issues'],
+          required: [
+            'bug_id',
+            'approved',
+            'score',
+            'summary',
+            'public_contract_status',
+            'public_contract_test_files',
+            'public_contract_test_names',
+            'public_contract_evidence',
+            'issues',
+          ],
           properties: {
             bug_id: { type: 'string', pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$' },
             approved: { type: 'boolean' },
             score: { type: 'integer', minimum: 1, maximum: 5 },
             summary: { type: 'string', minLength: 10 },
+            public_contract_status: { enum: ['compatible', 'conflict', 'no_direct_test'] },
+            public_contract_test_files: {
+              type: 'array',
+              maxItems: 8,
+              items: { type: 'string', pattern: '^(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+_test\\.go$' },
+            },
+            public_contract_test_names: {
+              type: 'array',
+              maxItems: 16,
+              items: { type: 'string', pattern: '^Test[A-Za-z0-9_]+$' },
+            },
+            public_contract_evidence: { type: 'string', minLength: 20 },
             issues: {
               type: 'array',
               items: {
@@ -1191,14 +1213,34 @@ export function selectReviewedBugCandidates(finderResults, reviewResult, previou
   const approved = normalized.candidates
     .map((item) => ({ ...item, review: reviews.get(item.candidate.bug_id) || null }))
     .filter((item) => {
-      if (item.review?.approved && Number(item.review.score || 0) >= NATURAL_BUG_MIN_REVIEW_SCORE) return true;
+      const contractStatus = String(item.review?.public_contract_status || '');
+      const contractEvidence = String(item.review?.public_contract_evidence || '').trim();
+      const contractFiles = Array.isArray(item.review?.public_contract_test_files)
+        ? item.review.public_contract_test_files.filter(Boolean)
+        : [];
+      const contractTests = Array.isArray(item.review?.public_contract_test_names)
+        ? item.review.public_contract_test_names.filter(Boolean)
+        : [];
+      const reportedConflict = contractStatus === 'conflict'
+        || (item.review?.issues || []).some((issue) => String(issue?.code || '').toUpperCase() === 'PUBLIC_CONTRACT_CONFLICT');
+      let contractIssue = '';
+      if (reportedConflict) {
+        contractIssue = `PUBLIC_CONTRACT_CONFLICT：${contractEvidence || item.review?.summary || '候选题与现有公开测试要求相反'}`;
+      } else if (!['compatible', 'no_direct_test'].includes(contractStatus) || contractEvidence.length < 20) {
+        contractIssue = '公开测试契约预检缺少结构化状态或核对证据';
+      } else if (contractStatus === 'compatible' && (!contractFiles.length || !contractTests.length)) {
+        contractIssue = '公开测试契约预检声称兼容，但没有给出具体 _test.go 文件和 Test 名称';
+      }
+      if (item.review?.approved
+        && Number(item.review.score || 0) >= NATURAL_BUG_MIN_REVIEW_SCORE
+        && !contractIssue) return true;
       rejected.push({
         bugId: item.candidate.bug_id,
-        reason: item.review
+        reason: contractIssue || (item.review
           ? Number(item.review.score || 0) < NATURAL_BUG_MIN_REVIEW_SCORE
             ? `难度评分 ${item.review.score || 0} 低于 ${NATURAL_BUG_MIN_REVIEW_SCORE} 分门槛`
             : item.review.issues?.map((issue) => `${issue.code}: ${issue.message}`).join('；') || item.review.summary
-          : 'batch reviewer did not return a decision',
+          : 'batch reviewer did not return a decision'),
       });
       return false;
     })
@@ -5381,6 +5423,7 @@ async function reviewNaturalBugDifficulty(jobFile, stageId, cwd, bug, bugIndex) 
     bugDifficultyPolicyText(),
     'Approve only when the reported runtime mechanism and propagation chain are supported by the code and locating the root cause plus verifying the invariant requires reasoning across at least two meaningful boundaries. Reject unused or toy components and reject a local typo, mapping, nil check, string normalization, decoder option, simple comparator, index, counter, offset, one-term SQL WHERE/filter change, or collection-to-current-item argument replacement even when the report describes a severe downstream symptom.',
     'An overflow or boundary defect may pass only when the actual mechanism includes a substantive transaction, persistence, concurrency, recovery, or resource invariant and the required regression evidence verifies that invariant, such as preventing an orphan persisted Session after a failed reservation.',
+    'Before approval, inspect directly related repository-owned *_test.go files by targeted endpoint, command, and symbol search. Reject with issue code PUBLIC_CONTRACT_CONFLICT when an existing public test sends the same public input but requires the opposite result from user_query or success_criteria. Production-code evidence alone is insufficient when related public tests exist.',
     `Candidate Bug record:\n${JSON.stringify(bug, null, 2)}`,
     'Return JSON matching the supplied schema. Cite exact files, symbols, control flow, and affected runtime state for approval or rejection.',
   ].join('\n\n');
@@ -5443,6 +5486,7 @@ function naturalBugFinderPrompt(job, partition, remainingCount, previousBugs, an
     bugNarrativeLanguageInstruction(),
     `No root-cause file may account for more than 30% of this project's Bug records. Current single-target file counts are ${JSON.stringify(filePolicy.counts)}; the per-file ceiling is ${Number.isFinite(filePolicy.limit) ? filePolicy.limit : 'not-applicable'}.`,
     'Every candidate must identify exact reachable files and symbols, a concrete three-link failure mechanism, actual reproduction evidence, affected runtime state, and retained behavior. Reject dead code, toy packages, local spelling/mapping/nil/comparator/index/counter fixes, and variants of another candidate.',
+    'Before returning a candidate, perform a targeted search for its endpoint, command, public symbol, and expected outcome in repository-owned *_test.go files. Omit the candidate when an existing public test sends the same public input but explicitly requires the opposite result. Production-code evidence alone is not enough to return a candidate when related public tests exist.',
     job.request.taskType === 'diagnosis'
       ? 'Each diagnosis candidate should identify a legal direct public read-only command or focused observable scenario when available. Do not require the command to have been executed or to return non-zero during discovery; final red evidence is generated later in the verifier overlay. The eventual command cannot create files, use pipes, redirects, Git, hidden tests, or external network access.'
       : 'You may use temporary files outside the repository to confirm behavior, but finish with a clean Git worktree.',
@@ -5491,6 +5535,7 @@ async function reviewNaturalBugCandidateBatch({ jobFile, stageId, projectDir, jo
     bugDifficultyPolicyText(),
     'Return exactly one review for every candidate bug_id. Approve only candidates supported by reachable code, concrete reproduction evidence, a substantive runtime invariant, and at least two meaningful boundaries. Reject semantic duplicates by approving only the stronger one. Reject dead code, toy components, shallow local fixes, invented evidence, and candidates that merely restate another failure.',
     'For each candidate, use targeted symbol, endpoint, command, or test-name search to inspect the directly related existing *_test.go contract before approval. Reject the candidate when its user_query or success_criteria requires a different outcome for the same public API or command input that a retained public test explicitly expects to succeed or fail. Report this hard rejection as PUBLIC_CONTRACT_CONFLICT; a benchmark must not require breaking an already passing repository-owned public behavior. Test inspection is exclusion-only: do not scan unrelated tests, inspect testdata, or invent test-versus-production discriminators.',
+    'The public-contract fields are a mandatory evidence gate, not a narrative formality. Set public_contract_status=compatible only after citing at least one exact directly related _test.go path, Test name, concrete input, and asserted outcome in public_contract_evidence. Set public_contract_status=conflict, approved=false, and add issue code PUBLIC_CONTRACT_CONFLICT when the same input requires opposite outcomes. Set public_contract_status=no_direct_test only after targeted searches find no directly related public test; public_contract_evidence must list the endpoint/symbol/test-name searches performed, and both test arrays may then be empty. Never approve from production-code evidence alone while leaving this audit implicit.',
     'Score approved candidates from 1 to 5 for evidence strength, runtime depth, public observability, and independence. A rejected candidate still receives a score and concrete issue evidence.',
     `Candidate records:\n${JSON.stringify(candidates.map((item) => item.candidate), null, 2)}`,
     'Return only JSON matching the supplied schema.',

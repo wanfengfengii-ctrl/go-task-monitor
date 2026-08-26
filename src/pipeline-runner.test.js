@@ -1919,8 +1919,28 @@ test('project-level Bug discovery pools candidates and selects only batch-review
 
   const selected = selectReviewedBugCandidates(finders, {
     reviews: [
-      { bug_id: 'batch-partial-commit', approved: true, score: 4, summary: '跨事务边界证据完整', issues: [] },
-      { bug_id: 'replay-stale-state', approved: true, score: 5, summary: '恢复链路证据更强', issues: [] },
+      {
+        bug_id: 'batch-partial-commit',
+        approved: true,
+        score: 4,
+        summary: '跨事务边界证据完整',
+        public_contract_status: 'compatible',
+        public_contract_test_files: ['internal/store/tx_test.go'],
+        public_contract_test_names: ['TestTransactionRollback'],
+        public_contract_evidence: 'TestTransactionRollback 使用相同失败输入并断言事务状态完整回滚，与候选要求一致。',
+        issues: [],
+      },
+      {
+        bug_id: 'replay-stale-state',
+        approved: true,
+        score: 5,
+        summary: '恢复链路证据更强',
+        public_contract_status: 'compatible',
+        public_contract_test_files: ['internal/replay/recover_test.go'],
+        public_contract_test_names: ['TestRecoverCommittedState'],
+        public_contract_evidence: 'TestRecoverCommittedState 检查已提交状态的恢复，没有要求保留失败事务的半成品。',
+        issues: [],
+      },
     ],
   }, [], { limit: 1, request });
   assert.equal(selected.selected.length, 1);
@@ -1930,12 +1950,39 @@ test('project-level Bug discovery pools candidates and selects only batch-review
 
   const lowDifficulty = selectReviewedBugCandidates(finders, {
     reviews: [
-      { bug_id: 'batch-partial-commit', approved: true, score: NATURAL_BUG_MIN_REVIEW_SCORE - 1, summary: '证据不足', issues: [] },
-      { bug_id: 'replay-stale-state', approved: true, score: NATURAL_BUG_MIN_REVIEW_SCORE, summary: '跨层证据充分', issues: [] },
+      {
+        bug_id: 'batch-partial-commit', approved: true, score: NATURAL_BUG_MIN_REVIEW_SCORE - 1, summary: '证据不足',
+        public_contract_status: 'no_direct_test', public_contract_test_files: [], public_contract_test_names: [],
+        public_contract_evidence: '已按 Store.WithTx 和公开失败接口搜索测试，没有找到直接覆盖相同输入的用例。', issues: [],
+      },
+      {
+        bug_id: 'replay-stale-state', approved: true, score: NATURAL_BUG_MIN_REVIEW_SCORE, summary: '跨层证据充分',
+        public_contract_status: 'no_direct_test', public_contract_test_files: [], public_contract_test_names: [],
+        public_contract_evidence: '已按 Recover.Load 和重启恢复场景搜索测试，没有找到直接覆盖相同输入的用例。', issues: [],
+      },
     ],
   }, [], { limit: 10, request });
   assert.deepEqual(lowDifficulty.selected.map((item) => item.candidate.bug_id), ['replay-stale-state']);
   assert.match(lowDifficulty.rejected.find((item) => item.bugId === 'batch-partial-commit').reason, /评分/);
+
+  const contractConflict = selectReviewedBugCandidates(finders, {
+    reviews: [
+      {
+        bug_id: 'batch-partial-commit', approved: true, score: 5, summary: '生产链路看似成立',
+        public_contract_status: 'conflict', public_contract_test_files: ['internal/store/tx_test.go'],
+        public_contract_test_names: ['TestFailedWriteIsRetained'],
+        public_contract_evidence: 'TestFailedWriteIsRetained 对相同失败请求明确断言半成品仍被保留，与候选要求的回滚结果相反。',
+        issues: [{ code: 'PUBLIC_CONTRACT_CONFLICT', message: '相同输入要求相反结果', evidence: 'TestFailedWriteIsRetained' }],
+      },
+      {
+        bug_id: 'replay-stale-state', approved: true, score: 4, summary: '恢复链路兼容',
+        public_contract_status: 'no_direct_test', public_contract_test_files: [], public_contract_test_names: [],
+        public_contract_evidence: '已按 Recover.Load、重启和失败恢复输入做定向搜索，没有找到直接公开测试。', issues: [],
+      },
+    ],
+  }, [], { limit: 10, request });
+  assert.deepEqual(contractConflict.selected.map((item) => item.candidate.bug_id), ['replay-stale-state']);
+  assert.match(contractConflict.rejected.find((item) => item.bugId === 'batch-partial-commit').reason, /PUBLIC_CONTRACT_CONFLICT/);
 });
 
 test('natural Bug batch review rejects conflicts with retained public tests', async () => {
@@ -1944,6 +1991,9 @@ test('natural Bug batch review rejects conflicts with retained public tests', as
   assert.match(runner, /PUBLIC_CONTRACT_CONFLICT/);
   assert.match(runner, /same public API or command input/);
   assert.match(runner, /must not require breaking an already passing repository-owned public behavior/);
+  assert.match(runner, /public_contract_status=compatible/);
+  assert.match(runner, /public_contract_status=conflict/);
+  assert.match(runner, /Production-code evidence alone/);
 });
 
 test('batch Bug schemas bound finder and reviewer output sizes', () => {
@@ -1955,7 +2005,18 @@ test('batch Bug schemas bound finder and reviewer output sizes', () => {
     assert.match(pool.properties.candidates.items.properties[field].description, /Chinese/, `${field} must carry the Chinese narrative contract in the schema`);
   }
   assert.equal(review.properties.reviews.maxItems, 14);
-  assert.deepEqual(review.properties.reviews.items.required, ['bug_id', 'approved', 'score', 'summary', 'issues']);
+  assert.deepEqual(review.properties.reviews.items.required, [
+    'bug_id',
+    'approved',
+    'score',
+    'summary',
+    'public_contract_status',
+    'public_contract_test_files',
+    'public_contract_test_names',
+    'public_contract_evidence',
+    'issues',
+  ]);
+  assert.deepEqual(review.properties.reviews.items.properties.public_contract_status.enum, ['compatible', 'conflict', 'no_direct_test']);
 });
 
 test('every batch Bug producer receives the Chinese narrative contract', async () => {
