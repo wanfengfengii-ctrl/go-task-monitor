@@ -8,6 +8,7 @@ const execFileAsync = promisify(execFile);
 const GIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
 
 export const GIT_COMMIT_LAYOUT_POLICY_VERSION = 1;
+const ALLOWED_POST_PROOF_FILES = new Set(['BENZHI_README.md']);
 
 function text(value) {
   return String(value ?? '').trim();
@@ -46,21 +47,36 @@ export function gitDeliveryLayoutIssues(record = {}, snapshot = {}) {
   const taskType = text(record.task_type || record.taskType).toLowerCase();
   const branches = expectedBranches(record);
   const heads = snapshot.heads || {};
-  const commitCounts = snapshot.commitCounts || {};
+  const verifiedAncestors = snapshot.verifiedAncestors || {};
+  const trailingFiles = snapshot.trailingFiles || {};
   const redHead = text(heads[branches.red]);
   const greenHead = text(heads[branches.green]);
-  const redCount = Number(commitCounts[branches.red]);
-  const greenCount = Number(commitCounts[branches.green]);
   const expectedRedCommit = text(record.red_commit || record.redCommit);
+
+  const checkProofCommit = (branch, head, expectedCommit, label) => {
+    if (!head || !GIT_SHA_PATTERN.test(expectedCommit) || head === expectedCommit) return;
+    if (verifiedAncestors[branch] !== true) {
+      issues.push(`远端 ${branch} 不包含元数据记录的${label}`);
+      return;
+    }
+    if (!Array.isArray(trailingFiles[branch])) {
+      issues.push(`远端 ${branch} 缺少证明提交之后的文件变更审计`);
+      return;
+    }
+    const prohibited = trailingFiles[branch]
+      .map(text)
+      .filter((file) => file && !ALLOWED_POST_PROOF_FILES.has(file));
+    if (prohibited.length) {
+      issues.push(`远端 ${branch} 在${label}之后修改了非白名单文件：${[...new Set(prohibited)].join('、')}`);
+    }
+  };
 
   if (text(record.red_branch || record.redBranch) !== branches.red) {
     issues.push(`red_branch 必须为 ${branches.red}`);
   }
   if (!redHead) issues.push(`远端缺少 ${branches.red}`);
   if (!GIT_SHA_PATTERN.test(expectedRedCommit)) issues.push('red_commit 必须是 40 位 Git commit SHA');
-  if (redHead && GIT_SHA_PATTERN.test(expectedRedCommit) && redHead !== expectedRedCommit) {
-    issues.push(`远端 ${branches.red} 分支头与 red_commit 不一致`);
-  }
+  checkProofCommit(branches.red, redHead, expectedRedCommit, 'red_commit');
 
   if (taskType === 'bugfix') {
     if (text(record.green_branch || record.greenBranch) !== branches.green) {
@@ -72,15 +88,10 @@ export function gitDeliveryLayoutIssues(record = {}, snapshot = {}) {
       || record.green_fix_commit
       || record.greenFixCommit);
     if (!GIT_SHA_PATTERN.test(expectedGreenCommit)) issues.push('模型修复 commit 必须是 40 位 Git commit SHA');
-    if (greenHead && GIT_SHA_PATTERN.test(expectedGreenCommit) && greenHead !== expectedGreenCommit) {
-      issues.push(`远端 ${branches.green} 分支头与模型修复 commit 不一致`);
-    }
-    if (redHead && redCount !== 1) issues.push(`${branches.red} 必须且只能包含 1 个 commit，实际为 ${redCount}`);
-    if (greenHead && greenCount !== 2) issues.push(`${branches.green} 必须且只能包含 2 个 commit，实际为 ${greenCount}`);
+    checkProofCommit(branches.green, greenHead, expectedGreenCommit, '模型修复 commit');
   } else if (taskType === 'diagnosis') {
     if (text(record.green_branch || record.greenBranch)) issues.push('diagnosis 不得记录 green_branch');
     if (greenHead) issues.push(`diagnosis 远端不得存在 ${branches.green}`);
-    if (redHead && redCount !== 1) issues.push(`${branches.red} 必须且只能包含 1 个 commit，实际为 ${redCount}`);
   } else {
     issues.push(`不支持的 task_type：${taskType || '空'}`);
   }
@@ -113,8 +124,20 @@ export async function inspectRemoteGitDeliveryLayout(record = {}, {
   const remote = await gitRunner(['ls-remote', '--heads', repository, ...refs], { timeoutMs });
   const heads = parseRemoteHeads(remote.stdout);
   const commitCounts = {};
+  const verifiedAncestors = {};
+  const trailingFiles = {};
   const existingBranches = Object.keys(heads);
-  if (!existingBranches.length) return { repository, heads, commitCounts };
+  if (!existingBranches.length) {
+    return { repository, heads, commitCounts, verifiedAncestors, trailingFiles };
+  }
+
+  const expectedCommits = {
+    [branches.red]: text(record.red_commit || record.redCommit),
+    [branches.green]: text(record.test_model_fix_commit
+      || record.testModelFixCommit
+      || record.green_fix_commit
+      || record.greenFixCommit),
+  };
 
   const temporary = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-git-layout-audit-'));
   try {
@@ -125,13 +148,23 @@ export async function inspectRemoteGitDeliveryLayout(record = {}, {
       timeoutMs,
     });
     for (const branch of existingBranches) {
-      const count = await gitRunner(['rev-list', '--count', `refs/heads/${branch}`], { cwd: temporary, timeoutMs });
-      commitCounts[branch] = Number(text(count.stdout));
+      const history = await gitRunner(['rev-list', `refs/heads/${branch}`], { cwd: temporary, timeoutMs });
+      const commits = text(history.stdout).split(/\r?\n/).filter(Boolean);
+      const expectedCommit = expectedCommits[branch];
+      commitCounts[branch] = commits.length;
+      verifiedAncestors[branch] = GIT_SHA_PATTERN.test(expectedCommit) && commits.includes(expectedCommit);
+      trailingFiles[branch] = [];
+      if (verifiedAncestors[branch] && heads[branch] !== expectedCommit) {
+        const changes = await gitRunner([
+          'log', '--format=', '--name-only', `${expectedCommit}..refs/heads/${branch}`,
+        ], { cwd: temporary, timeoutMs });
+        trailingFiles[branch] = [...new Set(text(changes.stdout).split(/\r?\n/).map(text).filter(Boolean))];
+      }
     }
   } finally {
     await fsp.rm(temporary, { recursive: true, force: true }).catch(() => {});
   }
-  return { repository, heads, commitCounts };
+  return { repository, heads, commitCounts, verifiedAncestors, trailingFiles };
 }
 
 export async function assertRemoteGitDeliveryLayout(record = {}, options = {}) {

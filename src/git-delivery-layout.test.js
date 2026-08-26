@@ -23,7 +23,7 @@ function bugfix(overrides = {}) {
   };
 }
 
-test('bugfix requires exactly one Red commit and two Green commits', () => {
+test('bugfix accepts proof commits at branch heads', () => {
   const record = bugfix();
   assert.equal(usesFixedGitCommitLayout(record), true);
   assert.equal(usesFixedGitCommitLayout({ ...record, git_commit_layout_policy_version: 0 }), false);
@@ -37,10 +37,32 @@ test('bugfix requires exactly one Red commit and two Green commits', () => {
     heads: { bug1_red: 'c'.repeat(40), bug1_green: 'd'.repeat(40) },
     commitCounts: { bug1_red: 2, bug1_green: 3 },
   });
-  assert.match(issues.join('；'), /red_commit 不一致/);
-  assert.match(issues.join('；'), /模型修复 commit 不一致/);
-  assert.match(issues.join('；'), /bug1_red.*1 个 commit.*实际为 2/);
-  assert.match(issues.join('；'), /bug1_green.*2 个 commit.*实际为 3/);
+  assert.match(issues.join('；'), /bug1_red 不包含元数据记录的red_commit/);
+  assert.match(issues.join('；'), /bug1_green 不包含元数据记录的模型修复 commit/);
+});
+
+test('bugfix allows README-only commits after the recorded proof commits', () => {
+  const record = bugfix();
+  assert.deepEqual(gitDeliveryLayoutIssues(record, {
+    heads: { bug1_red: 'c'.repeat(40), bug1_green: 'd'.repeat(40) },
+    commitCounts: { bug1_red: 2, bug1_green: 3 },
+    verifiedAncestors: { bug1_red: true, bug1_green: true },
+    trailingFiles: {
+      bug1_red: ['BENZHI_README.md'],
+      bug1_green: ['BENZHI_README.md'],
+    },
+  }), []);
+
+  const issues = gitDeliveryLayoutIssues(record, {
+    heads: { bug1_red: 'c'.repeat(40), bug1_green: 'd'.repeat(40) },
+    verifiedAncestors: { bug1_red: true, bug1_green: true },
+    trailingFiles: {
+      bug1_red: ['BENZHI_README.md', 'internal/service.go'],
+      bug1_green: ['model_regression_test.go'],
+    },
+  });
+  assert.match(issues.join('；'), /bug1_red.*非白名单文件：internal\/service.go/);
+  assert.match(issues.join('；'), /bug1_green.*非白名单文件：model_regression_test.go/);
 });
 
 test('diagnosis requires one Red commit and forbids a Green branch', () => {
@@ -65,10 +87,9 @@ test('diagnosis requires one Red commit and forbids a Green branch', () => {
     commitCounts: { bug2_red: 2, bug2_green: 1 },
   });
   assert.match(issues.join('；'), /不得存在 bug2_green/);
-  assert.match(issues.join('；'), /bug2_red.*1 个 commit.*实际为 2/);
 });
 
-test('remote inspection reads real branch heads and complete commit counts', async () => {
+test('remote inspection accepts README-only descendants of proof commits', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'git-delivery-layout-test-'));
   const work = path.join(root, 'work');
   const remote = path.join(root, 'remote.git');
@@ -97,15 +118,36 @@ test('remote inspection reads real branch heads and complete commit counts', asy
     git(['remote', 'add', 'origin', remote]);
     git(['push', '--quiet', 'origin', 'bug1_red', 'bug1_green']);
 
-    const snapshot = await inspectRemoteGitDeliveryLayout(bugfix({
+    git(['switch', 'bug1_red']);
+    await writeFile(path.join(work, 'BENZHI_README.md'), '基于 Go 实现的示例项目。\n');
+    git(['add', 'BENZHI_README.md']);
+    git(['commit', '--quiet', '-m', 'docs: update introduction']);
+    const redHead = git(['rev-parse', 'HEAD']);
+    git(['push', '--quiet', 'origin', 'bug1_red']);
+
+    git(['switch', 'bug1_green']);
+    await writeFile(path.join(work, 'BENZHI_README.md'), '基于 Go 实现的示例项目。\n');
+    git(['add', 'BENZHI_README.md']);
+    git(['commit', '--quiet', '-m', 'docs: update introduction']);
+    const greenHead = git(['rev-parse', 'HEAD']);
+    git(['push', '--quiet', 'origin', 'bug1_green']);
+
+    const record = bugfix({
       repository: remote,
       red_commit: actualRed,
       test_model_fix_commit: actualGreen,
-    }));
-    assert.equal(snapshot.heads.bug1_red, actualRed);
-    assert.equal(snapshot.heads.bug1_green, actualGreen);
-    assert.equal(snapshot.commitCounts.bug1_red, 1);
-    assert.equal(snapshot.commitCounts.bug1_green, 2);
+    });
+    const snapshot = await inspectRemoteGitDeliveryLayout(record);
+    assert.equal(snapshot.heads.bug1_red, redHead);
+    assert.equal(snapshot.heads.bug1_green, greenHead);
+    assert.equal(snapshot.commitCounts.bug1_red, 2);
+    assert.equal(snapshot.commitCounts.bug1_green, 3);
+    assert.deepEqual(snapshot.verifiedAncestors, { bug1_red: true, bug1_green: true });
+    assert.deepEqual(snapshot.trailingFiles, {
+      bug1_red: ['BENZHI_README.md'],
+      bug1_green: ['BENZHI_README.md'],
+    });
+    assert.deepEqual(gitDeliveryLayoutIssues(record, snapshot), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

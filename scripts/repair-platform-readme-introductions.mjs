@@ -55,19 +55,34 @@ function repositoryUrl(metadata) {
 
 async function publishBranchReadme(repository, branch, summary) {
   const checkout = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-task-readme-repair-'));
-  await execFileAsync('git', ['clone', '--quiet', '--depth=1', '--single-branch', '--branch', branch, repository, checkout], {
-    timeout: 5 * 60_000,
-    maxBuffer: 4 * 1024 * 1024,
-  });
-  const readme = path.join(checkout, 'BENZHI_README.md');
-  if (!await pathExists(readme)) throw new Error(`${repository} ${branch} 缺少 BENZHI_README.md`);
-  const before = await fsp.readFile(readme, 'utf8');
-  const after = withIntroduction(before, summary);
-  if (after !== before) {
-    throw new Error(`${repository} ${branch} 已进入不可追加提交的 Red/Green 交付阶段；请在创建 Red/Green 前完成项目简介修复，或使用会重建固定提交数并重新生成证明的专用返修流程`);
+  try {
+    await execFileAsync('git', ['clone', '--quiet', '--depth=1', '--single-branch', '--branch', branch, repository, checkout], {
+      timeout: 5 * 60_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const readme = path.join(checkout, 'BENZHI_README.md');
+    if (!await pathExists(readme)) throw new Error(`${repository} ${branch} 缺少 BENZHI_README.md`);
+    const before = await fsp.readFile(readme, 'utf8');
+    const after = withIntroduction(before, summary);
+    if (after !== before) {
+      await fsp.writeFile(readme, after, 'utf8');
+      await execFileAsync('git', ['-C', checkout, 'add', '--', 'BENZHI_README.md']);
+      await execFileAsync('git', [
+        '-C', checkout,
+        '-c', 'user.name=Go Task Monitor',
+        '-c', 'user.email=go-task-monitor@local.invalid',
+        'commit', '--quiet', '-m', 'docs: update project introduction',
+      ]);
+      await execFileAsync('git', ['-C', checkout, 'push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`], {
+        timeout: 5 * 60_000,
+        maxBuffer: 4 * 1024 * 1024,
+      });
+    }
+    const { stdout } = await execFileAsync('git', ['-C', checkout, 'rev-parse', 'HEAD']);
+    return { branch, commit: stdout.trim(), changed: after !== before };
+  } finally {
+    await fsp.rm(checkout, { recursive: true, force: true }).catch(() => {});
   }
-  const { stdout } = await execFileAsync('git', ['-C', checkout, 'rev-parse', 'HEAD']);
-  return { branch, commit: stdout.trim(), changed: false };
 }
 
 async function updateTaskReadmes(taskDir, summary) {
