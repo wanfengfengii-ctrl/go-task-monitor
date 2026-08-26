@@ -102,7 +102,9 @@ test('policy 4 diagnosis publishes only an orphan red branch', async (context) =
   const seed = path.join(root, 'seed');
   const task = path.join(root, 'task');
   const fixed = path.join(root, 'fixed');
+  const fixture = path.join(task, 'diagnosis-verification-bug1');
   await Promise.all([fs.mkdir(seed), fs.mkdir(task), fs.mkdir(fixed)]);
+  await fs.mkdir(fixture);
   await git(root, 'init', '--bare', remote);
   await git(seed, 'init', '-b', 'main');
   await git(seed, 'config', 'user.name', 'Fixture');
@@ -120,7 +122,7 @@ test('policy 4 diagnosis publishes only an orphan red branch', async (context) =
   await fs.writeFile(path.join(seed, 'go.mod'), 'module example.test/diagnosis\n\ngo 1.23\n');
   await fs.writeFile(path.join(seed, 'value.go'), source.split('\n').slice(4).join('\n'));
   const testSource = 'package diagnosis\n\nimport "testing"\n\nfunc TestValue(t *testing.T) { if Value() != 0 { t.Fatal("unexpected value") } }\n';
-  await fs.writeFile(path.join(seed, 'value_test.go'), testSource);
+  await fs.writeFile(path.join(fixture, 'value_test.go'), testSource);
   const unrelatedTestSource = 'package diagnosis\n\nimport "testing"\n\nfunc TestUnrelated(t *testing.T) { t.Helper() }\n';
   await fs.writeFile(path.join(seed, 'unrelated_test.go'), unrelatedTestSource);
   await git(seed, 'add', '.');
@@ -137,8 +139,8 @@ test('policy 4 diagnosis publishes only an orphan red branch', async (context) =
   await git(seed, 'push', 'origin', 'HEAD:bug1_red');
   await fs.writeFile(path.join(fixed, 'go.mod'), 'module example.test/diagnosis\n\ngo 1.23\n');
   await fs.writeFile(path.join(fixed, 'value.go'), source.split('\n').slice(4).join('\n'));
-  await fs.writeFile(path.join(fixed, 'value_test.go'), testSource);
   await fs.writeFile(path.join(fixed, 'unrelated_test.go'), unrelatedTestSource);
+  const fixtureSha = (await execFileAsync('shasum', ['-a', '256', path.join(fixture, 'value_test.go')])).stdout.split(/\s+/)[0];
   await fs.writeFile(path.join(task, 'public.json'), `${JSON.stringify({
     workflow_version: 3,
     workflow_policy_version: 4,
@@ -157,8 +159,12 @@ test('policy 4 diagnosis publishes only an orphan red branch', async (context) =
     main_unchanged: true,
     red_branch: 'bug1_red',
     test_model_fix_branch: 'bug1_red',
-    verification_test_overlay: 'repository-tests',
+    verification_test_overlay: 'private-fixture',
     verification_test_files: ['value_test.go'],
+    verification_fixture_dir: fixture,
+    verification_fixture_sha256: fixtureSha,
+    verification_fixture_published: false,
+    verification_fixture_materialized: false,
   }, null, 2)}\n`);
 
   const red = (await execFileAsync('/bin/bash', [publisher, task, fixed, 'diagnosis-session'])).stdout.trim();
@@ -169,9 +175,13 @@ test('policy 4 diagnosis publishes only an orphan red branch', async (context) =
   assert.equal(updated.green_branch, '');
   assert.equal(updated.model_input_branch, '');
   assert.equal(updated.red_commit, red);
-  assert.equal(red, redBaseline);
+  assert.notEqual(red, redBaseline);
   assert.equal(await git(seed, '--git-dir', remote, 'rev-list', '--parents', '-n', '1', red).then((value) => value.split(/\s+/).length), 1);
   assert.equal(await git(seed, '--git-dir', remote, 'show', `${red}:value_test.go`), testSource.trimEnd());
   assert.equal(await git(seed, '--git-dir', remote, 'show', `${red}:unrelated_test.go`), unrelatedTestSource.trimEnd());
+  assert.equal(updated.verification_test_overlay, 'repository-tests');
+  assert.equal(updated.verification_test_storage, 'repository-red-branch');
+  assert.equal(updated.verification_test_published, true);
+  assert.equal(updated.verification_fixture_materialized, false);
   assert.equal(await git(seed, 'ls-remote', remote, 'refs/heads/bug1_green'), '');
 });

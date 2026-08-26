@@ -1,5 +1,6 @@
 export const LEGACY_PROJECT_PACKAGE_POLICY_VERSION = 1;
-export const CURRENT_PROJECT_PACKAGE_POLICY_VERSION = 2;
+export const MANAGED_PROJECT_PACKAGE_POLICY_VERSION = 2;
+export const CURRENT_PROJECT_PACKAGE_POLICY_VERSION = 3;
 
 const PROJECT_TYPES = new Set(['cli', 'web']);
 const PROJECT_SUMMARY_ALLOWED_LATIN_TOKENS = new Set([
@@ -23,9 +24,10 @@ function text(value) {
 
 export function normalizeProjectPackagePolicyVersion(value) {
   const version = Number(value || LEGACY_PROJECT_PACKAGE_POLICY_VERSION);
-  return Number.isInteger(version) && version >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION
-    ? CURRENT_PROJECT_PACKAGE_POLICY_VERSION
-    : LEGACY_PROJECT_PACKAGE_POLICY_VERSION;
+  if (!Number.isInteger(version) || version < MANAGED_PROJECT_PACKAGE_POLICY_VERSION) {
+    return LEGACY_PROJECT_PACKAGE_POLICY_VERSION;
+  }
+  return Math.min(version, CURRENT_PROJECT_PACKAGE_POLICY_VERSION);
 }
 
 export function normalizeProjectType(value) {
@@ -37,7 +39,7 @@ export function validateProjectPackagePlan(plan = {}, {
   policyVersion = plan.project_package_policy_version || plan.projectPackagePolicyVersion,
   frontendRequired = plan.frontend_required || plan.frontendRequired,
 } = {}) {
-  if (normalizeProjectPackagePolicyVersion(policyVersion) < CURRENT_PROJECT_PACKAGE_POLICY_VERSION) {
+  if (normalizeProjectPackagePolicyVersion(policyVersion) < MANAGED_PROJECT_PACKAGE_POLICY_VERSION) {
     return { ok: true, issues: [], projectType: '', projectSummary: '' };
   }
   const projectType = normalizeProjectType(plan.project_type || plan.projectType);
@@ -89,7 +91,7 @@ export function validateReadmeProjectIntroduction(readme, options = {}) {
   const policyVersion = normalizeProjectPackagePolicyVersion(
     options.projectPackagePolicyVersion || options.project_package_policy_version,
   );
-  if (policyVersion < CURRENT_PROJECT_PACKAGE_POLICY_VERSION) return { ok: true, issues: [] };
+  if (policyVersion < MANAGED_PROJECT_PACKAGE_POLICY_VERSION) return { ok: true, issues: [] };
   const firstLine = String(readme || '').replace(/^\uFEFF/, '').split(/\r?\n/, 1)[0].trim();
   const plan = validateProjectPackagePlan({
     project_type: options.projectType || options.project_type,
@@ -124,7 +126,7 @@ export function projectPackageRuleOptions(value = {}) {
     || value.packageExpectedFailureCommands
     || value.expectedFailureCommands;
   const expectedFailureCommands = normalizePackageExpectedFailureCommands(
-    explicitExpectedFailures || (policyVersion >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION && value.task_type === 'diagnosis'
+    explicitExpectedFailures || (policyVersion >= MANAGED_PROJECT_PACKAGE_POLICY_VERSION && value.task_type === 'diagnosis'
       ? value.verify_cmds
       : []),
   );

@@ -33,10 +33,19 @@ export function classifyTrajectoryAttemptFailure(message = '') {
   const value = String(message);
   if (/GRADER_COLLISION|grader[_ -]collision|隐藏测试.*(?:冲突|重名)/i.test(value)) return 'grader_collision';
   if (/mutation-audit[\s\S]*(?:未记录\s*(?:PreToolUse|PostToolUse)|baseline.*missing)|Hook 审计.*(?:缺失|失败)/i.test(value)) return 'audit_infrastructure';
+  // A scheduler stop can race the child-command failure handler and persist a
+  // failed record immediately before the explicit stopped record. Neither is
+  // a completed model attempt, so the duplicate must not consume its budget.
+  if (/exit=none[，,]\s*signal=SIG(?:TERM|INT|HUP|KILL)|人工停止（SIG(?:TERM|INT|HUP|KILL)）/i.test(value)) return 'runner_infrastructure';
+  // A non-zero CLI exit with no terminal result and no stderr is a transport
+  // or process failure. Older runners persisted only their progress heartbeats,
+  // so retain that exact legacy shape without hiding genuine model/test errors.
+  if (/CLAUDE_CLI_EMPTY_FAILURE=1/i.test(value)
+    || /^Claude 修复失败（exit=1）：\s*(?:CLAUDE_PROGRESS\s*)+$/iu.test(value.trim())) return 'model_gateway_infrastructure';
   // Claude Code reports model-gateway outages as API Error/api_retry events.
   // Keep the gateway context mandatory so a repository test that merely
   // expects an HTTP 504 response remains a genuine model attempt.
-  if (/API\s+Error:\s*504\b|api_retry[\s\S]{0,500}(?:\b504\b|server_error|gateway timeout)|(?:model|模型|claude|anthropic)[ _-]?(?:api[ _-]?)?gateway[\s\S]{0,300}(?:\b504\b|server_error|timed?\s*out|超时)|(?:claude|anthropic)\s+api[\s\S]{0,300}(?:\b504\b|server_error|gateway timeout)/i.test(value)) return 'model_gateway_infrastructure';
+  if (/API\s+Error:\s*504\b|api_retry[\s\S]{0,500}(?:\b504\b|server_error|gateway timeout)|consecutive Claude API retries|(?:model|模型|claude|anthropic)[ _-]?(?:api[ _-]?)?gateway[\s\S]{0,300}(?:\b504\b|server_error|timed?\s*out|超时)|(?:claude|anthropic)\s+api[\s\S]{0,300}(?:\b504\b|server_error|gateway timeout)/i.test(value)) return 'model_gateway_infrastructure';
   // Older diagnosis runners correctly accepted a red target, then accidentally
   // included the injected Gold test in the baseline `go test ./...` run. That
   // is grader pollution, not a failed model diagnosis.

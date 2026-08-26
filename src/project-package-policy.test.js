@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  CURRENT_PROJECT_PACKAGE_POLICY_VERSION,
   isBugReproPath,
   normalizePackageExpectedFailureCommands,
+  normalizeProjectPackagePolicyVersion,
   projectPackageRuleOptions,
   validateProjectPackagePlan,
   validateReadmeProjectIntroduction,
@@ -11,6 +13,14 @@ import {
 const cliSummary = '基于 Go 实现的停车场管理 CLI 项目，一款命令行工具，完成车位录入、车辆进出登记与费用核算。';
 const webSummary = '基于 Go 实现的外卖订单管理 Web 项目，一款后端服务，处理订单创建、状态流转与商家数据管理。';
 const technicalSummary = '基于 Go 实现的DNSSEC轮换 Web 项目，一款后端服务，协调 HSM 槽位与 API 发布租约。';
+
+test('package policy keeps v2 compatibility and assigns v3 to new projects', () => {
+  assert.equal(normalizeProjectPackagePolicyVersion(1), 1);
+  assert.equal(normalizeProjectPackagePolicyVersion(2), 2);
+  assert.equal(normalizeProjectPackagePolicyVersion(3), CURRENT_PROJECT_PACKAGE_POLICY_VERSION);
+  assert.equal(normalizeProjectPackagePolicyVersion(99), CURRENT_PROJECT_PACKAGE_POLICY_VERSION);
+  assert.equal(CURRENT_PROJECT_PACKAGE_POLICY_VERSION, 3);
+});
 
 test('current package policy accepts the required CLI and Web introduction forms', () => {
   assert.equal(validateProjectPackagePlan({

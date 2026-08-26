@@ -110,6 +110,7 @@ require_remote main "$main_commit"
 
 checkout_tree() {
   local commit="$1"
+  chmod -R u+rwX "$delivery_repo" 2>/dev/null || true
   git -C "$delivery_repo" reset --hard "$commit" >/dev/null
   git -C "$delivery_repo" read-tree --reset "$commit"
   git -C "$delivery_repo" clean -fdxq
@@ -147,6 +148,7 @@ commit_root() {
   local branch="$1" message="$2"
   local tree_commit="${3:-}"
   local source_workspace="${4:-}"
+  chmod -R u+rwX "$delivery_repo" 2>/dev/null || true
   git -C "$delivery_repo" branch -D "$branch" >/dev/null 2>&1 || true
   git -C "$delivery_repo" switch --orphan "$branch" >/dev/null
   if [[ -n "$tree_commit" ]]; then
@@ -218,20 +220,39 @@ if [[ "$task_type" == "bugfix" ]]; then
   delivery_commit="$green_commit"
   delivery_branch="$green_branch"
 else
-  # Diagnosis R1 is frozen and published before the pre-fix proof so the
-  # proof manifest can bind to a commit that the submitted repository exposes.
-  # The read-only Claude Session must return the exact same tree.
+  # The read-only Diagnosis Session must return the exact frozen source tree.
+  # After that Session ends, the trusted system publisher creates a new orphan
+  # R1 containing the byte-identical source plus the independently authored
+  # acceptance test. The model workspace itself remains untouched.
   red_commit="$(remote_head "$red_branch")"
   [[ -n "$red_commit" && "$red_commit" == "$bug_base_commit" ]] \
     || { echo "remote diagnosis red branch is ${red_commit:-missing}, expected $bug_base_commit" >&2; exit 4; }
   git -C "$delivery_repo" fetch --quiet --no-tags origin "refs/heads/$red_branch:refs/remotes/origin/$red_branch"
   [[ "$(git -C "$delivery_repo" rev-list --parents -n 1 "$red_commit" | awk '{print NF - 1}')" == 0 ]] \
     || { echo "diagnosis red R1 must be orphan" >&2; exit 5; }
-  checkout_tree "$red_commit"
-  rsync -a --checksum --delete --exclude='.git/' "$fixed_workspace/" "$delivery_repo/"
-  git -C "$delivery_repo" add -A
-  git -C "$delivery_repo" diff --cached --quiet \
-    || { echo "diagnosis workspace differs from the frozen red R1" >&2; exit 5; }
+  if git -C "$delivery_repo" cat-file -e "$red_commit:$fixture_file" 2>/dev/null; then
+    red_test_sha="$(git -C "$delivery_repo" show "$red_commit:$fixture_file" | shasum -a 256 | awk '{print $1}')"
+    if [[ -n "$fixture_sha" ]]; then
+      [[ "$red_test_sha" == "$fixture_sha" ]] || { echo "published diagnosis test hash does not match the system fixture" >&2; exit 5; }
+    else
+      fixture_sha="$red_test_sha"
+    fi
+  else
+    checkout_tree "$red_commit"
+    rsync -a --checksum --delete --exclude='.git/' "$fixed_workspace/" "$delivery_repo/"
+    git -C "$delivery_repo" add -A
+    git -C "$delivery_repo" diff --cached --quiet \
+      || { echo "diagnosis workspace differs from the frozen red R1" >&2; exit 5; }
+    # The diagnosis workspace is intentionally read-only. Its file modes must
+    # not make the trusted temporary publication repository read-only too.
+    chmod -R u+rwX "$delivery_repo" 2>/dev/null || true
+    red_commit="$(commit_root "$red_branch" 'test: public diagnosis acceptance' "$bug_base_commit")"
+    [[ "$(git -C "$delivery_repo" rev-list --parents -n 1 "$red_commit" | awk '{print NF - 1}')" == 0 ]] \
+      || { echo "published diagnosis red R1 must be orphan" >&2; exit 5; }
+    red_test_sha="$(git -C "$delivery_repo" show "$red_commit:$fixture_file" | shasum -a 256 | awk '{print $1}')"
+    [[ "$red_test_sha" == "$fixture_sha" ]] || { echo "diagnosis R1 acceptance test hash does not match the system fixture" >&2; exit 5; }
+    push_branch "$red_branch" "$red_commit"
+  fi
   delivery_commit="$red_commit"
   delivery_branch="$red_branch"
   green_commit=""
@@ -257,9 +278,12 @@ jq \
    | .red_commit = $red_commit
    | .red_pushed = true
    | .red_test_files = (if .verification_test_files then .verification_test_files else [] end)
-   | if $green_commit != "" then .green_fix_commit = $green_commit else .green_branch = "" | .green_fix_commit = "" | .green_baseline_commit = "" | .green_baseline_pushed = false | .bug_base_branch = "" | .bug_base_pushed = false | .model_input_branch = "" | .model_input_commit = "" | .model_input_snapshot = "single-branch-single-commit-no-tests" end
+   | if $green_commit != "" then .green_fix_commit = $green_commit else .green_branch = "" | .green_fix_commit = "" | .green_baseline_commit = "" | .green_baseline_pushed = false | .bug_base_branch = "" | .bug_base_commit = $red_commit | .bug_base_pushed = false | .test_model_fix_base_commit = $red_commit | .model_input_branch = "" | .model_input_commit = "" | .model_input_snapshot = "single-branch-single-commit-no-tests" end
    | .verification_fixture_published = true
+   | .verification_fixture_materialized = false
    | .verification_test_published = true
+   | .verification_test_overlay = "repository-tests"
+   | .verification_test_storage = "repository-red-branch"
    | .verification_test_sha256 = $fixture_sha' \
   "$meta_file" >"$updated_meta"
 mv "$updated_meta" "$meta_file"

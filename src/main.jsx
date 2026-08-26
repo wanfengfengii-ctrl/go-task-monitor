@@ -29,7 +29,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import './styles.css';
-import { EXCEL_EXPORT_FIELDS, isChineseDescription, isCloudTrajectoryFileUrl, isCloudTrajectoryUrl, prepareExcelRecord, requireDirectPublicVerifyCmd, requireDockerVerifyCmds, sanitizeHarness } from './export-rules.js';
+import { EXCEL_EXPORT_FIELDS, isChineseDescription, isCloudTrajectoryFileUrl, isCloudTrajectoryUrl, isGitTestModelBranchUrl, prepareExcelRecord, requireDirectPublicVerifyCmd, requireDockerVerifyCmds, sanitizeHarness } from './export-rules.js';
 import { splitExportBatches } from './export-coordinator.js';
 import { getClaudeHarnessIssues } from './harness-rules.js';
 import { resolvePinnedGoVersion } from './review-rules.js';
@@ -326,15 +326,9 @@ function validateRuleRecord(record, index, records) {
   for (const message of getHardRuleIssues({ ...record, verification_policy_version: verificationV5 ? VERIFICATION_POLICY_VERSION : 0 }, { includeGoVersion: false })) add('delivery', message);
   if (typeof rootCause === 'string' && rootCause.trim() && !isChineseDescription(rootCause)) add('delivery', 'gold_root_cause 必须以中文为主体，文件名、函数名和 Go 标识符可以保留英文，但不能夹带英文叙述段落');
   if (typeof rootCause === 'string' && /`/.test(rootCause)) add('delivery', 'gold_root_cause 不得包含 Markdown 反引号，导出时会自动清理');
-  const v3Git = Number(record.workflow_version || 1) >= 3 || record.production_flow === 'codex_design_claude_generate_then_select_or_inject_bug_before_git_then_claude_fix';
-  const expectedV3Suffix = record.task_type === 'diagnosis' ? 'red' : 'green';
-  const repoPattern = v3Git
-    ? new RegExp(`^https://[^\\s]+/tree/bug\\d+_${expectedV3Suffix}$`, 'i')
-    : /^https:\/\/[^\s]+\/tree\/bug-\d{2}\/test_model_fix$/i;
-  if (typeof repoUrl !== 'string' || !repoPattern.test(repoUrl.trim())) {
-    add('delivery', v3Git
-      ? `repo_url 必须是 ${record.task_type === 'diagnosis' ? 'red 复现' : 'green 修复'}分支地址（.../tree/bug1_${expectedV3Suffix}）`
-      : 'repo_url 必须是测试模型分支地址（.../tree/bug-01/test_model_fix）');
+  const expectedGitRole = record.task_type === 'diagnosis' ? 'red' : record.task_type === 'bugfix' ? 'green' : '';
+  if (typeof repoUrl !== 'string' || !isGitTestModelBranchUrl(repoUrl, expectedGitRole)) {
+    add('delivery', `repo_url 必须是显式 ${expectedGitRole || 'red/green'} 分支地址；test_model_fix 等无法识别红绿角色的分支禁止提交`);
   }
   if (typeof success !== 'string' || success.trim().length < 20 || !isChineseDescription(success)) add('delivery', 'success_criteria 必须使用中文填写可观察、可自动验收的完成条件，不能夹带英文叙述段落');
   if (record.task_type === 'diagnosis' && (typeof success !== 'string' || !hasAny(success, [/诊断|调查|定位|根因|复现|证据|行为|diagnos|investigat|locat|root\s*cause|reproduc|evidence|behavio(?:u)?r|failure|issue/i]) || !hasAny(success, [/不修改|不得|禁止|无代码|工作区.*(一致|未改|零)|no\s+(?:code|source)\s+(?:change|modif)|without\s+(?:changing|modif)|read[- ]only|unchanged|pristine|workspace.*(?:unchanged|untouched)|must\s+not\s+(?:modify|change)/i]))) add('delivery', 'diagnosis 的 success_criteria 必须以正确根因/调查证据为终点，并明确禁止代码修改');

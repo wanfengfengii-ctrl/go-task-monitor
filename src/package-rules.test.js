@@ -34,6 +34,17 @@ function currentPolicyEntries() {
     : entry);
 }
 
+function dockerAliasEntries() {
+  const entries = currentPolicyEntries();
+  const canonical = entries.find((entry) => entry.path === 'benzhi.Dockerfile');
+  return [...entries, { path: 'Dockerfile', content: canonical.content }];
+}
+
+const dockerAliasPolicyOptions = {
+  ...currentPolicyOptions,
+  projectPackagePolicyVersion: 3,
+};
+
 test('package entries strip one enclosing task directory', () => {
   const normalized = normalizePackageEntries(validEntries('task-name/'));
   assert.equal(normalized.rootPrefix, 'task-name/');
@@ -45,6 +56,23 @@ test('valid pure Go package passes static rules', () => {
   assert.equal(result.ok, true);
   assert.deepEqual(result.issues, []);
   assert.equal(result.warnings.length, 1);
+});
+
+test('v3 package policy requires a standard Dockerfile identical to benzhi.Dockerfile', () => {
+  assert.equal(validateGoPackage(dockerAliasEntries(), dockerAliasPolicyOptions).ok, true);
+
+  const missing = validateGoPackage(currentPolicyEntries(), dockerAliasPolicyOptions);
+  assert.ok(missing.issues.some((issue) => issue.includes('根目录缺少 Dockerfile')));
+
+  const drifted = dockerAliasEntries().map((entry) => entry.path === 'Dockerfile'
+    ? { ...entry, content: entry.content.replace('CMD ["bash"]', 'CMD ["go", "version"]') }
+    : entry);
+  assert.ok(validateGoPackage(drifted, dockerAliasPolicyOptions).issues
+    .some((issue) => issue.includes('完全一致')));
+});
+
+test('v2 package policy keeps historical branches without Dockerfile valid', () => {
+  assert.equal(validateGoPackage(currentPolicyEntries(), currentPolicyOptions).ok, true);
 });
 
 test('smoke validation accepts a loopback URL assembled from a loopback variable', () => {

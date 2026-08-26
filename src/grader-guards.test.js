@@ -28,6 +28,8 @@ test('trajectory attempt failures distinguish system faults from model output', 
   assert.equal(classifyTrajectoryAttemptFailure('/task-monitor/run_one_claude.sh: line 184: syntax error near unexpected token'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('/pipeline-jobs/job/artifacts/runner-snapshots/bug6-claude-attempt-1.sh: line 398: rg: command not found'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('/pipeline-jobs/job/artifacts/runner-snapshots/bug6-claude-attempt-1.sh: line 586: /Users/niuyuhang/Documents/New: Permission denied'), 'runner_infrastructure');
+  assert.equal(classifyTrajectoryAttemptFailure('Claude 修复失败（exit=none，signal=SIGTERM）：\n运行被调度器终止'), 'runner_infrastructure');
+  assert.equal(classifyTrajectoryAttemptFailure('人工停止（SIGINT），本次尝试已停止'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('trajectory already exists in /tmp/task/trajectory'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('bug_index must be an integer from 1 to 5'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('Claude 修复失败（exit=75）：\nClaude task runner already active for /tmp/task (pid=67809)'), 'runner_infrastructure');
@@ -44,6 +46,10 @@ test('trajectory attempt failures distinguish system faults from model output', 
   assert.equal(classifyTrajectoryAttemptFailure('FAST_VERIFICATION_GATE: fixed Go 1.25.6 is not installed locally; refusing host toolchain auto-download'), 'runner_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('Claude CLI: API Error: 504 {"type":"error","error":{"type":"server_error"}}'), 'model_gateway_infrastructure');
   assert.equal(classifyTrajectoryAttemptFailure('{"type":"system","subtype":"api_retry","error_status":504,"error_type":"server_error"}'), 'model_gateway_infrastructure');
+  assert.equal(classifyTrajectoryAttemptFailure('Claude stream guard reached (3 consecutive Claude API retries); terminating Session'), 'model_gateway_infrastructure');
+  assert.equal(classifyTrajectoryAttemptFailure('CLAUDE_CLI_EMPTY_FAILURE=1\nClaude CLI exited non-zero without a terminal result or stderr'), 'model_gateway_infrastructure');
+  assert.equal(classifyTrajectoryAttemptFailure('Claude 修复失败（exit=1）：\nCLAUDE_PROGRESS\nCLAUDE_PROGRESS'), 'model_gateway_infrastructure');
+  assert.equal(classifyTrajectoryAttemptFailure('Claude 修复失败（exit=1）：\nCLAUDE_PROGRESS\ngo test failed'), 'model_attempt');
   assert.equal(isSystemTrajectoryFailure('Claude API gateway returned 504 server_error after retries'), true);
   assert.equal(classifyTrajectoryAttemptFailure('go test failed: expected HTTP 504 from the business service, got 500'), 'model_attempt');
   assert.equal(classifyTrajectoryAttemptFailure('go test failed: not enough arguments'), 'model_attempt');

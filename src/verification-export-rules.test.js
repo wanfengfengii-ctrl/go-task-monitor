@@ -83,7 +83,7 @@ test('diagnosis Excel metadata requires only the pre-fix proof', () => {
   assert.deepEqual(assertVerificationExportMetadata(value).phases, ['pre_fix']);
 });
 
-test('diagnosis Excel metadata accepts only an external unmaterialized verification fixture', () => {
+test('diagnosis Excel metadata blocks the private fixture intermediate state until Git publication', () => {
   const value = metadata({
     task_type: 'diagnosis',
     verification_test_overlay: 'private-fixture',
@@ -98,10 +98,13 @@ test('diagnosis Excel metadata accepts only an external unmaterialized verificat
   const parsed = JSON.parse(value.verify_result);
   delete parsed.post_fix;
   value.verify_result = JSON.stringify(parsed);
-  assert.deepEqual(assertVerificationExportMetadata(value).phases, ['pre_fix']);
+  assert.match(verificationExportMetadataIssues(value).issues.join(';'), /中间态.*发布到 red 分支/);
 
-  value.verification_fixture_materialized = true;
-  assert.match(verificationExportMetadataIssues(value).issues.join(';'), /禁止写入工作区或 Git 分支/);
+  value.verification_test_overlay = 'repository-tests';
+  value.verification_fixture_published = true;
+  value.verification_test_published = true;
+  value.verification_test_storage = 'repository-red-branch';
+  assert.deepEqual(assertVerificationExportMetadata(value).phases, ['pre_fix']);
 });
 
 test('historical diagnosis evidence with MODEL_REPRO exports using the canonical command', () => {

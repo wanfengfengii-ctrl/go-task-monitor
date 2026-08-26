@@ -81,6 +81,38 @@ function goTestDetails(command) {
   };
 }
 
+function focusedGoTestName(command) {
+  const details = goTestDetails(String(command || ''));
+  if (!details?.hasRun) return '';
+  const names = [...new Set(details.runExpression.match(/\bTest[A-Za-z0-9_]+\b/g) || [])];
+  return names.length === 1 ? names[0] : '';
+}
+
+export function goTargetTestRedIssues(command, output = '') {
+  const details = goTestDetails(String(command || ''));
+  if (!details?.hasRun) return [];
+  const value = String(output || '');
+  const issues = [];
+  const testName = focusedGoTestName(command);
+  const escapedName = testName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const runPattern = testName
+    ? new RegExp(`(?:^|\\n)=== RUN\\s+${escapedName}(?:\\/|\\s|$)`, 'm')
+    : /(?:^|\n)=== RUN\s+Test[A-Za-z0-9_]+(?:\/|\s|$)/m;
+  const failPattern = testName
+    ? new RegExp(`(?:^|\\n)--- FAIL:\\s+${escapedName}(?:\\/|\\s|\\()`, 'm')
+    : /(?:^|\n)--- FAIL:\s+Test[A-Za-z0-9_]+(?:\/|\s|\()/m;
+  if (/\[(?:build failed|setup failed)\]/i.test(value) || /(?:^|\n)FAIL\s+\S+\s+\[setup failed\]/im.test(value)) {
+    issues.push('目标测试在进入断言前发生构建或初始化失败');
+  }
+  if (!runPattern.test(value)) {
+    issues.push(testName ? `没有执行到目标测试 ${testName}` : '没有执行到 -run 指定的目标测试');
+  }
+  if (!failPattern.test(value)) {
+    issues.push(testName ? `目标测试 ${testName} 没有形成断言失败` : '目标测试没有形成断言失败');
+  }
+  return [...new Set(issues)];
+}
+
 function isLocalHttpCommand(command) {
   return /^(?:(?:[A-Z_][A-Z0-9_]*=[^\s]+)\s+)*curl\b/i.test(command)
     && /https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:[/'"?\s]|$)/i.test(command);
@@ -292,9 +324,9 @@ export function platformCompatibleVerificationProofIssues({
       if (!/(?:^|\n)Exit code\s+[1-9]\d*(?:\n|$)/i.test(execution.output)) {
         issues.push(`pre_fix 第 ${index + 1} 条目标命令未在 tool_result 中显式记录非零 Exit code`);
       }
-      if (DIRECT_GO_TEST_PATTERN.test(command)
-        && !/(?:^|\n)(?:--- FAIL:|FAIL(?:\s|\t|$)|panic:|#\s+\S+)|\[(?:build failed|setup failed)\]/im.test(execution.output)) {
-        issues.push(`pre_fix 第 ${index + 1} 条 go test 结果缺少可识别的 FAIL、panic 或构建失败输出`);
+      if (DIRECT_GO_TEST_PATTERN.test(command)) {
+        issues.push(...goTargetTestRedIssues(command, execution.output)
+          .map((issue) => `pre_fix 第 ${index + 1} 条 go test ${issue}`));
       }
     } else if (phase === 'post_fix' && execution.exitCode !== 0) {
       issues.push(`post_fix 第 ${index + 1} 条目标命令未呈绿`);
@@ -366,9 +398,17 @@ export function verificationProofPrompt(phase, verifyCmds = []) {
     `This is the ${phase} verification session. Use one separate Bash tool call for each command below, in the exact listed order.`,
     'Execute every command verbatim. Shell quoting, $(pwd), or bash -c already present inside a listed Docker command is part of that command and must be preserved. Do not combine commands, add another wrapper, add prefixes or suffixes, retry them, or skip later commands after a failure.',
     'Do not inspect files, read source code, edit anything, or run any command not listed below.',
+    'If a Bash result contains a <persisted-output> notice because its output is large, do not read, tail, cat, or otherwise inspect that temporary file. Treat the original Bash tool result and exit status as the complete command result.',
     ...verifyCmds.flatMap((command, index) => [`Command ${index + 1}:`, String(command)]),
     'After all commands have returned, report only whether the verification result was red, green, or an infrastructure error.',
   ].join('\n');
+}
+
+function prePersistedOutputVerificationProofPrompt(phase, verifyCmds = []) {
+  return verificationProofPrompt(phase, verifyCmds).replace(
+    '\nIf a Bash result contains a <persisted-output> notice because its output is large, do not read, tail, cat, or otherwise inspect that temporary file. Treat the original Bash tool result and exit status as the complete command result.',
+    '',
+  );
 }
 
 function legacyDirectVerificationProofPrompt(phase, verifyCmds = []) {
@@ -383,6 +423,13 @@ function legacyDirectVerificationProofPrompt(phase, verifyCmds = []) {
 
 function timedVerificationProofPrompt(phase, verifyCmds = []) {
   return verificationProofPrompt(phase, verifyCmds).replace(
+    '\nDo not inspect files',
+    '\nSet every Bash tool timeout to 600000 milliseconds so each verification command can finish.\nDo not inspect files',
+  );
+}
+
+function timedPrePersistedOutputVerificationProofPrompt(phase, verifyCmds = []) {
+  return prePersistedOutputVerificationProofPrompt(phase, verifyCmds).replace(
     '\nDo not inspect files',
     '\nSet every Bash tool timeout to 600000 milliseconds so each verification command can finish.\nDo not inspect files',
   );
@@ -451,6 +498,8 @@ export function validateVerificationProofBundle(input = {}) {
   const directPromptVariants = [
     verificationProofPrompt(phase, verifyCmds),
     timedVerificationProofPrompt(phase, verifyCmds),
+    prePersistedOutputVerificationProofPrompt(phase, verifyCmds),
+    timedPrePersistedOutputVerificationProofPrompt(phase, verifyCmds),
     legacyDirectVerificationProofPrompt(phase, verifyCmds),
     timedLegacyDirectVerificationProofPrompt(phase, verifyCmds),
   ];

@@ -28,14 +28,26 @@ test('platform proof compatibility requires a paired non-zero Go failure with re
     phase: 'pre_fix',
     taskType: 'bugfix',
     verifyCmds: [command],
-    trajectoryContent: trajectory('Exit code 1\n--- FAIL: TestRegression (0.01s)\nFAIL\n'),
+    trajectoryContent: trajectory('Exit code 1\n=== RUN   TestRegression\n--- FAIL: TestRegression (0.01s)\nFAIL\n'),
   }), []);
   assert.match(platformCompatibleVerificationProofIssues({
     phase: 'pre_fix',
     taskType: 'bugfix',
     verifyCmds: [command],
+    trajectoryContent: trajectory('Exit code 1\n==================\nWARNING: DATA RACE\nRead at 0x00c0000142f8\n'),
+  }).join('；'), /没有执行到目标测试/);
+  assert.match(platformCompatibleVerificationProofIssues({
+    phase: 'pre_fix',
+    taskType: 'bugfix',
+    verifyCmds: [command],
+    trajectoryContent: trajectory('Exit code 1\n# sample/service_test\nservice_test.go:12: undefined: FixedOnlyAPI\nFAIL sample/service [build failed]\nFAIL\n'),
+  }).join('；'), /构建或初始化失败/);
+  assert.match(platformCompatibleVerificationProofIssues({
+    phase: 'pre_fix',
+    taskType: 'bugfix',
+    verifyCmds: [command],
     trajectoryContent: trajectory('Exit code 1\ncommand stopped\n'),
-  }).join('；'), /缺少可识别的 FAIL/);
+  }).join('；'), /没有执行到目标测试/);
 });
 
 test('proof validator accepts the exact direct-command timeout prompt template', () => {
@@ -79,9 +91,28 @@ test('proof validator accepts the exact direct-command timeout prompt template',
   });
   assert.doesNotMatch(checked.issues.join(';'), /提示词与系统固定提示不一致/);
 
+  const previousPromptContent = `${currentPrompt.replace(
+    '\nIf a Bash result contains a <persisted-output> notice because its output is large, do not read, tail, cat, or otherwise inspect that temporary file. Treat the original Bash tool result and exit status as the complete command result.',
+    '',
+  )}\n`;
+  const previousContents = { ...contents, promptContent: previousPromptContent };
+  const previousManifest = { ...manifest, prompt_sha256: hash(previousPromptContent) };
+  const previousChecked = validateVerificationProofBundle({
+    phase: 'pre_fix',
+    bugBaseCommit: previousManifest.source_commit,
+    verifyCmds,
+    evidence: previousManifest,
+    manifest: previousManifest,
+    ...previousContents,
+  });
+  assert.doesNotMatch(previousChecked.issues.join(';'), /提示词与系统固定提示不一致/);
+
   const legacyPromptContent = `${currentPrompt.replace(
     'Execute every command verbatim. Shell quoting, $(pwd), or bash -c already present inside a listed Docker command is part of that command and must be preserved. Do not combine commands, add another wrapper, add prefixes or suffixes, retry them, or skip later commands after a failure.',
     'Execute every command verbatim. Do not combine commands, wrap them in another command or script, add prefixes or suffixes, retry them, or skip later commands after a failure.',
+  ).replace(
+    '\nIf a Bash result contains a <persisted-output> notice because its output is large, do not read, tail, cat, or otherwise inspect that temporary file. Treat the original Bash tool result and exit status as the complete command result.',
+    '',
   ).replace(
     '\nDo not inspect files',
     '\nSet every Bash tool timeout to 600000 milliseconds so each verification command can finish.\nDo not inspect files',

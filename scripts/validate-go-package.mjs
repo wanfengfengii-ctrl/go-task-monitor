@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fsp from 'node:fs/promises';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -65,10 +66,24 @@ async function readTarget(target) {
   throw new Error('目标必须是 Git 项目目录；不再接受 ZIP 交付');
 }
 
-function run(command, args, cwd, onProgress = null) {
+export function runValidationCommand(command, args, cwd, onProgress = null, {
+  env = process.env,
+  pipeDrainTimeoutMs = 1_000,
+} = {}) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
+    let settled = false;
+    let drainHandle = null;
+    const finish = (exitCode, suffix = '') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(drainHandle);
+      if (suffix) output += `${output ? '\n' : ''}${suffix}`;
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve({ exitCode, output });
+    };
     const observe = (stream, chunk) => {
       const text = String(chunk);
       output += text;
@@ -76,9 +91,35 @@ function run(command, args, cwd, onProgress = null) {
     };
     child.stdout.on('data', (chunk) => observe('stdout', chunk));
     child.stderr.on('data', (chunk) => observe('stderr', chunk));
-    child.once('error', (error) => resolve({ exitCode: null, output: `${output}\n${error.message}` }));
-    child.once('close', (exitCode) => resolve({ exitCode, output }));
+    child.once('error', (error) => finish(null, error.message));
+    child.once('close', (exitCode) => finish(exitCode));
+    // Docker credential helpers can outlive a failed build and retain the
+    // inherited stderr pipe. The actual command has already exited, so give
+    // buffered output a bounded drain window instead of waiting forever for
+    // an orphaned descendant to close unrelated descriptors.
+    child.once('exit', (exitCode) => {
+      const boundedDrainMs = Number.isFinite(Number(pipeDrainTimeoutMs))
+        ? Math.max(0, Number(pipeDrainTimeoutMs))
+        : 1_000;
+      drainHandle = setTimeout(() => finish(exitCode), boundedDrainMs);
+    });
   });
+}
+
+export async function createPublicDockerEnvironment() {
+  const dockerConfigRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-task-package-docker-config-'));
+  const desktopPluginDir = '/Applications/Docker.app/Contents/Resources/cli-plugins';
+  const config = { auths: {} };
+  if (await fsp.stat(desktopPluginDir).catch(() => null)) config.cliPluginsExtraDirs = [desktopPluginDir];
+  await fsp.writeFile(path.join(dockerConfigRoot, 'config.json'), `${JSON.stringify(config)}\n`, 'utf8');
+  return {
+    env: {
+      ...process.env,
+      DOCKER_CONFIG: dockerConfigRoot,
+      BUILDX_CONFIG: process.env.BUILDX_CONFIG || path.join(os.homedir(), '.docker/buildx'),
+    },
+    cleanup: () => fsp.rm(dockerConfigRoot, { recursive: true, force: true }),
+  };
 }
 
 async function validateTarget(target, options = {}) {
@@ -119,19 +160,24 @@ async function validateTarget(target, options = {}) {
     const script = path.join(target, 'build_benzhi_docker.sh');
     const verificationPlan = createContainerVerificationPlan(entries, staticResult.frontendDir, ruleOptions);
     const runId = crypto.randomBytes(6).toString('hex');
-    for (const platform of docker.platforms) {
-      progress({ phase: 'docker_build', platform, message: `开始 ${platform} 镜像构建` });
-      const imageName = `go-task-validator-${runId}-${platform.replace('/', '-')}`;
-      const imageReference = `${imageName}:latest`;
-      const build = await run(script, [imageName, platform], target, progress);
-      progress({ phase: 'docker_verify', platform, message: `开始 ${platform} 容器验证` });
-      const verify = build.exitCode === 0
-        ? await run('docker', ['run', '--rm', '--network', 'none', '--platform', platform, imageReference, ...CONTAINER_SHELL_ARGS, verificationPlan.script], target, progress)
-        : { exitCode: null, output: '跳过容器验证：镜像构建失败' };
-      const cleanup = await run('docker', ['image', 'rm', '-f', imageReference], target, progress);
-      docker.results.push({ platform, imageReference, build, verify, cleanup, exitCode: verify.exitCode ?? build.exitCode, output: [build.output, verify.output].filter(Boolean).join('\n') });
-      if (build.exitCode !== 0 || verify.exitCode !== 0) docker.ok = false;
-      progress({ phase: 'docker_complete', platform, message: `${platform} 校验${build.exitCode === 0 && verify.exitCode === 0 ? '通过' : '失败'}` });
+    const dockerRuntime = await createPublicDockerEnvironment();
+    try {
+      for (const platform of docker.platforms) {
+        progress({ phase: 'docker_build', platform, message: `开始 ${platform} 镜像构建` });
+        const imageName = `go-task-validator-${runId}-${platform.replace('/', '-')}`;
+        const imageReference = `${imageName}:latest`;
+        const build = await runValidationCommand(script, [imageName, platform], target, progress, { env: dockerRuntime.env });
+        progress({ phase: 'docker_verify', platform, message: `开始 ${platform} 容器验证` });
+        const verify = build.exitCode === 0
+          ? await runValidationCommand('docker', ['run', '--rm', '--network', 'none', '--platform', platform, imageReference, ...CONTAINER_SHELL_ARGS, verificationPlan.script], target, progress, { env: dockerRuntime.env })
+          : { exitCode: null, output: '跳过容器验证：镜像构建失败' };
+        const cleanup = await runValidationCommand('docker', ['image', 'rm', '-f', imageReference], target, progress, { env: dockerRuntime.env });
+        docker.results.push({ platform, imageReference, build, verify, cleanup, exitCode: verify.exitCode ?? build.exitCode, output: [build.output, verify.output].filter(Boolean).join('\n') });
+        if (build.exitCode !== 0 || verify.exitCode !== 0) docker.ok = false;
+        progress({ phase: 'docker_complete', platform, message: `${platform} 校验${build.exitCode === 0 && verify.exitCode === 0 ? '通过' : '失败'}` });
+      }
+    } finally {
+      await dockerRuntime.cleanup();
     }
   }
   return {

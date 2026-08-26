@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { adaptiveBugSourceWorkerLimit, applyInjectionInfrastructureFailures, applyInjectionPreparationFailures, approvedInjectionCandidateMismatch, assertGoldTestsUsePublicBehavior, bugCandidatePoolSchema, bugCandidateReviewSchema, bugNarrativeLanguageInstruction, bugSchema, bugSchemaForPolicy, buildPreparedVerifyResult, bugfixEffort, bugfixModel, bugWorkerOrder, canonicalizeGoldDescriptor, changedTestFiles, claudeProjectArgs, codexFailureMessage, codexSandboxArgs, codexStreamRecoveryConfigArgs, createCodexStreamRecoveryMonitor, createCurrentQualityReviewBundle, createDockerGraderScript, createOrphanDiagnosisRedSnapshot, criticalDatastoreFiles, discoveryRootCauseDescriptor, elasticProjectBugWorkerLimit, ensureDiagnosisWorkspaceUnchanged, existingDiagnosisVerificationPlan, explicitDockerVerifyCmds, extractFailedGoTestNames, finalizeVerificationResult, goModVersion, injectionPlanningBatch, inspectBugfixRepairWorkspace, inspectClaudeSessionMetadata, inspectDiagnosisWorkspace, isGoldCheckpointSemanticFailure, isRecoverableInjectionCandidateFailure, isRetryableInjectionInfrastructureFailure, materializeVerificationTest, modelFacingDiagnosisQuery, NATURAL_BUG_MIN_REVIEW_SCORE, naturalBugCandidateSeedResult, naturalBugFinderFailureCount, NaturalBugFinderInfrastructureError, normalizeBugCandidateFinders, normalizedPipelineCloneUrl, normalizeDiagnosisVerificationTests, numberedBugId, numberedGreenBranch, numberedRedBranch, numberedModelFixBranch, packagedDockerVerifyCmds, persistVerificationManifest, pipelineHealthPathForJob, pipelineTasksRootForJob, prepareTrajectoryRetry, prepareVerificationProofInputs, projectBugWorkerCeiling, projectGenerationPrompt, projectGeneratorConfig, projectGeneratorGatewayEnvironment, projectGeneratorSessionMismatch, projectGoEnvironment, promotePublishedVerificationFixture, publicTargetCommandForTask, readJson, recoverGoldCheckpoint, rejectGoldCheckpoint, remainingProjectGenerationTimeout, removeGeneratedBuildArtifacts, removeGeneratedCompilerArtifacts, resolveGoldTestPackage, restoreArchivedTrajectoryArtifacts, restoreVerificationEvidenceFromManifests, retainValidInjectionPlanCandidates, runAdaptiveBoundedWorkers, runCommand, safeDiagnosisPublicReproductionCommand, safeSlug, sanitizeModelFacingDiagnosisTask, selectReviewedBugCandidates, shellSingleQuote, snapshotRunnerScript, syncAuthoredVerificationMetadata, terminateProcessTree, validateDiscoveredBug, validateGoldTestDescriptor, validateInjectedBugWorktree, verificationCoverageSchema, writeGrader, migrateWorkflowPolicyVersion } from '../scripts/run-production-pipeline.mjs';
+import { adaptiveBugSourceWorkerLimit, applyInjectionInfrastructureFailures, applyInjectionPreparationFailures, approvedInjectionCandidateMismatch, assertGoldTestsUsePublicBehavior, bugCandidatePoolSchema, bugCandidateReviewSchema, bugNarrativeLanguageInstruction, bugSchema, bugSchemaForPolicy, buildPreparedVerifyResult, bugfixEffort, bugfixModel, bugWorkerOrder, canonicalizeGoldDescriptor, changedTestFiles, claudeProjectArgs, codexFailureMessage, codexSandboxArgs, codexStreamRecoveryConfigArgs, createCodexStreamRecoveryMonitor, createCurrentQualityReviewBundle, createDockerGraderScript, createOrphanDiagnosisRedSnapshot, createProjectDockerEnvironment, criticalDatastoreFiles, discoveryRootCauseDescriptor, elasticProjectBugWorkerLimit, ensureDiagnosisWorkspaceUnchanged, existingDiagnosisVerificationPlan, explicitDockerVerifyCmds, extractFailedGoTestNames, finalizeVerificationResult, goModVersion, injectionPlanningBatch, inspectBugfixRepairWorkspace, inspectClaudeSessionMetadata, inspectDiagnosisWorkspace, isGoldCheckpointSemanticFailure, isRecoverableInjectionCandidateFailure, isRetryableInjectionInfrastructureFailure, materializeVerificationTest, modelFacingDiagnosisQuery, NATURAL_BUG_MIN_REVIEW_SCORE, naturalBugCandidateSeedResult, naturalBugFinderFailureCount, NaturalBugFinderInfrastructureError, normalizeBugCandidateFinders, normalizedPipelineCloneUrl, normalizeDiagnosisVerificationTests, numberedBugId, numberedGreenBranch, numberedRedBranch, numberedModelFixBranch, packagedDockerVerifyCmds, persistVerificationManifest, pipelineHealthPathForJob, pipelineTasksRootForJob, prepareTrajectoryRetry, prepareVerificationProofInputs, projectBugWorkerCeiling, projectGenerationPrompt, projectGeneratorConfig, projectGeneratorGatewayEnvironment, projectGeneratorSessionMismatch, projectGoEnvironment, promotePublishedVerificationFixture, publicTargetCommandForTask, readJson, recoverGoldCheckpoint, rejectGoldCheckpoint, remainingProjectGenerationTimeout, removeGeneratedBuildArtifacts, removeGeneratedCompilerArtifacts, resolveGoldTestPackage, restoreArchivedTrajectoryArtifacts, restoreVerificationEvidenceFromManifests, retainValidInjectionPlanCandidates, runAdaptiveBoundedWorkers, runCommand, safeDiagnosisPublicReproductionCommand, safeSlug, sanitizeModelFacingDiagnosisTask, selectReviewedBugCandidates, shellSingleQuote, snapshotRunnerScript, syncAuthoredVerificationMetadata, terminateProcessTree, validateDiscoveredBug, validateGoldTestDescriptor, validateInjectedBugWorktree, verificationCoverageSchema, writeGrader, migrateWorkflowPolicyVersion } from '../scripts/run-production-pipeline.mjs';
 import { reopenBug } from '../scripts/reopen-skipped-bug.mjs';
 import { reopenQualityRejectedBug } from '../scripts/reopen-quality-rejected-diagnosis.mjs';
+import { orderStageResourceWaiters, stageResourceWaiterId } from '../scripts/run-production-pipeline.mjs';
 import { BUG_DIFFICULTY_POLICY_VERSION, BUG_TAXONOMY_POLICY_VERSION } from './bug-policy.js';
-import { verificationCommandsSha256 } from './verification-proof.js';
+import { verificationCommandsSha256, verificationProofPrompt } from './verification-proof.js';
 import { pipelineTaskOutcome, reactivateFrozenVerificationFailures } from './pipeline-rules.js';
 
 test('pipeline runner normalizes identifiers and parses go.mod language versions', () => {
@@ -180,6 +181,27 @@ test('manual Bug workbench mode queues only the selected Bug', () => {
   };
   assert.deepEqual(bugWorkerOrder(job), [3]);
   assert.deepEqual(bugWorkerOrder(job, { selectedBugIndex: 3, autoContinue: true }), [3, 1, 2, 4]);
+});
+
+test('structured Codex waiters are admitted in stable request order', () => {
+  const ordered = orderStageResourceWaiters([
+    { id: 'waiter-c.json', requestedAt: '2026-08-25T12:00:02.000Z' },
+    { id: 'waiter-b.json', requestedAt: '2026-08-25T12:00:01.000Z' },
+    { id: 'waiter-a.json', requestedAt: '2026-08-25T12:00:01.000Z' },
+  ]);
+  assert.deepEqual(ordered.map((waiter) => waiter.id), ['waiter-a.json', 'waiter-b.json', 'waiter-c.json']);
+});
+
+test('parallel structured Codex calls receive distinct waiter identities', () => {
+  const jobFile = '/tmp/pipeline-jobs/example/job.json';
+  assert.notEqual(
+    stageResourceWaiterId(jobFile, 'codex_injection', 'bug6-injection', 'first'),
+    stageResourceWaiterId(jobFile, 'codex_injection', 'bug7-injection', 'second'),
+  );
+  assert.notEqual(
+    stageResourceWaiterId(jobFile, 'codex_injection', 'bug6-injection', 'first'),
+    stageResourceWaiterId(jobFile, 'codex_injection', 'bug6-injection', 'retry'),
+  );
 });
 
 test('Bug worker order replaces a stale delivered cursor with the next unfinished Bug', () => {
@@ -617,15 +639,16 @@ test('proof input preflight rejects a declared test that is not materialized', a
   }
 });
 
-test('Claude fix uses a fifteen-minute stream-idle timeout without a file-progress deadline', async () => {
+test('Claude fix bounds stream silence and prolonged lack of implementation progress', async () => {
   const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
   assert.match(pipeline, /GO_PIPELINE_CLAUDE_FIX_IDLE_TIMEOUT_MS \|\| 15 \* 60_000/);
   assert.match(pipeline, /GO_PIPELINE_CLAUDE_FIX_TIMEOUT_MS \|\| 120 \* 60_000/);
   assert.match(pipeline, /timeoutMs: CLAUDE_FIX_TIMEOUT_MS/);
-  assert.match(pipeline, /GO_PIPELINE_CLAUDE_FIX_PROGRESS_TIMEOUT_MS \|\| 0/);
-  assert.match(pipeline, /const CLAUDE_FIX_PROGRESS_TIMEOUT_MS[\s\S]*?\n  : 0;/);
-  assert.match(pipeline, /GO_PIPELINE_CLAUDE_FIX_INITIAL_PROGRESS_GRACE_MS \|\| 0/);
-  assert.match(pipeline, /const CLAUDE_FIX_INITIAL_PROGRESS_GRACE_MS[\s\S]*?\n  : 0;/);
+  assert.match(pipeline, /GO_PIPELINE_CLAUDE_FIX_PROGRESS_TIMEOUT_MS \|\| 15 \* 60_000/);
+  assert.match(pipeline, /const CLAUDE_FIX_PROGRESS_TIMEOUT_MS[\s\S]*?\n  : 15 \* 60_000;/);
+  assert.match(pipeline, /GO_PIPELINE_CLAUDE_FIX_INITIAL_PROGRESS_GRACE_MS \|\| 15 \* 60_000/);
+  assert.match(pipeline, /const CLAUDE_FIX_INITIAL_PROGRESS_GRACE_MS[\s\S]*?\n  : 15 \* 60_000;/);
+  assert.match(pipeline, /progressPaths: \[path\.join\(task\.taskDir, '\.claude-source-progress\.json'\)\]/);
 });
 
 test('pipeline stage transitions refresh the Bug worker heartbeat', async () => {
@@ -719,6 +742,21 @@ test('DeepSeek project generation refuses to start without its isolated API key'
   );
 });
 
+test('project generation uses an anonymous Docker config without desktop credential helpers', async () => {
+  const runtime = await createProjectDockerEnvironment({ BUILDX_CONFIG: '/tmp/test-buildx' });
+  try {
+    const config = JSON.parse(await readFile(runtime.configPath, 'utf8'));
+    assert.deepEqual(config.auths, {});
+    assert.equal('credsStore' in config, false);
+    assert.equal('credHelpers' in config, false);
+    assert.equal(runtime.env.DOCKER_CONFIG, path.dirname(runtime.configPath));
+    assert.equal(runtime.env.BUILDX_CONFIG, '/tmp/test-buildx');
+  } finally {
+    await runtime.cleanup();
+  }
+  await assert.rejects(stat(runtime.configPath), /ENOENT/);
+});
+
 test('Claude project generation selects the fastest healthy gateway for its current model', async () => {
   const config = projectGeneratorConfig({});
   const delays = new Map([
@@ -774,9 +812,18 @@ test('Bug fixing uses the dedicated GLM model independently of project generatio
   assert.equal(bugfixModel({ GO_PIPELINE_BUGFIX_MODEL: '  ' }), 'model_hub/glm-52-coding');
   assert.equal(bugfixEffort(1, {}), 'low');
   assert.equal(bugfixEffort(2, {}), 'medium');
+  assert.equal(bugfixEffort(3, {}), 'high');
   assert.equal(bugfixEffort(1, { GO_PIPELINE_BUGFIX_EFFORT: 'high' }), 'high');
   assert.equal(bugfixEffort(2, { GO_PIPELINE_BUGFIX_RETRY_EFFORT: 'low' }), 'low');
   assert.equal(bugfixEffort(1, { GO_PIPELINE_BUGFIX_EFFORT: 'invalid' }), 'low');
+});
+
+test('Claude infrastructure retries also raise bugfix effort without spending model attempts', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  assert.match(pipeline, /const infrastructureRetryCount = Number\(initialJob\.bugs/);
+  assert.match(pipeline, /stageAutoRetries\?\.\[`bug\$\{bugIndex\}_claude_fix`\]\?\.retryCount/);
+  assert.match(pipeline, /const effortAttempt = Math\.max\(attempt, infrastructureRetryCount \+ 1\)/);
+  assert.match(pipeline, /CLAUDE_EFFORT: bugfixEffort\(effortAttempt\)/);
 });
 
 test('pipeline child commands never inherit orchestrator secret variables', async () => {
@@ -1070,7 +1117,7 @@ test('Claude task runner terminates a repeated permission-denial loop', async ()
   const functionEnd = runner.indexOf('\nstart_progress_watcher() {', functionStart);
   assert.match(runner, /permission_denied_limit="\$\{GO_PIPELINE_CLAUDE_PERMISSION_DENIAL_LIMIT:-8\}"/);
   assert.match(runner, /permission_denied_count=\$\(\(permission_denied_count \+ 1\)\)/);
-  assert.match(runner, /permission denial guard reached \(\$\{permission_denial_stop_reason\}\)/);
+  assert.match(runner, /Claude stream guard reached \(\$\{stream_stop_reason\}\)/);
   assert.match(runner, /terminate_claude_pipeline_siblings "\$claude_pipeline_parent_pid"/);
   assert.match(runner, /pipeline_status\[2\].*-eq 86/);
   assert.notEqual(functionStart, -1);
@@ -1086,10 +1133,13 @@ test('Claude task runner terminates a repeated permission-denial loop', async ()
       'permission_denied_limit=3',
       'diagnosis_mutation_denied_count=0',
       'diagnosis_mutation_denied_limit=0',
-      'permission_denial_stop_reason=""',
+      'stream_stop_reason=""',
+      'stream_stop_exit=86',
+      'api_retry_count=0',
+      'api_retry_limit=3',
       functions,
       'while IFS= read -r line; do',
-      '  if ! record_stream_activity "$line"; then exit 86; fi',
+      '  if ! record_stream_activity "$line"; then exit "$stream_stop_exit"; fi',
       'done',
     ].join('\n');
     const denied = JSON.stringify({
@@ -1105,6 +1155,12 @@ test('Claude task runner terminates a repeated permission-denial loop', async ()
     const successfulToolResult = JSON.stringify({
       type: 'user',
       message: { role: 'user', content: [{ type: 'tool_result', content: 'ok', is_error: false }] },
+    });
+    const apiRetry = JSON.stringify({
+      type: 'system',
+      subtype: 'api_retry',
+      error_status: 504,
+      error: 'server_error',
     });
     const result = spawnSync('bash', ['-c', script], {
       encoding: 'utf8',
@@ -1125,6 +1181,12 @@ test('Claude task runner terminates a repeated permission-denial loop', async ()
     assert.equal(recovered.status, 0, recovered.stderr);
     const recoveredActivity = JSON.parse(await readFile(activity, 'utf8'));
     assert.equal(recoveredActivity.permission_denied_count, 1);
+
+    const gatewayFailed = spawnSync('bash', ['-c', script], {
+      encoding: 'utf8',
+      input: `${apiRetry}\n${apiRetry}\n${apiRetry}\n`,
+    });
+    assert.equal(gatewayFailed.status, 87, gatewayFailed.stderr);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -1148,10 +1210,13 @@ test('Claude task runner distinguishes read-only diagnosis denials from mutation
     'permission_denied_limit=8',
     'diagnosis_mutation_denied_count=0',
     'diagnosis_mutation_denied_limit=1',
-    'permission_denial_stop_reason=""',
+    'stream_stop_reason=""',
+    'stream_stop_exit=86',
+    'api_retry_count=0',
+    'api_retry_limit=3',
     functions,
     'while IFS= read -r line; do',
-    '  if ! record_stream_activity "$line"; then exit 86; fi',
+    '  if ! record_stream_activity "$line"; then exit "$stream_stop_exit"; fi',
     'done',
   ].join('\n');
   const readOnlyDenial = JSON.stringify({
@@ -1273,6 +1338,10 @@ test('Claude task runner gives diagnosis sessions an unambiguous read-only promp
 
   assert.ok(promptStart >= 0 && promptBranch > promptStart && toolPolicy > promptBranch);
   assert.match(promptBlock, /This is a read-only diagnosis task/);
+  assert.match(promptBlock, /Before opening, searching, or listing any \*_test\.go/);
+  assert.match(promptBlock, /test source must never perform the initial localization/);
+  assert.match(promptBlock, /Do not open, search, list, or quote any \*_test\.go/);
+  assert.match(promptBlock, /you may run an explicitly public reproduction command without reading its test source/);
   assert.match(promptBlock, /workspace is intentionally read-only/);
   assert.match(promptBlock, /do not attempt a fix/);
   assert.match(promptBlock, /Never invoke Edit, Write, NotebookEdit, shell redirection, chmod/);
@@ -1508,6 +1577,55 @@ test('pipeline runner terminates continuous log output without real file progres
   }
 });
 
+test('pipeline runner recycles a Claude session that ignores the edit-required marker', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'pipeline-edit-required-test-'));
+  const progress = path.join(directory, 'source-progress.json');
+  const editRequired = path.join(directory, 'edit-required.json');
+  try {
+    await writeFile(editRequired, '{"reason":"exploration_budget_exhausted"}\n');
+    const result = await runCommand(process.execPath, ['-e', "setInterval(() => process.stdout.write('THINKING\\n'), 10)"], {
+      timeoutMs: 2_000,
+      idleTimeoutMs: 500,
+      progressPaths: [progress],
+      progressTimeoutMs: 1_500,
+      initialProgressGraceMs: 1_500,
+      editRequiredPath: editRequired,
+      editRequiredTimeoutMs: 120,
+    });
+    assert.equal(result.progressTimedOut, true);
+    assert.match(result.error, /探索已关闭后连续 1 秒仍未修改生产源码/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Claude runner bridges its hook-local edit requirement into the task progress boundary', async () => {
+  const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
+  assert.match(runner, /export V4_EDIT_REQUIRED_STATE="\$run_root\/edit-required\.json"/);
+  assert.match(runner, /if \[\[ -s "\$V4_EDIT_REQUIRED_STATE" && ! -s "\$source_progress_state" \]\]; then/);
+  assert.match(runner, /cmp -s "\$V4_EDIT_REQUIRED_STATE" "\$edit_required_state"/);
+  assert.match(runner, /cp "\$V4_EDIT_REQUIRED_STATE" "\$edit_required_temporary"/);
+  assert.match(runner, /rm -f "\$edit_required_state"/);
+});
+
+test('Claude infrastructure retries retain production-file context and skip repeated discovery', async () => {
+  const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
+  assert.match(runner, /retry_context_state="\$task_dir\/\.claude-retry-context\.json"/);
+  assert.match(runner, /select\(type == "string" and contains\("\/workspace\/"\)\)/);
+  assert.match(runner, /endswith\("_test\.go"\) \| not/);
+  assert.match(runner, /Prior read-only exploration already reached these likely relevant production files/);
+  assert.match(runner, /retry_context_count/);
+  assert.match(runner, /retry_exploration_limit=\$\(\(retry_context_count \+ 2\)\)/);
+  assert.match(runner, /retry_exploration_limit" -lt 8/);
+  assert.match(runner, /retry_exploration_limit" -gt 12/);
+  assert.match(runner, /claude_effort="high"/);
+  assert.match(runner, /if \[\[ "\$workspace_committed" -ne 1 \]\]; then/);
+  assert.doesNotMatch(runner, /if \[\[ "\$exit_code" -ne 0 && "\$workspace_committed" -ne 1 \]\]; then/);
+  assert.match(runner, /retry_guidance_state="\$task_dir\/\.claude-retry-guidance\.txt"/);
+  assert.match(runner, /This retry follows a deterministic public full-test regression/);
+  assert.match(runner, /The prior repair passed its issue-specific red\/green test but failed ordinary public full tests/);
+});
+
 test('pipeline stop signals retain their origin instead of impersonating a user stop', async () => {
   const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
   const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
@@ -1520,6 +1638,9 @@ test('pipeline stop signals retain their origin instead of impersonating a user 
   assert.match(server, /runnerPid = Number\(activePipelineProcesses\.get\(jobId\)\?\.pid\) \|\| null/);
   assert.match(server, /delete current\.manualHold/);
   assert.match(server, /writePipelineStopRequest\(incident\.jobId, 'watchdog_retry', 'pipeline_watchdog'\)/);
+  assert.match(server, /job\.retryBlockedReason === retryBlockedReason/);
+  assert.doesNotMatch(server, /job\.error = `Codex 服务连续失败/);
+  assert.match(server, /Preserve the actual failure timestamp and error/);
   assert.match(server, /writePipelineStopRequest\(jobId, 'emergency_stop', 'scheduler_control'\)/);
   assert.match(server, /reason: 'user_switched'/);
   assert.match(server, /await stopPipelineJob\(jobId, \{ pauseScheduling: false \}\);/);
@@ -2537,6 +2658,11 @@ test('pipeline runner does not combine mutually exclusive Codex sandbox flags', 
   assert.deepEqual(codexSandboxArgs('read-only'), ['-s', 'read-only']);
 });
 
+test('Claude edit-required watchdog leaves room for a delayed model turn', async () => {
+  const runner = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  assert.match(runner, /GO_PIPELINE_CLAUDE_EDIT_REQUIRED_TIMEOUT_MS \|\| 4 \* 60_000/);
+});
+
 test('Claude runner quotes the publisher path for workspaces containing spaces', async () => {
   const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
   assert.ok(runner.includes('"$publisher" "$task_dir" "$validated_workspace" "$validated_session"'));
@@ -2563,6 +2689,14 @@ test('Claude runner quotes the publisher path for workspaces containing spaces',
   assert.match(runner, /save_repair_checkpoint\(\)[\s\S]+remove_generated_compiler_artifacts "\$sandbox_workspace" "\$sandbox_pristine"/);
   assert.match(runner, /bugfix_workspace_has_non_test_change/);
   assert.match(runner, /INVALID_REPAIR_OUTPUT=1/);
+  assert.match(runner, /CANDIDATE_CONTRACT_CONFLICT=1/);
+  assert.match(runner, /\.candidate-contract-conflict\.json/);
+  assert.match(runner, /If and only if the user requirement and an established public test require opposite outcomes/);
+  assert.match(runner, /\.claude-retry-summary\.txt/);
+  assert.match(runner, /\.claude-retry-seed\.txt/);
+  assert.match(runner, /Prior read-only exploration also left this concise working conclusion/);
+  assert.doesNotMatch(runner, /retry_exploration_limit=2/);
+  assert.match(runner, /elif \[\[ -n "\$retry_summary" \]\]; then\s+retry_exploration_limit=6/);
   assert.match(runner, /remove_generated_compiler_artifacts "\$workspace" "\$sandbox_pristine"/);
   assert.match(runner, /publish_validated_workspace\(\)[\s\S]+env -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM -u GH_CONFIG_DIR/);
   const packageFailure = runner.slice(runner.indexOf('Git project packaging validation failed'), runner.indexOf('save_publish_checkpoint()'));
@@ -2615,6 +2749,10 @@ test('Claude runner captures an original complete trajectory and keeps Docker ta
   assert.match(runner, /Bash\(docker \*\)/);
   assert.match(runner, /pipeline performs those broad checks independently after the model task/);
   assert.match(runner, /This is a bugfix task[\s\S]+make the smallest appropriate production fix requested by the user/);
+  assert.match(runner, /stop exploratory reading[\s\S]+do not keep surveying tests or unrelated modules merely for completeness/);
+  assert.match(runner, /GO_PIPELINE_CLAUDE_API_RETRY_LIMIT:-3/);
+  assert.match(runner, /consecutive Claude API retries/);
+  assert.match(runner, /\.claude-source-progress\.json/);
   assert.doesNotMatch(runner, /SOURCE_FILE_BUDGET|Never enumerate or read the repository package by package|Do not bypass these budgets/);
   assert.match(runner, /--allow-dangerously-skip-permissions/);
   assert.match(runner, /Claude task runner already active/);
@@ -2968,13 +3106,25 @@ test('structured Codex calls use clean sessions, real health probes, and shared 
     assert.match(call, /ephemeral: true/);
   }
   assert.match(operations, /stage === 'project_plan' \|\| stage === 'codex_injection_plan' \|\| stage === 'codex_injection'/);
-  assert.match(operations, /return \{ pool: 'codex-structured', limit: 2, weight: 1 \}/);
-  assert.match(operations, /loadRatio >= 1\.2 \? 1 : limit/);
+  assert.match(operations, /return \{ pool: 'codex-structured', limit: 4, weight: 1 \}/);
+  assert.match(operations, /loadRatio >= 7/);
+  assert.match(operations, /loadRatio >= 5/);
   assert.doesNotMatch(operations, /node:os/);
   assert.match(pipeline, /loadAverage: os\.loadavg\(\)\[0\],[\s\S]{0,80}cpuCount: os\.cpus\(\)\.length/);
   assert.match(server, /collectHostResourceSnapshot\(\{[\s\S]{0,160}loadAverage: os\.loadavg\(\)\[0\],[\s\S]{0,80}cpuCount: os\.cpus\(\)\.length,[\s\S]{0,80}freeMemoryBytes: os\.freemem\(\),[\s\S]{0,80}totalMemoryBytes: os\.totalmem\(\)/);
   assert.match(pipeline, /async function runInjectionCodexJson\(options\)/);
   assert.match(pipeline, /acquireStageResourceSlot\(options\.jobFile, 'codex_injection'/);
+  assert.match(pipeline, /waiterKey: options\.name/);
+  assert.match(pipeline, /workerStageId: options\.stageId/);
+  const injectionPlanningLoop = pipeline.slice(
+    pipeline.indexOf('for (let planningAttempt = recoveredPlanningAttempts + 1'),
+    pipeline.indexOf('planningSessionIds.push(result.sessionId)'),
+  );
+  assert.match(injectionPlanningLoop, /const attemptName = planningAttempt === 1 \? key : `\$\{key\}-batch-\$\{planningAttempt\}`/);
+  const injectionPlanning = injectionPlanningLoop.slice(injectionPlanningLoop.indexOf("acquireStageResourceSlot(jobFile, 'codex_injection_plan'"));
+  assert.match(injectionPlanning, /waiterKey: attemptName/);
+  assert.match(injectionPlanning, /workerStageId: stageId/);
+  assert.match(server, /\['codex_injection', 'codex_injection_plan'\]\.includes\(stage\)/);
   assert.match(pipeline, /const result = await runInjectionCodexJson\(\{ jobFile, stageId: sourceStage/);
   assert.match(server, /GO_PIPELINE_CODEX_INFERENCE_PROBE_INTERVAL_MS \|\| 5 \* 60_000/);
   assert.match(server, /'exec', '--ephemeral', '--ignore-user-config'/);
@@ -3203,12 +3353,29 @@ test('an invalidated in-flight task discovery cannot republish its stale snapsho
   assert.doesNotMatch(discovery, /generation === taskDiscoveryCache\.generation\s*\?\s*TASK_DISCOVERY_CACHE_TTL_MS\s*:\s*TASK_DISCOVERY_DIRTY_SNAPSHOT_TTL_MS/);
 });
 
+test('proof upload confirms a cached task miss against a fresh filesystem scan', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  const start = server.indexOf('async function uploadProofTrajectory(taskId, artifactKind)');
+  const end = server.indexOf('async function uploadTrajectoryFile', start);
+  const uploader = server.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(uploader, /let task = \(await discoverTasks\(\)\)\.find/);
+  assert.match(uploader, /if \(!task\) \{[\s\S]*invalidateTaskDiscoveryCache\(\);[\s\S]*discoverTasksFresh\(\)/);
+});
+
 test('completed Bug workbench requests are idempotently ignored after delivery', async () => {
   const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
   assert.match(server, /isPipelineBugDeliveryComplete\(job, index\)/);
   assert.match(server, /Bug \$\{index\} 已交付，忽略重复的/);
   assert.match(server, /isPipelineBugDeliveryComplete\(job, index\) && !\(action === 'retry' && missingIndependentTest\)/);
   assert.match(server, /撤销假交付并从 test_author 恢复/);
+});
+
+test('quality-rejection recovery remains runnable while project autofill is paused', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  assert.match(server, /'manual_start', 'manual_retry', 'user_switched', 'quality_rejection_recovery'/);
+  assert.match(server, /async function resumePausedManualBugQueues/);
+  assert.match(server, /resumePausedManualBugQueues\('检测到外部加入的人工返修队列'\)/);
 });
 
 test('an adopted live Runner remains authoritative when persisted job status is stale', async () => {
@@ -3219,6 +3386,30 @@ test('an adopted live Runner remains authoritative when persisted job status is 
   assert.match(server, /const runnerActive = Boolean\(runnerHandle && processIsAlive\(Number\(runnerHandle\.pid\)\)\);/);
   assert.doesNotMatch(server, /const runnerActive = activePipelineProcesses\.has\(jobId\)\s*&& \['queued', 'running'\]\.includes/);
   assert.match(server, /const existingRunner = liveRunners\.get\(jobId\);[\s\S]*?error\.code = 'PIPELINE_RUNNER_ACTIVE'/);
+});
+
+test('resetting one Bug queues it without rolling back an active project Runner', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  const start = server.indexOf('async function resetPipelineBugForRetry');
+  const end = server.indexOf('async function controlPipelineScheduler', start);
+  const reset = server.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(reset, /const runnerActive = Boolean\(runnerHandle && processIsAlive\(Number\(runnerHandle\.pid\)\)\);/);
+  assert.match(reset, /if \(runnerActive\) \{[\s\S]*?enqueueBugRetry\(current, index, resetAt\);[\s\S]*?return;/);
+  assert.match(reset, /if \(runnerActive\) \{[\s\S]*?当前 Runner 继续执行其他 Bug[\s\S]*?\}/);
+  assert.match(reset, /if \(selectedStageRecord\?\.status === 'failed'\) \{[\s\S]*?selectedStageRecord\.status = 'pending';[\s\S]*?selectedStageRecord\.error = '';/);
+  assert.ok(reset.indexOf('if (runnerActive) {') < reset.indexOf('queuePipelineManualRetry(updated'));
+});
+
+test('a reusable completed trajectory bypasses the Claude repair resource queue', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  const start = pipeline.indexOf('async function runTrajectoryCycle(jobFile, bugIndex)');
+  const end = pipeline.indexOf('\nasync function ', start + 1);
+  const cycle = pipeline.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(cycle, /const completedCycleIsReusable =/);
+  assert.match(cycle, /if \(completedCycleIsReusable\) return runTrajectoryCycleCore\(jobFile, bugIndex\);/);
+  assert.ok(cycle.indexOf('if (completedCycleIsReusable)') < cycle.indexOf('acquireStageResourceSlot'));
 });
 
 test('injection review retry cannot leave a queued job without a live Runner', async () => {
@@ -3273,11 +3464,14 @@ test('transient dependency outages wait for recovery instead of failing or skipp
 
 test('post-Claude delivery releases Docker capacity before network-only Git publication', async () => {
   const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
   const start = pipeline.indexOf('async function runPostClaudeDelivery');
   const end = pipeline.indexOf('async function previousProjectContext', start);
   const delivery = pipeline.slice(start, end);
   assert.doesNotMatch(delivery, /acquireStageResourceSlot/);
   assert.match(delivery, /GO_PIPELINE_PHASE_RESOURCE_HANDSHAKE: '1'/);
+  assert.match(delivery, /GO_PIPELINE_REQUIRE_REPAIR_CHECKPOINT: '1'/);
+  assert.match(runner, /REQUIRED_REPAIR_CHECKPOINT_INVALID=1/);
   assert.match(delivery, /if \(String\(request\?\.phase \|\| ''\) !== 'git_publication'\) return;/);
   const switchStart = delivery.indexOf('onPhaseRequest: async (request) =>');
   const switchEnd = delivery.indexOf('onPhaseObservation:', switchStart);
@@ -3339,11 +3533,60 @@ test('delivered public root-cause repairs are not overwritten by stale discovery
 test('Bugfix repair Sessions cannot mutate tests before the independent author stage', async () => {
   const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
   assert.match(runner, /bugfix_workspace_tests_unchanged\(\)/);
-  assert.match(runner, /--include='\*_test\.go'/);
-  assert.match(runner, /--include='testdata\/\*\*\*'/);
+  assert.match(runner, /-name '\*_test\.go'/);
+  assert.match(runner, /-path '\*\/testdata\/\*'/);
   assert.match(runner, /do not create, delete, or modify any \*_test\.go file or anything under testdata/);
   assert.match(runner, /INVALID_REPAIR_TEST_MUTATION=1/);
   assert.match(runner, /exit 45/);
+  assert.match(runner, /retry_exploration_limit=10/);
+  assert.match(runner, /GO_PIPELINE_CLAUDE_EXPLORATION_LIMIT:-\$retry_exploration_limit/);
+});
+
+test('Bugfix checkpoint test guard ignores metadata-only changes but rejects content changes', async () => {
+  const runner = await readFile(path.resolve(import.meta.dirname, '../run_one_claude.sh'), 'utf8');
+  const functionStart = runner.indexOf('bugfix_workspace_tests_unchanged() {');
+  const functionEnd = runner.indexOf('\n\n# Bind every stage checkpoint', functionStart);
+  assert.notEqual(functionStart, -1);
+  assert.notEqual(functionEnd, -1);
+  const guard = runner.slice(functionStart, functionEnd);
+  const root = await mkdtemp(path.join(os.tmpdir(), 'checkpoint-test-guard-'));
+  const baseline = path.join(root, 'baseline');
+  const candidate = path.join(root, 'candidate');
+  const testFile = 'internal/service/service_test.go';
+  try {
+    await Promise.all([
+      mkdir(path.join(baseline, path.dirname(testFile)), { recursive: true }),
+      mkdir(path.join(candidate, path.dirname(testFile)), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(path.join(baseline, testFile), 'package service\n'),
+      writeFile(path.join(candidate, testFile), 'package service\n'),
+    ]);
+    await utimes(path.join(candidate, testFile), new Date(1_000), new Date(1_000));
+
+    const runGuard = () => spawnSync('/bin/bash', [
+      '-c',
+      `${guard}\nbugfix_workspace_tests_unchanged "$1" "$2"`,
+      'checkpoint-test-guard',
+      baseline,
+      candidate,
+    ], { encoding: 'utf8' });
+
+    const metadataOnly = runGuard();
+    assert.equal(metadataOnly.status, 0, metadataOnly.stderr);
+
+    await writeFile(path.join(candidate, testFile), 'package changed\n');
+    const contentChange = runGuard();
+    assert.equal(contentChange.status, 1, contentChange.stderr);
+
+    await writeFile(path.join(candidate, testFile), 'package service\n');
+    await mkdir(path.join(candidate, 'testdata'), { recursive: true });
+    await writeFile(path.join(candidate, 'testdata', 'extra.json'), '{}\n');
+    const addedFixture = runGuard();
+    assert.equal(addedFixture.status, 1, addedFixture.stderr);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('stage transitions keep the project runner lease instead of preempting the pipeline', async () => {
@@ -3356,7 +3599,7 @@ test('stage transitions keep the project runner lease instead of preempting the 
   assert.ok(pipeline.includes('clearSchedulerAdmission(jobFile, stageId, { release: !concurrent })'));
 });
 
-test('Bug-scoped failures auto-continue while infrastructure failures still stop the project', async () => {
+test('Bug-scoped failures and runner timeouts retry while other infrastructure failures stop the project', async () => {
   const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
   assert.match(pipeline, /queuePipelineBugStageRetry\(current, bugIndex/);
   assert.match(pipeline, /保留已通过检查点并自动重试当前阶段/);
@@ -3366,11 +3609,27 @@ test('Bug-scoped failures auto-continue while infrastructure failures still stop
   assert.match(pipeline, /auto_continue_after_failure/);
   assert.match(pipeline, /const infrastructureFailure = new Set\(\[/);
   assert.match(pipeline, /'codex_infrastructure'/);
-  assert.match(pipeline, /if \(!infrastructureFailure && workflowVersion >= CURRENT_WORKFLOW_VERSION/);
+  assert.match(pipeline, /const retryableBugInfrastructureFailure = \(/);
+  assert.match(pipeline, /failureCategory === 'runner_infrastructure'/);
+  assert.match(pipeline, /failureCategory === 'codex_infrastructure'[\s\S]{0,100}bug\\d/);
+  assert.match(pipeline, /\^bug\\d\+_\(\?:claude_fix\|trajectory_validate\)\$/);
+  assert.match(pipeline, /if \(\(!infrastructureFailure \|\| retryableBugInfrastructureFailure\)/);
   assert.match(pipeline, /if \(infrastructureFailure \|\| !\/\^bug\\d\+_\//);
   assert.match(pipeline, /current\.status = 'running';/);
   assert.match(pipeline, /current\.status = 'failed';/);
   assert.match(pipeline, /自动切换到 Bug/);
+});
+
+test('pipeline runner fences new child processes before shutdown state rollback', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  assert.match(pipeline, /let runnerStopping = false;/);
+  assert.match(pipeline, /function runCommand\(command, args, options = \{\}\) \{\s+if \(runnerStopping\) \{/);
+  assert.match(pipeline, /const activeStageIdsAtStop = new Set/);
+  assert.match(pipeline, /stage\.status === 'running' \|\| activeStageIdsAtStop\.has\(stage\.id\)/);
+  assert.match(pipeline, /interruptedAttempt\.status = 'interrupted'/);
+  assert.match(pipeline, /async function stopJob\(signal\) \{[\s\S]*?runnerStopping = true;[\s\S]*?await Promise\.all\(\[\.\.\.activeChildren\]/);
+  assert.match(pipeline, /const processBug = async \(bugIndex\) => \{\s+if \(runnerStopping\) return;/);
+  assert.match(pipeline, /if \(error\?\.code === 'PIPELINE_RESOURCE_WAIT'\) throw error;[\s\S]*?if \(runnerStopping\) return;/);
 });
 
 test('Gold contract conflicts retry the current Bug and preserve the production candidate', async () => {
@@ -3797,6 +4056,14 @@ test('trajectory retry archives an unchanged bugfix repair checkpoint instead of
   }
 });
 
+test('invalid repair retry reports that locating trajectory is retained', async () => {
+  const runner = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  assert.match(runner, /生产补丁未通过有效性或全量公开测试，已保留定位轨迹并从 BUG_BASE 重新修复/);
+  assert.doesNotMatch(runner, /无有效生产补丁，已从 BUG_BASE 重新启动 Claude 修复/);
+  assert.match(runner, /candidateContractConflict/);
+  assert.match(runner, /candidate_contract_conflict_skipped/);
+});
+
 test('trajectory retry preserves a Docker-complete checkpoint across a monitor restart', async () => {
   const library = await mkdtemp(path.join(os.tmpdir(), 'pipeline-publish-retry-library-'));
   const tasksRoot = path.join(library, 'tasks');
@@ -4015,35 +4282,74 @@ test('proof recovery restores matching evidence and reopens a stale post-fix com
   const commandsSha = verificationCommandsSha256(commands);
   const baseCommit = 'a'.repeat(40);
   const fixedCommit = 'b'.repeat(40);
-  const manifest = (phase, sourceCommit, sessionId) => ({
-    policy_version: 5,
-    phase,
-    command_mode: 'direct_verify_cmds_v2',
-    command_count: 1,
-    session_id: sessionId,
-    result: phase === 'pre_fix' ? 'red' : 'green',
-    source_commit: sourceCommit,
-    verify_cmds_sha256: commandsSha,
-    trajectory_sha256: '1'.repeat(64),
-    raw_stream_sha256: '2'.repeat(64),
-    prompt_sha256: '3'.repeat(64),
-    result_sha256: '4'.repeat(64),
-    command_results_sha256: '5'.repeat(64),
-  });
+  const proofBundle = (phase, sourceCommit, sessionId, prompt = `${verificationProofPrompt(phase, commands)}\n`) => {
+    const failed = phase === 'pre_fix';
+    const exitCode = failed ? 1 : 0;
+    const result = failed ? 'red' : 'green';
+    const commandOutput = failed
+      ? 'Exit code 1\n=== RUN   TestModel_Sample\n--- FAIL: TestModel_Sample (0.01s)\nFAIL\n'
+      : '=== RUN   TestModel_Sample\n--- PASS: TestModel_Sample (0.01s)\nPASS\n';
+    const trajectory = [
+      { type: 'system', subtype: 'init', session_id: sessionId },
+      { type: 'assistant', session_id: sessionId, message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: commands[0] } }] } },
+      { type: 'user', session_id: sessionId, message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', is_error: failed, content: commandOutput }] } },
+      { type: 'assistant', session_id: sessionId, message: { content: [{ type: 'text', text: result }] } },
+      { type: 'result', subtype: 'success', is_error: false, session_id: sessionId },
+    ].map(JSON.stringify).join('\n').concat('\n');
+    const resultContent = `${JSON.stringify({ phase, result, exit_code: exitCode, target_total: 1, target_failed: failed ? 1 : 0 })}\n`;
+    const commandResultsContent = `${JSON.stringify({ index: 1, command: commands[0], kind: 'target', exit_code: exitCode })}\n`;
+    const hash = (content) => createHash('sha256').update(content).digest('hex');
+    const contents = {
+      trajectoryContent: trajectory,
+      rawStreamContent: trajectory,
+      promptContent: prompt,
+      resultContent,
+      commandResultsContent,
+    };
+    return {
+      contents,
+      manifest: {
+        policy_version: 5,
+        phase,
+        command_mode: 'direct_verify_cmds_v2',
+        command_count: 1,
+        session_id: sessionId,
+        result,
+        source_commit: sourceCommit,
+        verify_cmds_sha256: commandsSha,
+        trajectory_filename: `trajectory_${sessionId}.jsonl`,
+        trajectory_sha256: hash(trajectory),
+        raw_stream_sha256: hash(trajectory),
+        prompt_sha256: hash(prompt),
+        result_sha256: hash(resultContent),
+        command_results_sha256: hash(commandResultsContent),
+      },
+    };
+  };
   try {
+    const preProof = proofBundle('pre_fix', baseCommit, '11111111-1111-4111-8111-111111111111');
+    const stalePostProof = proofBundle('post_fix', 'c'.repeat(40), '22222222-2222-4222-8222-222222222222');
+    const preProofDir = path.join(taskDir, 'verification/pre_fix/attempt-1');
     await Promise.all([
-      mkdir(path.join(taskDir, 'verification/pre_fix/attempt-1'), { recursive: true }),
+      mkdir(preProofDir, { recursive: true }),
       mkdir(path.join(taskDir, 'verification/post_fix/attempt-1'), { recursive: true }),
     ]);
     await Promise.all([
       writeFile(path.join(taskDir, 'public.json'), `${JSON.stringify({
+        bug_id: 'sample-task',
+        task_type: 'bugfix',
         bug_base_commit: baseCommit,
         test_model_fix_commit: fixedCommit,
         verify_cmds: commands,
         verification_evidence: {},
       }, null, 2)}\n`),
-      writeFile(path.join(taskDir, 'verification/pre_fix/attempt-1/manifest.json'), `${JSON.stringify(manifest('pre_fix', baseCommit, '11111111-1111-4111-8111-111111111111'))}\n`),
-      writeFile(path.join(taskDir, 'verification/post_fix/attempt-1/manifest.json'), `${JSON.stringify(manifest('post_fix', 'c'.repeat(40), '22222222-2222-4222-8222-222222222222'))}\n`),
+      writeFile(path.join(preProofDir, 'manifest.json'), `${JSON.stringify(preProof.manifest)}\n`),
+      writeFile(path.join(preProofDir, preProof.manifest.trajectory_filename), preProof.contents.trajectoryContent),
+      writeFile(path.join(preProofDir, 'raw.stream.jsonl'), preProof.contents.rawStreamContent),
+      writeFile(path.join(preProofDir, 'PROMPT.md'), preProof.contents.promptContent),
+      writeFile(path.join(preProofDir, 'verification-result.json'), preProof.contents.resultContent),
+      writeFile(path.join(preProofDir, 'verification-command-results.jsonl'), preProof.contents.commandResultsContent),
+      writeFile(path.join(taskDir, 'verification/post_fix/attempt-1/manifest.json'), `${JSON.stringify(stalePostProof.manifest)}\n`),
       writeFile(jobFile, `${JSON.stringify({ bugs: [{
         bugIndex: 1,
         verificationEvidence: { post_fix: { session_id: 'stale-session' } },
@@ -4064,6 +4370,64 @@ test('proof recovery restores matching evidence and reopens a stale post-fix com
     assert.equal(job.stages[1].resultHistory[0].result.result, 'green');
     assert.equal(job.bugs[0].verificationEvidence.pre_fix.session_id, '11111111-1111-4111-8111-111111111111');
     assert.equal(job.bugs[0].verificationEvidence.post_fix, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('proof recovery invalidates a passed stage whose prompt no longer matches upload policy', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'verification-stale-prompt-'));
+  const taskDir = path.join(root, 'task');
+  const jobFile = path.join(root, 'job.json');
+  const phase = 'pre_fix';
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  const sourceCommit = 'a'.repeat(40);
+  const commands = ["go test ./internal/sample -run '^TestModel_Sample$' -count=1 -v"];
+  const proofDir = path.join(taskDir, 'verification/pre_fix/attempt-1');
+  try {
+    await mkdir(proofDir, { recursive: true });
+    const prompt = 'This old verification prompt is no longer accepted.\n';
+    const trajectory = [
+      { type: 'system', subtype: 'init', session_id: sessionId },
+      { type: 'assistant', session_id: sessionId, message: { content: [{ type: 'text', text: 'red' }] } },
+      { type: 'result', subtype: 'success', is_error: false, session_id: sessionId },
+    ].map(JSON.stringify).join('\n').concat('\n');
+    const resultContent = `${JSON.stringify({ phase, result: 'red', exit_code: 1, target_total: 1, target_failed: 1 })}\n`;
+    const commandResultsContent = `${JSON.stringify({ index: 1, command: commands[0], kind: 'target', exit_code: 1 })}\n`;
+    const hash = (content) => createHash('sha256').update(content).digest('hex');
+    const manifest = {
+      policy_version: 5,
+      phase,
+      command_mode: 'direct_verify_cmds_v2',
+      command_count: 1,
+      session_id: sessionId,
+      result: 'red',
+      source_commit: sourceCommit,
+      verify_cmds_sha256: verificationCommandsSha256(commands),
+      trajectory_filename: `trajectory_${sessionId}.jsonl`,
+      trajectory_sha256: hash(trajectory),
+      raw_stream_sha256: hash(trajectory),
+      prompt_sha256: hash(prompt),
+      result_sha256: hash(resultContent),
+      command_results_sha256: hash(commandResultsContent),
+    };
+    await Promise.all([
+      writeFile(path.join(taskDir, 'public.json'), `${JSON.stringify({ bug_id: 'sample-task', task_type: 'bugfix', bug_base_commit: sourceCommit, verify_cmds: commands, verification_evidence: { pre_fix: manifest } })}\n`),
+      writeFile(path.join(proofDir, 'manifest.json'), `${JSON.stringify(manifest)}\n`),
+      writeFile(path.join(proofDir, manifest.trajectory_filename), trajectory),
+      writeFile(path.join(proofDir, 'raw.stream.jsonl'), trajectory),
+      writeFile(path.join(proofDir, 'PROMPT.md'), prompt),
+      writeFile(path.join(proofDir, 'verification-result.json'), resultContent),
+      writeFile(path.join(proofDir, 'verification-command-results.jsonl'), commandResultsContent),
+      writeFile(jobFile, `${JSON.stringify({ bugs: [{ bugIndex: 1, verificationEvidence: { pre_fix: manifest } }], stages: [{ id: 'bug1_pre_verify', status: 'passed', result: { result: 'red' } }] })}\n`),
+    ]);
+
+    const recovered = await restoreVerificationEvidenceFromManifests(jobFile, 1, taskDir, 'bugfix');
+    assert.deepEqual(recovered.restored, []);
+    assert.equal(recovered.reset.length, 1);
+    assert.match(recovered.reset[0].reason, /证明提示词与系统固定提示不一致/);
+    const job = await readJson(jobFile);
+    assert.equal(job.stages[0].status, 'pending');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

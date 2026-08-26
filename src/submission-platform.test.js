@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  buildPlatformReviewSnapshot,
   buildSubmissionActivityStats,
   extractPlatformFields,
   extractPlatformSubmissionTotal,
   findPlatformSubmissionByBugId,
+  findPlatformSubmissionForRecord,
   isLegacyDeliveredPlatformBackfill,
   mergePlatformSubmissionReview,
   mergePlatformCookies,
@@ -21,7 +23,7 @@ const record = {
   bug_id: 'nyh-go-0300-bug-01',
   task_type: 'bugfix',
   bug_category: 'error',
-  repo_url: 'https://github.com/example/nyh-go-0300/tree/bug-01/test_model_fix',
+  repo_url: 'https://github.com/example/nyh-go-0300/tree/bug1_green',
   go_version: 'go1.25.6; go.mod go 1.23',
   go_mod_version: '1.23',
   repro_determinism: '',
@@ -108,6 +110,25 @@ test('legacy platform backfill accepts only an immutable delivered checkpoint', 
 test('platform payload stops when dynamic schema omits a system identity field', () => {
   const incomplete = { data: { fields: schema.data.fields.filter((field) => field.field_key !== 'repo_url') } };
   assert.throws(() => preparePlatformSubmission(record, incomplete), /动态表单缺少系统字段 repo_url/);
+});
+
+test('platform payload rejects branches without an explicit red or green role', () => {
+  assert.throws(
+    () => preparePlatformSubmission({
+      ...record,
+      repo_url: 'https://github.com/example/nyh-go-0300/tree/bug-01/test_model_fix',
+    }, schema),
+    /无法识别红绿角色/,
+  );
+  assert.throws(
+    () => preparePlatformSubmission({
+      ...record,
+      task_type: 'diagnosis',
+      repo_url: 'https://github.com/example/nyh-go-0300/tree/bug1_green',
+      verify_result: { pre_fix: record.verify_result.pre_fix },
+    }, schema),
+    /显式 red/,
+  );
 });
 
 test('platform payload fingerprint is stable across object key order', () => {
@@ -199,6 +220,29 @@ test('platform review reconciliation preserves import state and records repair f
 test('platform submission totals accept nested list envelopes', () => {
   assert.equal(extractPlatformSubmissionTotal({ data: { total: 369, items: [{}] } }), 369);
   assert.equal(extractPlatformSubmissionTotal({ items: [{}, {}] }), 2);
+});
+
+test('platform review reconciliation selects the exact submission before duplicate bug ids', () => {
+  const payload = { items: [
+    { id: 10, summary: 'nyh-go-0300-bug-01 | old', status: '待返修' },
+    { id: 20, summary: 'nyh-go-0300-bug-01 | current', status: '初审通过' },
+  ] };
+  assert.equal(findPlatformSubmissionForRecord(payload, {
+    bugId: 'nyh-go-0300-bug-01',
+    platformSubmissionId: '20',
+  }).id, 20);
+  assert.equal(findPlatformSubmissionForRecord(payload, { bugId: 'nyh-go-0300-bug-01' }).id, 10);
+});
+
+test('platform review snapshot counts every remote submission including duplicate bug ids', () => {
+  const snapshot = buildPlatformReviewSnapshot([
+    { id: 10, summary: 'nyh-go-0300-bug-01 | old', status: '待返修', current_version: 1 },
+    { id: 20, summary: 'nyh-go-0300-bug-01 | current', status: '初审通过', current_version: 2 },
+    { id: 30, summary: 'nyh-go-0301-bug-02 | current', status: '待返修', current_version: 1 },
+  ], { observedAt: '2026-08-26T04:00:00.000Z' });
+  assert.deepEqual(snapshot.reviewCounts, { PENDING_FIX: 2, FIRST_PASSED: 1 });
+  assert.deepEqual(snapshot.submissions.map((record) => record.submissionId), ['10', '20', '30']);
+  assert.equal(snapshot.submissions[0].bugId, 'nyh-go-0300-bug-01');
 });
 
 test('daily submission activity uses Beijing calendar boundaries and qualified backlog', () => {

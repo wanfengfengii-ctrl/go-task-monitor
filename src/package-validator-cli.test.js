@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { parseArguments, validateTarget } from '../scripts/validate-go-package.mjs';
+import { createPublicDockerEnvironment, parseArguments, runValidationCommand, validateTarget } from '../scripts/validate-go-package.mjs';
 
 test('package validator CLI enables Docker by default and supports static mode', () => {
   assert.deepEqual(parseArguments(['project']), {
@@ -31,6 +31,35 @@ test('package validator CLI enables Docker by default and supports static mode',
   ]);
   assert.equal(current.projectPackagePolicyVersion, 2);
   assert.equal(current.projectType, 'web');
+  assert.equal(parseArguments([
+    '--package-policy-version=3',
+    '--project-type=web',
+    '--project-summary=基于 Go 实现的订单管理 Web 项目，一款后端服务，处理订单创建与状态流转。',
+    'project',
+  ]).projectPackagePolicyVersion, 3);
+});
+
+test('package validator does not wait forever for an orphaned descendant holding stderr', async () => {
+  const startedAt = Date.now();
+  const result = await runValidationCommand('/bin/bash', [
+    '-c',
+    '(sleep 2 >&2 &) ; exit 7',
+  ], process.cwd(), null, { pipeDrainTimeoutMs: 80 });
+  assert.equal(result.exitCode, 7);
+  assert.ok(Date.now() - startedAt < 750, `validator took ${Date.now() - startedAt}ms`);
+});
+
+test('package validator uses an anonymous Docker config for public base images', async () => {
+  const runtime = await createPublicDockerEnvironment();
+  try {
+    const config = JSON.parse(await fs.readFile(path.join(runtime.env.DOCKER_CONFIG, 'config.json'), 'utf8'));
+    assert.deepEqual(config.auths, {});
+    assert.equal('credsStore' in config, false);
+    assert.equal('credHelpers' in config, false);
+    assert.ok(runtime.env.BUILDX_CONFIG);
+  } finally {
+    await runtime.cleanup();
+  }
 });
 
 test('package validator baseline mode accepts old issues and rejects new ones', async (context) => {

@@ -39,7 +39,13 @@ validation_log="$task_dir/trajectory/system-validation.log"
 project_validation_log="$task_dir/trajectory/git-project-validation.json"
 run_lock="$task_dir/.claude-run.lock"
 progress_state="$task_dir/.claude-progress.json"
+source_progress_state="$task_dir/.claude-source-progress.json"
 activity_state="$task_dir/.claude-activity.json"
+edit_required_state="$task_dir/.claude-edit-required.json"
+retry_context_state="$task_dir/.claude-retry-context.json"
+retry_guidance_state="$task_dir/.claude-retry-guidance.txt"
+retry_summary_state="$task_dir/.claude-retry-summary.txt"
+retry_seed_state="$task_dir/.claude-retry-seed.txt"
 phase_request_state="$task_dir/.runner-phase-request.json"
 phase_admission_state="$task_dir/.runner-phase-admission.json"
 phase_observation_state="$task_dir/.runner-phase-observation.json"
@@ -52,7 +58,13 @@ if [[ ! "$permission_denied_limit" =~ ^[1-9][0-9]*$ ]]; then
 fi
 diagnosis_mutation_denied_count=0
 diagnosis_mutation_denied_limit=0
-permission_denial_stop_reason=""
+stream_stop_reason=""
+stream_stop_exit=86
+api_retry_count=0
+api_retry_limit="${GO_PIPELINE_CLAUDE_API_RETRY_LIMIT:-3}"
+if [[ ! "$api_retry_limit" =~ ^[1-9][0-9]*$ ]]; then
+  api_retry_limit=3
+fi
 task_type=""
 workflow_version=""
 workflow_policy_version=""
@@ -104,7 +116,7 @@ if ! mkdir "$run_lock" 2>/dev/null; then
   fi
 fi
 printf '%s\n' "$$" > "$run_lock/pid"
-rm -f "$progress_state" "$activity_state" "$phase_request_state" "$phase_admission_state" "$phase_observation_state"
+rm -f "$progress_state" "$source_progress_state" "$activity_state" "$edit_required_state" "$phase_request_state" "$phase_admission_state" "$phase_observation_state"
 # Task packages retain their own grader copy for reproducibility, but retries
 # must receive the current system-side acceptance fixes. Never reuse an older
 # copied grader merely because the file already exists.
@@ -121,6 +133,28 @@ prompt_file="$run_root/user-prompt.txt"
 if ! jq -er '.user_query | strings | select(length > 0)' "$task_dir/public.json" >"$prompt_file"; then
   echo "task public.json is missing a non-empty user_query" >&2
   exit 2
+fi
+retry_context_paths="$(jq -r '
+  [.source_paths[]?
+    | select(type == "string")
+    | select((startswith("internal/") or startswith("cmd/")) and endswith(".go") and (endswith("_test.go") | not))]
+  | unique | .[:8] | join(", ")
+' "$retry_context_state" 2>/dev/null || true)"
+retry_context_count="$(jq -r '
+  [.source_paths[]?
+    | select(type == "string")
+    | select((startswith("internal/") or startswith("cmd/")) and endswith(".go") and (endswith("_test.go") | not))]
+  | unique | .[:8] | length
+' "$retry_context_state" 2>/dev/null || printf '0')"
+retry_guidance="$(head -c 3000 "$retry_guidance_state" 2>/dev/null || true)"
+retry_summary="$(head -c 2000 "$retry_summary_state" 2>/dev/null || true)"
+retry_seed="$(head -c 2000 "$retry_seed_state" 2>/dev/null || true)"
+if [[ -n "$retry_seed" ]]; then
+  if [[ "$retry_summary" == "$retry_seed" ]]; then
+    retry_summary="$retry_seed"
+  else
+    retry_summary="$retry_seed${retry_summary:+ $retry_summary}"
+  fi
 fi
 sandbox_workspace="$run_root/workspace"
 sandbox_pristine="$run_root/pristine"
@@ -256,14 +290,29 @@ bugfix_workspace_has_non_test_change() {
 bugfix_workspace_tests_unchanged() {
   local baseline="$1"
   local candidate="$2"
-  local changes
-  changes="$(rsync -ani --checksum --delete \
-    --include='*/' \
-    --include='*_test.go' \
-    --include='testdata/***' \
-    --exclude='*' \
-    "$baseline/" "$candidate/")"
-  [[ -z "$changes" ]]
+  local baseline_manifest candidate_manifest
+  # Compare only paths, file contents, and symlink targets. A restored
+  # checkpoint can legitimately have fresh mtimes or modes.
+  test_content_manifest() {
+    local root="$1"
+    (
+      cd "$root"
+      find . \( -type f -o -type l \) \
+        \( -name '*_test.go' -o -path '*/testdata/*' \) -print \
+        | LC_ALL=C sort \
+        | while IFS= read -r file; do
+            if [[ -L "$file" ]]; then
+              printf 'L\t%s\t%s\n' "$file" "$(readlink "$file")"
+            else
+              printf 'F\t%s\t' "$file"
+              shasum -a 256 "$file" | awk '{print $1}'
+            fi
+          done
+    )
+  }
+  baseline_manifest="$(test_content_manifest "$baseline")"
+  candidate_manifest="$(test_content_manifest "$candidate")"
+  [[ "$baseline_manifest" == "$candidate_manifest" ]]
 }
 
 # Bind every stage checkpoint to the same answer-free BUG_BASE snapshot. Later
@@ -333,6 +382,20 @@ write_progress_state() {
     '{version: 1, reason: $reason, workspace: $workspace, session_id: $session_id, workspace_signature: $signature, changed_at: (now | todate)}' \
     >"$temporary"
   mv -f "$temporary" "$progress_state"
+}
+
+write_source_progress_state() {
+  local signature="$1"
+  local reason="${2:-workspace_changed}"
+  local temporary="$source_progress_state.${BASHPID:-$$}.${RANDOM}"
+  jq -n \
+    --arg signature "$signature" \
+    --arg reason "$reason" \
+    --arg workspace "$workspace" \
+    --arg session_id "${session_id:-}" \
+    '{version: 1, reason: $reason, workspace: $workspace, session_id: $session_id, workspace_signature: $signature, changed_at: (now | todate)}' \
+    >"$temporary"
+  mv -f "$temporary" "$source_progress_state"
 }
 
 mark_runner_phase() {
@@ -433,13 +496,25 @@ record_stream_activity() {
     # repair later in the same Session.
     permission_denied_count=0
   fi
+  if [[ "$event_type" == "system" && "$event_subtype" == "api_retry" ]]; then
+    api_retry_count=$((api_retry_count + 1))
+  elif [[ "$tool_result_kind" == "success" || "$event_type" == "result" ]]; then
+    api_retry_count=0
+  fi
   write_activity_state "$event_type" "$event_subtype" "$permission_denied_count" "$diagnosis_mutation_denied_count"
+  if (( api_retry_count >= api_retry_limit )); then
+    stream_stop_reason="${api_retry_count} consecutive Claude API retries"
+    stream_stop_exit=87
+    return 1
+  fi
   if (( permission_denied_count >= permission_denied_limit )); then
-    permission_denial_stop_reason="${permission_denied_count} repeated permission denials"
+    stream_stop_reason="${permission_denied_count} repeated permission denials"
+    stream_stop_exit=86
     return 1
   fi
   if (( diagnosis_mutation_denied_limit > 0 && diagnosis_mutation_denied_count >= diagnosis_mutation_denied_limit )); then
-    permission_denial_stop_reason="${diagnosis_mutation_denied_count} diagnosis mutation denial"
+    stream_stop_reason="${diagnosis_mutation_denied_count} diagnosis mutation denial"
+    stream_stop_exit=86
     return 1
   fi
   return 0
@@ -471,17 +546,28 @@ start_progress_watcher() {
       sleep 5
       [[ -e "$progress_stop" ]] && break
       next_signature="$(workspace_fingerprint)"
+      if [[ -s "$V4_EDIT_REQUIRED_STATE" && ! -s "$source_progress_state" ]]; then
+        if [[ ! -s "$edit_required_state" ]] || ! cmp -s "$V4_EDIT_REQUIRED_STATE" "$edit_required_state"; then
+          edit_required_temporary="$edit_required_state.watcher.$$"
+          cp "$V4_EDIT_REQUIRED_STATE" "$edit_required_temporary"
+          mv -f "$edit_required_temporary" "$edit_required_state"
+        fi
+      else
+        rm -f "$edit_required_state"
+      fi
       if [[ -n "$next_signature" && "$next_signature" != "$last_signature" ]]; then
         last_signature="$next_signature"
         if [[ "$first_workspace_change" -eq 1 ]]; then
           first_workspace_change=0
           write_progress_state "$next_signature" "runner_phase:first_source_edit"
+          write_source_progress_state "$next_signature" "runner_phase:first_source_edit"
           local_observation="$phase_observation_state.watcher.$$"
           jq -n --arg phase "first_source_edit" --arg session_id "${session_id:-}" \
             '{version:1,phase:$phase,session_id:$session_id,observed_at:(now|todate)}' >"$local_observation"
           mv -f "$local_observation" "$phase_observation_state"
         else
           write_progress_state "$next_signature"
+          write_source_progress_state "$next_signature"
         fi
       fi
     done
@@ -498,16 +584,70 @@ archive_incomplete_stream() {
     kill "$progress_watcher_pid" 2>/dev/null || true
     wait "$progress_watcher_pid" 2>/dev/null || true
   fi
+  rm -f "$edit_required_state"
   if [[ -e "$sandbox_stderr" ]]; then
     cp "$sandbox_stderr" "$stderr"
   fi
-  if [[ "$exit_code" -ne 0 && -e "$sandbox_raw" ]]; then
+  # Parent watchdogs terminate the process group. Bash may enter EXIT with a
+  # zero status in that path, so workspace_committed is the reliable boundary
+  # between a completed repair and an interrupted Session.
+  if [[ "$workspace_committed" -ne 1 ]]; then
+    retry_stream=""
+    if [[ -s "$sandbox_raw" ]]; then
+      retry_stream="$sandbox_raw"
+    elif [[ -s "$raw" ]]; then
+      retry_stream="$raw"
+    fi
+    if [[ -n "$retry_stream" ]]; then
+      retry_context_temporary="$retry_context_state.$$"
+      if jq -s '
+        [.[]
+          | select(.type == "assistant")
+          | .message.content[]?
+          | select(.type == "tool_use")
+          | (.input.file_path // "")
+          | select(type == "string" and contains("/workspace/"))
+          | (split("/workspace/") | last)
+          | select((startswith("internal/") or startswith("cmd/")) and endswith(".go") and (endswith("_test.go") | not))]
+        | unique
+        | if length > 8 then .[-8:] else . end
+        | {version: 1, source_paths: ., captured_at: (now | todate)}
+      ' "$retry_stream" >"$retry_context_temporary" 2>/dev/null \
+        && jq -e '.source_paths | length > 0' "$retry_context_temporary" >/dev/null 2>&1; then
+        mv -f "$retry_context_temporary" "$retry_context_state"
+      else
+        rm -f "$retry_context_temporary"
+      fi
+      retry_summary_temporary="$retry_summary_state.$$"
+      if jq -rs '
+        [.[]
+          | select(.type == "assistant")
+          | .message.content[]?
+          | select(.type == "text")
+          | .text
+          | select(type == "string" and length > 0)]
+        | last // ""
+        | if length > 2000 then .[-2000:] else . end
+      ' "$retry_stream" >"$retry_summary_temporary" 2>/dev/null \
+        && [[ -s "$retry_summary_temporary" ]]; then
+        mv -f "$retry_summary_temporary" "$retry_summary_state"
+      else
+        rm -f "$retry_summary_temporary"
+      fi
+    fi
+  else
+    rm -f "$retry_context_state"
+    rm -f "$retry_guidance_state"
+    rm -f "$retry_summary_state"
+    rm -f "$retry_seed_state"
+  fi
+  if [[ "$workspace_committed" -ne 1 && -e "$sandbox_raw" ]]; then
     mv "$sandbox_raw" "$task_dir/trajectory/raw.stream.$(date +%Y%m%d%H%M%S).$$.incomplete.jsonl"
   fi
-  if [[ "$exit_code" -ne 0 && -e "$raw" ]]; then
+  if [[ "$workspace_committed" -ne 1 && -e "$raw" ]]; then
     mv "$raw" "$task_dir/trajectory/raw.stream.$(date +%Y%m%d%H%M%S).$$.incomplete.jsonl"
   fi
-  if [[ "$exit_code" -ne 0 && "$workspace_committed" -ne 1 ]]; then
+  if [[ "$workspace_committed" -ne 1 ]]; then
     rm -rf "$workspace"
     mkdir -p "$workspace"
     cp -R "$sandbox_pristine/." "$workspace/"
@@ -582,6 +722,23 @@ export V4_TASK_TYPE="$task_type"
 export V4_WORKSPACE_ROOT="$sandbox_workspace"
 export V4_TEMP_ROOT="$run_root"
 export V4_AUDIT_LOG="$audit_log"
+export V4_SOURCE_PROGRESS_STATE="$source_progress_state"
+export V4_EXPLORATION_STATE="$run_root/exploration-state.json"
+export V4_EDIT_REQUIRED_STATE="$run_root/edit-required.json"
+export V4_SOURCE_FIRST_STATE="$run_root/source-first-state.json"
+retry_exploration_limit=10
+if [[ "$retry_context_count" =~ ^[0-9]+$ && "$retry_context_count" -gt 0 ]]; then
+  # A retry summary is navigation context, not a substitute for the source
+  # signatures needed to make a correct edit. Give the model enough reads to
+  # inspect each previously identified file plus a small direct-call-chain
+  # margin, while retaining a bounded exploration phase.
+  retry_exploration_limit=$((retry_context_count + 2))
+  if [[ "$retry_exploration_limit" -lt 8 ]]; then retry_exploration_limit=8; fi
+  if [[ "$retry_exploration_limit" -gt 12 ]]; then retry_exploration_limit=12; fi
+elif [[ -n "$retry_summary" ]]; then
+  retry_exploration_limit=6
+fi
+export V4_EXPLORATION_LIMIT="${GO_PIPELINE_CLAUDE_EXPLORATION_LIMIT:-$retry_exploration_limit}"
 if [[ "$workflow_policy_version" =~ ^[0-9]+$ && "$verification_policy_version" =~ ^[0-9]+$ \
   && "$workflow_policy_version" -ge 4 && "$verification_policy_version" -ge 5 ]]; then
   new_private_fixture_flow=1
@@ -999,6 +1156,11 @@ if [[ -s "$publish_checkpoint/checkpoint.json" ]]; then
   else
     checkpoint_status=$?
     [[ "$checkpoint_status" -eq 2 ]] || exit "$checkpoint_status"
+    if [[ "${GO_PIPELINE_REQUIRE_REPAIR_CHECKPOINT:-0}" == "1" ]]; then
+      echo "REQUIRED_REPAIR_CHECKPOINT_INVALID=1" >&2
+      echo "post-Claude delivery cannot fall back to a new Claude Session after an invalid publish checkpoint" >&2
+      exit 46
+    fi
     echo "ignoring incomplete publish checkpoint; starting a fresh Claude run" >&2
   fi
 fi
@@ -1031,6 +1193,11 @@ if restore_repair_checkpoint; then
     echo "resuming completed independent-test checkpoint for session $session_id" >&2
   fi
 else
+  if [[ "${GO_PIPELINE_REQUIRE_REPAIR_CHECKPOINT:-0}" == "1" ]]; then
+    echo "REQUIRED_REPAIR_CHECKPOINT_INVALID=1" >&2
+    echo "post-Claude delivery requires the existing repair checkpoint and cannot start a new Claude Session" >&2
+    exit 46
+  fi
   remove_writable_tree "$repair_checkpoint"
   if ! checkpoint_context_matches "$test_author_checkpoint/checkpoint.json"; then
     remove_writable_tree "$test_author_checkpoint"
@@ -1050,22 +1217,34 @@ audit_hook="$hook_runtime/scripts/claude-v4-hook.mjs"
 printf -v hook_command '%q %q' "$node_bin" "$audit_hook"
 jq -n --arg command "$hook_command" '{
   hooks: {
-    PreToolUse: [{matcher: "Bash|Edit|Write|NotebookEdit|MultiEdit|apply_patch|ApplyPatch", hooks: [{type: "command", command: $command, timeout: 30}]}],
-    PostToolUse: [{matcher: "Bash|Edit|Write|NotebookEdit|MultiEdit|apply_patch|ApplyPatch", hooks: [{type: "command", command: $command, timeout: 30}]}],
+    PreToolUse: [{matcher: "Bash|Edit|Write|NotebookEdit|MultiEdit|apply_patch|ApplyPatch|Read|Grep|Glob", hooks: [{type: "command", command: $command, timeout: 30}]}],
+    PostToolUse: [{matcher: "Bash|Edit|Write|NotebookEdit|MultiEdit|apply_patch|ApplyPatch|Read", hooks: [{type: "command", command: $command, timeout: 30}]}],
     PostToolUseFailure: [{matcher: "Bash|Edit|Write|NotebookEdit|MultiEdit|apply_patch|ApplyPatch", hooks: [{type: "command", command: $command, timeout: 30}] }]
   }
 }' >"$hook_settings"
 printf '%s\n' '{"hook_event_name":"V4Baseline"}' | "$node_bin" "$audit_hook"
-append_system_prompt="Work only on the user request inside the provided isolated workspace. Ordinary production source, pre-existing tests and testdata, project documentation, build scripts, Dockerfiles, and public commands are available engineering context. Start from the concrete endpoint, CLI action, error, log, stack trace, or state difference stated by the user. Use rg, go list, and other ordinary source-navigation tools to find that public entry point and follow its direct call chain; avoid surveying unrelated packages. Run only an explicitly public reproduction from the user request or a focused pre-existing package or test. Do not run broad go test ./..., go vet ./..., go build ./..., Docker, or broad repository scans in this task Session; the pipeline performs those broad checks independently after the model task. Do not author any new bug-specific test, TestModel_ test, helper, script, or fixture. Do not run Git or GitHub commands or inspect Git history. Do not search outside the isolated workspace, clone code, or inspect Gold, grader, hidden-test, solution, answer, patch, pipeline, task metadata, archived-attempt, rejected-attempt, trajectory, prompt, preset-test, verification-material, or private-fixture paths. Do not read or write verify_cmds or any answer-bearing material. You may run focused ordinary Go tests, focused package builds, and public reproduction commands; do not use wrappers that expose Gold, grader, hidden tests, verify_cmds, or private fixtures."
+append_system_prompt="Work only on the user request inside the provided isolated workspace. Ordinary production source, pre-existing tests and testdata, project documentation, build scripts, Dockerfiles, and public commands are available engineering context. Start from the concrete endpoint, CLI action, error, log, stack trace, or state difference stated by the user. Use rg, go list, and other ordinary source-navigation tools to find that public entry point and follow its direct call chain; avoid surveying unrelated packages. Before opening, searching, or listing any *_test.go, testdata, *.test.*, or *.spec.* source, first successfully read a concrete production implementation or configuration file on that direct call chain. You may run an explicitly public reproduction command before reading test source, but the test source must never perform the initial localization for you. Run only an explicitly public reproduction from the user request or a focused pre-existing package or test. Do not run broad go test ./..., go vet ./..., go build ./..., Docker, or broad repository scans in this task Session; the pipeline performs those broad checks independently after the model task. Do not author any new bug-specific test, TestModel_ test, helper, script, or fixture. Do not run Git or GitHub commands or inspect Git history. Do not search outside the isolated workspace, clone code, or inspect Gold, grader, hidden-test, solution, answer, patch, pipeline, task metadata, archived-attempt, rejected-attempt, trajectory, prompt, preset-test, verification-material, or private-fixture paths. Do not read or write verify_cmds or any answer-bearing material. You may run focused ordinary Go tests, focused package builds, and public reproduction commands; do not use wrappers that expose Gold, grader, hidden tests, verify_cmds, or private fixtures."
 if [[ "$task_type" == "diagnosis" ]]; then
-  append_system_prompt+=" This is a read-only diagnosis task. Investigate the reported behavior and provide an evidence-based conclusion without modifying any file. The workspace is intentionally read-only. Once the implementation cause is located, stop and report the relevant call chain, state transition, and root cause; do not attempt a fix. Never invoke Edit, Write, NotebookEdit, shell redirection, chmod, or any other file-mutation command."
+  append_system_prompt+=" This is a read-only diagnosis task. Investigate the reported behavior and provide an evidence-based conclusion without modifying any file. Derive the diagnosis only from production implementation, configuration, and public runtime output. Do not open, search, list, or quote any *_test.go, testdata, *.test.*, or *.spec.* source, even after locating the implementation; you may run an explicitly public reproduction command without reading its test source. The workspace is intentionally read-only. Once the implementation cause is located, stop and report the relevant call chain, state transition, and root cause; do not attempt a fix. Never invoke Edit, Write, NotebookEdit, shell redirection, chmod, or any other file-mutation command."
 else
-  append_system_prompt+=" This is a bugfix task. After locating the implementation cause, make the smallest appropriate production fix requested by the user; do not stop after diagnosis or merely suggest a patch, because a Session with no non-test workspace change is rejected. You may run a focused pre-existing test, but do not create, delete, or modify any *_test.go file or anything under testdata; tests are immutable in this Session and are authored independently after you exit."
+  append_system_prompt+=" This is a bugfix task. After locating the implementation cause, stop exploratory reading and make the smallest appropriate production fix requested by the user immediately; do not keep surveying tests or unrelated modules merely for completeness. Do not stop after diagnosis or merely suggest a patch. A Session with no non-test workspace change is rejected unless the deterministic public-test retry instructions below explicitly allow a contract-conflict conclusion. You may run a focused pre-existing test, but do not create, delete, or modify any *_test.go file or anything under testdata; tests are immutable in this Session and are authored independently after you exit."
+  if [[ -n "$retry_context_paths" ]]; then
+    append_system_prompt+=" This is an infrastructure-only retry. Prior read-only exploration already reached these likely relevant production files: $retry_context_paths. Start from those files, avoid restarting repository discovery or reading tests, and make the smallest production edit as soon as the direct cause is visible."
+  fi
+  if [[ -n "$retry_summary" ]]; then
+    append_system_prompt+=" Prior read-only exploration also left this concise working conclusion: $retry_summary Treat it as navigation context, verify only the directly relevant lines, and edit the production source immediately when it matches the code."
+  fi
+  if [[ -n "$retry_guidance" ]]; then
+    append_system_prompt+=" This retry follows a deterministic public full-test regression. Do not repeat the previous production patch. Preserve ordinary public behavior while satisfying the user report. Previous public-test summary: $retry_guidance If and only if the user requirement and an established public test require opposite outcomes for the same public API input, do not invent a discriminator or modify production source. Explain the exact conflicting input and expectations, then finish with the standalone line CANDIDATE_CONTRACT_CONFLICT=1. Otherwise, make the production fix as required."
+  fi
 fi
 prompt="$(<"$prompt_file")"
 claude_effort="${CLAUDE_EFFORT:-low}"
 if [[ -z "${CLAUDE_EFFORT:-}" && "$task_type" == "bugfix" ]]; then
   claude_effort="medium"
+fi
+if [[ "$task_type" == "bugfix" && ( -n "$retry_context_paths" || -n "$retry_summary" ) ]]; then
+  claude_effort="high"
 fi
 
 cd "$sandbox_workspace"
@@ -1156,16 +1335,16 @@ set +e
   | tee "$sandbox_raw" \
   | while IFS= read -r line; do
       if ! record_stream_activity "$line"; then
-        echo "Claude permission denial guard reached (${permission_denial_stop_reason}); terminating Session" >&2
+        echo "Claude stream guard reached (${stream_stop_reason}); terminating Session" >&2
         terminate_claude_pipeline_siblings "$claude_pipeline_parent_pid"
-        exit 86
+        exit "$stream_stop_exit"
       fi
       printf 'CLAUDE_PROGRESS\n'
     done
 pipeline_status=("${PIPESTATUS[@]}")
 claude_exit="${pipeline_status[0]}"
-if [[ "${pipeline_status[2]:-0}" -eq 86 ]]; then
-  claude_exit=86
+if [[ "${pipeline_status[2]:-0}" -eq 86 || "${pipeline_status[2]:-0}" -eq 87 ]]; then
+  claude_exit="${pipeline_status[2]}"
 fi
 set -e
 cp "$sandbox_stderr" "$stderr"
@@ -1178,6 +1357,13 @@ if [[ "$claude_exit" -ne 0 ]]; then
   ' "$sandbox_raw" 2>/dev/null || true)"
   if [[ -n "$api_retry_summary" ]]; then
     printf '%s\n' "$api_retry_summary" >&2
+  fi
+  terminal_result_count="$(jq -s '[.[] | select(.type == "result")] | length' "$sandbox_raw" 2>/dev/null || printf '0')"
+  if [[ -z "$api_retry_summary" \
+    && "${terminal_result_count:-0}" -eq 0 \
+    && ! -s "$sandbox_stderr" ]]; then
+    echo "CLAUDE_CLI_EMPTY_FAILURE=1" >&2
+    echo "Claude CLI exited non-zero without a terminal result or stderr" >&2
   fi
   if /usr/bin/grep -Eq 'EPERM: operation not permitted, fstat|process\.stderr\.fd' "$sandbox_stderr"; then
     echo "Claude CLI sandbox output initialization failed; stderr must stay inside the isolated temp directory" >&2
@@ -1210,6 +1396,23 @@ if [[ "$init_count" -ne 1 || "$result_count" -ne 1 || "$success_count" -ne 1 ]];
   mv "$raw" "$invalid"
   echo "invalid trajectory: init=$init_count result=$result_count success=$success_count retries=$retry_count; saved as $invalid" >&2
   exit 5
+fi
+contract_conflict_result="$(jq -rs '[.[] | select(.type == "result" and .subtype == "success" and .is_error == false) | .result] | last // ""' "$raw")"
+if [[ "$task_type" == "bugfix" && -n "$retry_guidance" ]] \
+  && ! bugfix_workspace_has_non_test_change "$sandbox_pristine" "$sandbox_workspace" \
+  && printf '%s\n' "$contract_conflict_result" | /usr/bin/grep -Eq '(^|[[:space:]])CANDIDATE_CONTRACT_CONFLICT=1([[:space:]]|$)'; then
+  conflict_report="$task_dir/.candidate-contract-conflict.json"
+  conflict_report_temporary="$conflict_report.$$"
+  jq -n \
+    --arg session_id "$session_id" \
+    --arg summary "$contract_conflict_result" \
+    --arg public_test_guidance "$retry_guidance" \
+    '{version:1,status:"candidate_contract_conflict",session_id:$session_id,summary:$summary,public_test_guidance:$public_test_guidance,detected_at:(now|todate)}' \
+    >"$conflict_report_temporary"
+  mv -f "$conflict_report_temporary" "$conflict_report"
+  echo "CANDIDATE_CONTRACT_CONFLICT=1" >&2
+  echo "candidate requirements conflict with the established public test contract; preserved report at $conflict_report" >&2
+  exit 46
 fi
 if [[ "$task_type" == "bugfix" ]] \
   && ! bugfix_workspace_has_non_test_change "$sandbox_pristine" "$sandbox_workspace"; then
@@ -1373,6 +1576,13 @@ if ! "$docker_grader" "$task_dir" "$docker_workspace" "$task_type" 2>&1 | tee -a
     remove_writable_tree "$test_author_checkpoint"
     remove_writable_tree "$red_green_checkpoint"
     remove_writable_tree "$publish_checkpoint"
+    retry_guidance_temporary="$retry_guidance_state.$$"
+    {
+      printf '%s\n' 'The prior repair passed its issue-specific red/green test but failed ordinary public full tests.'
+      /usr/bin/grep -E -- '^(--- FAIL:|FAILURE_CLASS=)|[[:alnum:]_]+_test\.go:[0-9]+:|expected .* got | = .* want ' "$validation_log" \
+        | tail -n 24 || true
+    } >"$retry_guidance_temporary"
+    mv -f "$retry_guidance_temporary" "$retry_guidance_state"
     echo "INVALID_REPAIR_CHECKPOINT=1" >&2
   elif [[ "$new_private_fixture_flow" -eq 1 ]]; then
     # The Claude repair checkpoint and Codex-authored test are immutable. A

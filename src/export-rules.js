@@ -159,15 +159,24 @@ export function requireGitCommitUrl(value, field, bugId = '') {
   return text;
 }
 
-export function isGitTestModelBranchUrl(value) {
-  return /^https:\/\/[^\s]+\/tree\/(?:bug-\d{2}\/)?test_model_fix$|^https:\/\/[^\s]+\/tree\/bug\d+_(?:green|red)$/i.test(String(value ?? '').trim());
+export function gitReviewBranchRole(value) {
+  const text = String(value ?? '').trim();
+  const match = text.match(/^https:\/\/[^\s]+\/tree\/(?:bug-?\d+(?:_|\/))?(red|green)(?:[12])?$/i);
+  return match ? match[1].toLowerCase() : '';
 }
 
-export function requireGitTestModelBranchUrl(value, bugId = '') {
+export function isGitTestModelBranchUrl(value, expectedRole = '') {
+  const role = gitReviewBranchRole(value);
+  return Boolean(role) && (!expectedRole || role === String(expectedRole).trim().toLowerCase());
+}
+
+export function requireGitTestModelBranchUrl(value, bugId = '', taskType = '') {
   const text = String(value ?? '').trim();
-  if (!isGitTestModelBranchUrl(text)) {
+  const expectedRole = taskType === 'diagnosis' ? 'red' : taskType === 'bugfix' ? 'green' : '';
+  if (!isGitTestModelBranchUrl(text, expectedRole)) {
     const taskLabel = bugId ? `任务 ${bugId}` : '当前任务';
-    throw new Error(`${taskLabel} 的 repo_url 必须是完整测试模型分支地址（.../tree/test_model_fix、.../tree/bug-01/test_model_fix、.../tree/bug1_green 或 .../tree/bug1_red），已取消 Excel 导出`);
+    const roleLabel = expectedRole ? `${expectedRole} ` : 'red/green ';
+    throw new Error(`${taskLabel} 的 repo_url 必须使用显式 ${roleLabel}分支（如 .../tree/bug1_${expectedRole || 'green'}、.../tree/bug1/${expectedRole || 'green'} 或 .../tree/${expectedRole || 'green'}）；test_model_fix 等无法识别红绿角色的分支禁止提交，已取消 Excel 导出`);
   }
   return text;
 }
@@ -307,7 +316,7 @@ export function prepareExcelRecord(record) {
     bug_category: bugCategory,
     go_version: requirePinnedGoVersion(goVersion, record?.bug_id),
     trajectory: requireCloudTrajectoryUrl(record?.trajectory, record?.bug_id),
-    repo_url: requireGitTestModelBranchUrl(record?.repo_url, record?.bug_id),
+    repo_url: requireGitTestModelBranchUrl(record?.repo_url, record?.bug_id, record?.task_type),
     user_query: requireChineseText(record?.user_query, 'user_query', record?.bug_id),
     verify_cmds: isVerificationPolicyV5(record)
       ? requireDirectPublicVerifyCmd(record?.verify_cmds, record?.task_type, record?.bug_id, {

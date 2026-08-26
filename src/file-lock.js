@@ -76,7 +76,7 @@ async function withFileLockDirectory(lockPath, callback, options = {}) {
       if (error?.code !== 'EEXIST') throw error;
       const owner = await readOwner(lockPath);
       const age = Number.isFinite(owner.createdAt) ? Date.now() - owner.createdAt : staleMs + 1;
-      if (owner.hasOwner && !processIsAlive(owner.pid) && age >= staleMs) {
+      if ((!owner.hasOwner || !processIsAlive(owner.pid)) && age >= staleMs) {
         await fsp.rm(lockPath, { recursive: true, force: true });
         continue;
       }

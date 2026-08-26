@@ -16,6 +16,9 @@ const REQUIRED_VALIDATION_PATTERN = /run_(?:target|full|static)\.sh|\bgo\s+(?:te
 const PIPE_SINK_PATTERN = /(?:^|[^|])\|(?!\|)\s*(?:head|tail|tee)\b/i;
 const MASKED_SUFFIX_PATTERN = /;\s*(?:echo|printf)\b[^\n]*(?:\$\?|EXIT)|\|\|\s*(?:true|:)\b/i;
 const TEST_FILE_PATTERN = /_test\.go$/i;
+const TEST_SOURCE_PATH_PATTERN = /(?:^|\/)(?:testdata)(?:\/|$)|(?:^|\/)[^/]*_test\.go$|(?:^|\/)[^/]*\.(?:test|spec)\.[cm]?[jt]sx?$/i;
+const IMPLEMENTATION_SOURCE_PATH_PATTERN = /(?:\.go|\.mod|\.sum|\.py|\.pyw|\.sh|\.bash|\.zsh|\.js|\.jsx|\.ts|\.tsx|\.c|\.cc|\.cpp|\.h|\.hpp|\.rs|\.java|\.kt|\.ya?ml|\.json|\.toml|Dockerfile)$/i;
+const SOURCE_INSPECTION_COMMAND_PATTERN = /\b(?:cat|sed|rg|grep|head|tail|awk)\b/i;
 
 function issue(level, code, message, evidence = '') {
   return { level, code, message, ...(evidence ? { evidence } : {}) };
@@ -84,6 +87,56 @@ function directTarget(call) {
   const input = call.input;
   if (!input || typeof input !== 'object') return '';
   return String(input.file_path || input.path || input.notebook_path || '');
+}
+
+function commandWithoutTestExclusions(command) {
+  return String(command || '')
+    .replace(/\|\s*(?:\S*\/)?(?:grep|rg)\b(?=[^|\n]*(?:\s--invert-match\b|\s-[A-Za-z]*v[A-Za-z]*\b))[^|\n]*/gi, '')
+    .replace(/\s+(?:-g|--glob)(?:=|\s+)(["'])![^"']*(?:_test\.go|\.(?:test|spec)\.[cm]?[jt]sx?|testdata)[^"']*\1/gi, '')
+    .replace(/\s+(?:!|-not)\s+-name\s+(?:"[^"]*(?:_test\.go|\.(?:test|spec)\.[cm]?[jt]sx?)[^"]*"|'[^']*(?:_test\.go|\.(?:test|spec)\.[cm]?[jt]sx?)[^']*'|\S*(?:_test\.go|\.(?:test|spec)\.[cm]?[jt]sx?)\S*)/gi, '');
+}
+
+export function sourceInspectionKind(toolName, toolInput = {}) {
+  const call = { name: String(toolName || ''), input: toolInput || {} };
+  const direct = directTarget(call).split(path.sep).join('/');
+  const testTarget = (value) => TEST_SOURCE_PATH_PATTERN.test(String(value || '').split(path.sep).join('/'));
+  const implementationTarget = (value) => {
+    const target = String(value || '').split(path.sep).join('/');
+    return Boolean(target && !testTarget(target) && IMPLEMENTATION_SOURCE_PATH_PATTERN.test(target));
+  };
+
+  if (call.name === 'Read') {
+    if (testTarget(direct)) return { kind: 'test', evidence: direct };
+    if (implementationTarget(direct)) return { kind: 'implementation', evidence: direct };
+    return { kind: '', evidence: direct };
+  }
+  if (call.name === 'Glob') {
+    const pattern = String(call.input?.pattern || call.input?.glob || '');
+    return TEST_SOURCE_PATH_PATTERN.test(pattern) || /_test\.go|\.(?:test|spec)\.[cm]?[jt]sx?/i.test(pattern)
+      ? { kind: 'test', evidence: pattern }
+      : { kind: '', evidence: pattern };
+  }
+  if (call.name === 'Grep') {
+    const target = String(call.input?.path || call.input?.file_path || call.input?.filePath || '');
+    const pattern = String(call.input?.pattern || '');
+    if (testTarget(target) || /\bTest[A-Z][A-Za-z0-9_]*\b/.test(pattern)) return { kind: 'test', evidence: `${pattern} ${target}`.trim() };
+    if (implementationTarget(target)) return { kind: 'implementation', evidence: target };
+    return { kind: '', evidence: `${pattern} ${target}`.trim() };
+  }
+  if (call.name !== 'Bash') return { kind: '', evidence: direct };
+
+  const command = String(call.input?.command || '');
+  if (!SOURCE_INSPECTION_COMMAND_PATTERN.test(command)) return { kind: '', evidence: command };
+  const inspectionCommand = commandWithoutTestExclusions(command).trim();
+  if (TEST_SOURCE_PATH_PATTERN.test(inspectionCommand)
+    || /_test\.go|\.(?:test|spec)\.[cm]?[jt]sx?/i.test(inspectionCommand)
+    || /\b(?:rg|grep)\b[^\n]*\bTest[A-Z][A-Za-z0-9_]*\b/.test(inspectionCommand)) {
+    return { kind: 'test', evidence: command.slice(0, 320) };
+  }
+  if (IMPLEMENTATION_SOURCE_PATH_PATTERN.test(inspectionCommand)) {
+    return { kind: 'implementation', evidence: command.slice(0, 320) };
+  }
+  return { kind: '', evidence: command.slice(0, 320) };
 }
 
 function cleanShellToken(token) {
@@ -649,6 +702,25 @@ export function validateTrajectoryEvents(events, options = {}) {
   if (duplicateUseIds.length) addError('tool-id-duplicate', `存在 ${duplicateUseIds.length} 个重复 tool_use id`);
   if (unmatchedUses.length || orphanResults.length) {
     addError('tool-balance', `工具调用/返回未按 ID 一一配对：调用 ${uses.length}，返回 ${toolResults.length}，未配对调用 ${unmatchedUses.length}，孤立返回 ${orphanResults.length}`);
+  }
+
+  if (policyV4 && ['bugfix', 'diagnosis'].includes(taskType)) {
+    const inspections = uses.map((call) => ({ call, ...sourceInspectionKind(call.name, call.input) }));
+    const firstTest = inspections.find((item) => item.kind === 'test');
+    const firstImplementation = inspections.find((item) => item.kind === 'implementation');
+    if (taskType === 'diagnosis' && firstTest) {
+      addError(
+        'diagnosis-test-source-inspection',
+        `Diagnosis 工具 #${firstTest.call.ordinal} 检查了测试源码；诊断必须仅依据生产调用链和公开运行结果，测试不得参与定位或确认答案`,
+        firstTest.evidence,
+      );
+    } else if (firstTest && (!firstImplementation || firstTest.call.ordinal < firstImplementation.call.ordinal)) {
+      addError(
+        'test-source-before-implementation',
+        `工具 #${firstTest.call.ordinal} 在读取直接调用链的生产实现前检查了测试源码；测试不得替模型完成定位`,
+        firstTest.evidence,
+      );
+    }
   }
 
   const failedToolResults = toolResults.filter((result) => result.is_error === true);

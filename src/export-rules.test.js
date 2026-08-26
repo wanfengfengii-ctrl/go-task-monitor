@@ -237,7 +237,7 @@ test('Excel export removes a duplicated go.mod version', () => {
     go_version: 'go1.25.6; go.mod go 1.23; go.mod go 1.23',
     go_mod_version: '1.23',
     trajectory: 'https://upload.example.com/trajectory_sample-task.json',
-    repo_url: 'https://git.example.com/team/task/tree/bug-01/test_model_fix',
+    repo_url: 'https://git.example.com/team/task/tree/bug1_green',
     user_query: '请修复空输入触发的异常，并补充回归测试。',
     verify_cmds: directVerifyCmd,
     gold_root_cause: 'sample.go 的 sample.Run 未检查空输入，导致 panic。',
@@ -258,7 +258,7 @@ test('Excel export writes bug_category using the annotation labels', () => {
     go_version: 'go1.25.6; go.mod go 1.23',
     go_mod_version: '1.23',
     trajectory: 'https://upload.example.com/trajectory_sample-category.jsonl',
-    repo_url: 'https://git.example.com/team/task/tree/bug-01/test_model_fix',
+    repo_url: 'https://git.example.com/team/task/tree/bug1_green',
     user_query: '请修复并发访问导致的异常，并补充回归测试。',
     verify_cmds: "go test -race ./internal/sample -run '^TestRegression$' -count=20 -v",
     gold_root_cause: 'sample.go 的 run 存在并发访问错误，导致状态不一致。',
@@ -276,7 +276,7 @@ test('Excel export writes bug_category using the annotation labels', () => {
     go_version: 'go1.25.6; go.mod go 1.23',
     go_mod_version: '1.23',
     trajectory: 'https://upload.example.com/trajectory_sample-category-legacy.jsonl',
-    repo_url: 'https://git.example.com/team/task/tree/bug-01/test_model_fix',
+    repo_url: 'https://git.example.com/team/task/tree/bug1_green',
     user_query: '请修复切片处理错误，并补充回归测试。',
     verify_cmds: directVerifyCmd,
     gold_root_cause: 'sample.go 的 run 错误复用了切片底层数组，导致数据污染。',
@@ -291,16 +291,19 @@ test('Excel export requires a test-model branch URL and a gold commit URL', () =
   const sha = 'a'.repeat(40);
   const url = `https://git.example.com/team/task/commit/${sha}`;
   assert.equal(isGitCommitUrl(url), true);
-  const branchUrl = 'https://git.example.com/team/task/tree/bug-02/test_model_fix';
+  const branchUrl = 'https://git.example.com/team/task/tree/bug2_red';
   assert.equal(isGitTestModelBranchUrl(branchUrl), true);
-  assert.equal(requireGitTestModelBranchUrl(branchUrl, 'sample-task'), branchUrl);
+  assert.equal(requireGitTestModelBranchUrl(branchUrl, 'sample-task', 'diagnosis'), branchUrl);
   const greenBranchUrl = 'https://git.example.com/team/task/tree/bug2_green';
   assert.equal(isGitTestModelBranchUrl(greenBranchUrl), true);
-  assert.equal(requireGitTestModelBranchUrl(greenBranchUrl, 'sample-task'), greenBranchUrl);
-  const unnumberedBranchUrl = 'https://git.example.com/team/task/tree/test_model_fix';
-  assert.equal(isGitTestModelBranchUrl(unnumberedBranchUrl), true);
-  assert.equal(requireGitTestModelBranchUrl(unnumberedBranchUrl, 'sample-task'), unnumberedBranchUrl);
-  assert.throws(() => requireGitTestModelBranchUrl(url, 'sample-task'), /测试模型分支地址/);
+  assert.equal(requireGitTestModelBranchUrl(greenBranchUrl, 'sample-task', 'bugfix'), greenBranchUrl);
+  assert.equal(isGitTestModelBranchUrl('https://git.example.com/team/task/tree/bug2/green2', 'green'), true);
+  assert.equal(isGitTestModelBranchUrl('https://git.example.com/team/task/tree/red', 'red'), true);
+  const legacyBranchUrl = 'https://git.example.com/team/task/tree/bug-02/test_model_fix';
+  assert.equal(isGitTestModelBranchUrl(legacyBranchUrl), false);
+  assert.throws(() => requireGitTestModelBranchUrl(legacyBranchUrl, 'sample-task', 'bugfix'), /无法识别红绿角色/);
+  assert.throws(() => requireGitTestModelBranchUrl(greenBranchUrl, 'sample-task', 'diagnosis'), /显式 red/);
+  assert.throws(() => requireGitTestModelBranchUrl(url, 'sample-task'), /red\/green/);
   assert.throws(() => requireGitCommitUrl(sha, 'gold_patch', 'sample-task'), /完整 HTTPS Git commit 地址/);
 });
 
@@ -312,7 +315,7 @@ test('Excel export canonicalizes historical diagnosis MODEL_REPRO commands', () 
     go_version: 'go1.25.6; go.mod go 1.23',
     go_mod_version: '1.23',
     trajectory: 'https://upload.example.com/trajectory_sample-diagnosis-history.jsonl',
-    repo_url: 'https://git.example.com/team/task/tree/bug-01/test_model_fix',
+    repo_url: 'https://git.example.com/team/task/tree/bug1_red',
     user_query: '请排查重复读取导致的异常，并给出根因证据。',
     verify_cmds: "MODEL_REPRO=1 go test ./internal/sample -run '^TestRegression$' -count=1 -v",
     verify_result: {
@@ -339,7 +342,7 @@ test('prepared Excel row keeps Chinese root cause and excludes blocked harness f
     task_type: 'bugfix',
     go_version: 'go1.25.6; go.mod go 1.23',
     trajectory: 'https://upload.example.com/trajectory_sample-task.json',
-    repo_url: 'https://git.example.com/team/task/tree/bug-01/test_model_fix',
+    repo_url: 'https://git.example.com/team/task/tree/bug1_green',
     user_query: '请修复空输入触发的异常，并补充回归测试。',
     verify_cmds: directVerifyCmd,
     gold_root_cause: '`sample.go` 的 `run` 在空输入时错误访问索引并触发 panic。',
@@ -380,7 +383,7 @@ test('V5 Excel export serializes independent red and green proof trajectories', 
     task_type: 'bugfix',
     go_version: 'go1.25.6; go.mod go 1.23',
     trajectory: `https://upload.example.com/trajectory_${mainSession}.jsonl`,
-    repo_url: 'https://git.example.com/team/task/tree/bug-01/test_model_fix',
+    repo_url: 'https://git.example.com/team/task/tree/bug1_green',
     user_query: '请修复空输入触发的异常，并补充回归测试。',
     verify_cmds: directVerifyCmd,
     gold_root_cause: 'sample.go 的 run 在空输入时错误访问索引并触发 panic。',

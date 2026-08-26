@@ -19,7 +19,10 @@ export const PLATFORM_REVIEW_STATUS_LABELS = Object.freeze({
   DISCARDED: '已废弃',
 });
 const PLATFORM_REVIEW_LABEL_STATUSES = Object.freeze(Object.fromEntries(
-  Object.entries(PLATFORM_REVIEW_STATUS_LABELS).map(([status, label]) => [label, status]),
+  [
+    ...Object.entries(PLATFORM_REVIEW_STATUS_LABELS).map(([status, label]) => [label, status]),
+    ['通过', 'FINAL_PASSED'],
+  ],
 ));
 
 function text(value) {
@@ -235,15 +238,29 @@ export function extractPlatformSubmissionTotal(payload) {
 export function findPlatformSubmissionByBugId(payload, bugId) {
   const expected = text(bugId);
   return extractPlatformSubmissionItems(payload).find((item) => {
-    const direct = item?.bug_id ?? item?.bugId;
-    const nested = item?.data?.bug_id ?? item?.form_data?.bug_id;
-    const summaryBugId = text(item?.summary).split(/\s*\|\s*/, 1)[0];
-    return text(direct ?? nested) === expected || summaryBugId === expected;
+    return platformSubmissionBugId(item) === expected;
   }) || null;
 }
 
 export function platformSubmissionId(payload) {
   return text(payload?.data?.id ?? payload?.data?.submission_id ?? payload?.id ?? payload?.submission_id);
+}
+
+export function platformSubmissionBugId(item) {
+  const direct = item?.bug_id ?? item?.bugId;
+  const nested = item?.data?.bug_id ?? item?.form_data?.bug_id;
+  const summaryBugId = text(item?.summary).split(/\s*\|\s*/, 1)[0];
+  return text(direct ?? nested) || summaryBugId;
+}
+
+export function findPlatformSubmissionForRecord(payload, record = {}) {
+  const items = extractPlatformSubmissionItems(payload);
+  const expectedSubmissionId = text(record?.platformSubmissionId);
+  if (expectedSubmissionId) {
+    const exact = items.find((item) => platformSubmissionId(item) === expectedSubmissionId);
+    if (exact) return exact;
+  }
+  return findPlatformSubmissionByBugId({ items }, record?.bugId);
 }
 
 export function mergePlatformSubmissionReview(record = {}, remote = {}, { observedAt = new Date().toISOString() } = {}) {
@@ -266,6 +283,26 @@ export function mergePlatformSubmissionReview(record = {}, remote = {}, { observ
       ? text(remote?.updated_at ?? remote?.reviewed_at) || observedAt
       : record?.platformReviewUpdatedAt || null,
   };
+}
+
+export function buildPlatformReviewSnapshot(remoteItems = [], { observedAt = new Date().toISOString() } = {}) {
+  const submissions = (Array.isArray(remoteItems) ? remoteItems : []).map((remote) => {
+    const merged = mergePlatformSubmissionReview({}, remote, { observedAt });
+    return {
+      submissionId: platformSubmissionId(remote),
+      bugId: platformSubmissionBugId(remote),
+      reviewStatus: merged.platformReviewStatus || '',
+      reviewLabel: merged.platformReviewLabel || '',
+      reviewReason: merged.platformReviewReason || '',
+      reviewUpdatedAt: merged.platformReviewUpdatedAt || null,
+      currentVersion: merged.platformCurrentVersion || null,
+    };
+  }).filter((record) => record.submissionId);
+  const reviewCounts = submissions.reduce((counts, record) => {
+    if (record.reviewStatus) counts[record.reviewStatus] = Number(counts[record.reviewStatus] || 0) + 1;
+    return counts;
+  }, {});
+  return { observedAt, reviewCounts, submissions };
 }
 
 export function platformImportState(record) {

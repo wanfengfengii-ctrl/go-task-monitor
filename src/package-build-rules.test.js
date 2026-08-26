@@ -5,12 +5,13 @@ import { validateGoPackage } from './package-rules.js';
 
 const bytes = (value) => new TextEncoder().encode(value);
 
-test('generated package files use the model toolchain and documented platform parameter', () => {
+test('generated package files use the model toolchain and cloud-compatible platform parameters', () => {
   const files = createPackageSupportFiles({ bug_id: 'sample-task', go_version: 'go1.25.6; go.mod go 1.23' }, [
     { path: 'go.mod', content: bytes('module example.com/task\n\ngo 1.23\n') },
   ]);
   const map = new Map(files.map((file) => [file.path, new TextDecoder().decode(file.content)]));
-  assert.match(map.get('benzhi.Dockerfile'), /^FROM --platform=\$BUILDPLATFORM golang:1\.25\.6 AS benzhi-build/m);
+  assert.match(map.get('benzhi.Dockerfile'), /^FROM golang:1\.25\.6 AS benzhi-build/m);
+  assert.doesNotMatch(map.get('benzhi.Dockerfile'), /BUILDPLATFORM/);
   assert.match(map.get('benzhi.Dockerfile'), /^LABEL io\.benzhi\.delivery-template="backend-v2"/m);
   assert.match(map.get('benzhi.Dockerfile'), /ARG GOPROXY=https:\/\/goproxy\.cn,direct/);
   assert.match(map.get('benzhi.Dockerfile'), /ENV GOPROXY=\$\{GOPROXY\}/);
@@ -30,6 +31,29 @@ test('generated package files use the model toolchain and documented platform pa
   assert.doesNotMatch(map.get('.dockerignore'), /_test\.go|testdata/);
   assert.match(map.get('.dockerignore'), /\*\*\/node_modules\//);
   assert.match(map.get('.gitignore'), /\*\*\/dist\//);
+});
+
+test('v3 package support includes an identical standard Dockerfile', () => {
+  const task = {
+    bug_id: 'standard-dockerfile-task',
+    go_version: 'go1.25.6; go.mod go 1.25',
+    project_package_policy_version: 3,
+    project_type: 'web',
+    project_summary: '基于 Go 实现的订单管理 Web 项目，一款后端服务，处理订单创建、状态流转与商家数据管理。',
+  };
+  const workspace = [
+    { path: 'go.mod', content: bytes('module example.com/task\n\ngo 1.25\n') },
+    { path: 'main.go', content: bytes('package main\nfunc main() {}\n') },
+  ];
+  const files = createPackageSupportFiles(task, workspace);
+  const map = new Map(files.map((file) => [file.path, new TextDecoder().decode(file.content)]));
+  assert.equal(map.get('Dockerfile'), map.get('benzhi.Dockerfile'));
+  assert.match(map.get('BENZHI_README.md'), /docker build --platform linux\/amd64 -t standard-dockerfile-task:latest \./);
+  assert.deepEqual(validateGoPackage([...workspace, ...files], {
+    projectPackagePolicyVersion: 3,
+    projectType: task.project_type,
+    projectSummary: task.project_summary,
+  }).issues, []);
 });
 
 test('current system template is statically valid and rejects external Dockerfile syntax frontends', () => {
@@ -166,6 +190,7 @@ test('Git workspace excludes build artifacts but retains committed delivery file
   assert.equal(isExcludedWorkspacePath('.git/config'), true);
   assert.equal(isExcludedWorkspacePath('web/node_modules/pkg/index.js'), true);
   assert.equal(isExcludedWorkspacePath('build_benzhi_docker.sh'), false);
+  assert.equal(isExcludedWorkspacePath('Dockerfile'), false);
   assert.equal(isExcludedWorkspacePath('benzhi.Dockerfile'), false);
   assert.equal(isExcludedWorkspacePath('BENZHI_README.md'), false);
   assert.equal(isExcludedWorkspacePath('pkg/task.go'), false);

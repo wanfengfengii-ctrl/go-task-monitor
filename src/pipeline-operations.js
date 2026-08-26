@@ -103,19 +103,21 @@ export function pipelineStageWeight(stageId = '') {
 }
 
 export function pipelineRepairWorkerLimit(environment = globalThis.process?.env || {}) {
-  const configured = Number(environment.GO_PIPELINE_REPAIR_WORKER_LIMIT || 2);
-  return Math.max(1, Math.min(8, Number.isFinite(configured) ? configured : 2));
+  const configured = Number(environment.GO_PIPELINE_REPAIR_WORKER_LIMIT || 6);
+  return Math.max(1, Math.min(8, Number.isFinite(configured) ? configured : 6));
 }
 
 export function pipelineStructuredCodexLimit({
-  configuredLimit = 2,
+  configuredLimit = 4,
   loadAverage = 0,
   cpuCount = 1,
 } = {}) {
-  const limit = Math.max(1, Math.min(2, Number(configuredLimit) || 2));
+  const limit = Math.max(1, Math.min(4, Number(configuredLimit) || 4));
   const normalizedCpuCount = Math.max(1, Number(cpuCount) || 1);
   const loadRatio = Number(loadAverage || 0) / normalizedCpuCount;
-  return loadRatio >= 1.2 ? 1 : limit;
+  if (loadRatio >= 7) return 1;
+  if (loadRatio >= 5) return Math.min(2, limit);
+  return limit;
 }
 
 export function pipelineStageResourceProfile(stageId = '') {
@@ -123,14 +125,14 @@ export function pipelineStageResourceProfile(stageId = '') {
   if (stage.endsWith('_user_query_review')) return { pool: '', limit: 0, weight: 0 };
   if (stage === 'project_plan' || stage === 'codex_injection_plan' || stage === 'codex_injection'
     || stage.endsWith('_test_author')) {
-    return { pool: 'codex-structured', limit: 2, weight: 1 };
+    return { pool: 'codex-structured', limit: 4, weight: 1 };
   }
   if (stage === 'project_generate') return { pool: 'project-generation', limit: 4, weight: 1 };
-  // Bug discovery/source preparation can use four lightweight analysis slots.
+  // Bug discovery/source preparation can use six lightweight analysis slots.
   // Each Runner dynamically reduces its internal fan-out when projects compete,
   // keeping the host-wide finder/writer count bounded by this pool.
   const analysis = stage.endsWith('_bug_discovery') || stage.endsWith('_bug_source_prepare');
-  if (analysis) return { pool: 'compute-analysis', limit: 4, weight: 1 };
+  if (analysis) return { pool: 'compute-analysis', limit: 6, weight: 1 };
   // Claude's production fix is independently bounded from validation and proof
   // work. The worker limit is temporarily overridable for repair sprints.
   if (stage.endsWith('_claude_fix')) {
@@ -194,7 +196,7 @@ export function pipelineResourcePoolState(jobs = [], effectiveMaxConcurrency = 4
     // The global limit counts project runners, while compute pools count Bug
     // workers inside those runners. Preserve internal capacity once a project
     // is admitted; project bootstrap pools still follow the project limit.
-    const projectBootstrapPool = pool === 'codex-structured' || pool === 'project-generation';
+    const projectBootstrapPool = pool === 'project-generation';
     const limit = effectiveMax === 0
       ? 0
       : projectBootstrapPool
@@ -243,7 +245,7 @@ export function pipelineResourcePoolState(jobs = [], effectiveMaxConcurrency = 4
       : contenders;
     pool.occupied = Math.min(pool.limit, authoritativeOccupied);
     pool.available = Math.max(0, pool.limit - pool.occupied);
-    const waiting = Math.max(0, contenders - pool.occupied);
+    const waiting = Math.max(0, contenders - pool.limit);
     if (waiting > 0) pool.waiting = waiting;
   }
   return pools;
@@ -395,7 +397,9 @@ export function pipelineResourcePolicy(snapshot = {}, { configuredMax = 4 } = {}
   else if (diskUsedPercent >= 85 && diskFreeBytes < 50 * 1024 ** 3) blockers.push(`磁盘使用率 ${diskUsedPercent.toFixed(1)}%，且可用空间不足 50 GiB`);
   else if (diskUsedPercent >= 75 && diskFreeBytes < 100 * 1024 ** 3) {
     warnings.push(`磁盘使用率 ${diskUsedPercent.toFixed(1)}%`);
-    effectiveMaxConcurrency = Math.min(effectiveMaxConcurrency, 2);
+    if (diskFreeBytes <= 80 * 1024 ** 3) {
+      effectiveMaxConcurrency = Math.min(effectiveMaxConcurrency, 2);
+    }
   }
 
   if (Number.isFinite(memoryAvailablePercent)) {

@@ -48,11 +48,13 @@ import {
 } from './src/review-rules.js';
 import { createPipelineStages, CURRENT_BUG_POLICY_VERSION, CURRENT_SUBMISSION_PLATFORM_POLICY_VERSION, CURRENT_VERIFICATION_POLICY_VERSION, CURRENT_WORKFLOW_POLICY_VERSION, CURRENT_WORKFLOW_VERSION, DEFAULT_BUG_COUNT, isPipelineBugDeliveryComplete, pipelineBugQuota, pipelineStageLayoutMatches, pipelineTaskOutcome, pipelineUserQueryReadiness, publicPipelineJob, reactivateFailedPipelineBugsForManualRetry, reactivateFrozenVerificationFailures, reactivatePipelineBug, rewindPipelineBugAfterMissingTrajectory, upgradeSubmissionPlatformStageLayout, upgradeUnfinishedPipelineBugQuota, validatePipelineRequest } from './src/pipeline-rules.js';
 import {
+  buildPlatformReviewSnapshot,
   buildSubmissionActivityStats,
   DEFAULT_SUBMISSION_PLATFORM_URL,
   extractPlatformSubmissionItems,
   extractPlatformSubmissionTotal,
   findPlatformSubmissionByBugId,
+  findPlatformSubmissionForRecord,
   isLegacyDeliveredPlatformBackfill,
   mergePlatformSubmissionReview,
   mergePlatformCookies,
@@ -247,6 +249,7 @@ const submissionPlatformApiUrl = `${submissionPlatformBaseUrl}/api/v1`;
 const submissionPlatformSessionPath = path.join(managedLibraryRoot, 'validation/submission_platform_session.json');
 const submissionPlatformRecordsPath = path.join(managedLibraryRoot, 'validation/platform_submissions.json');
 const submissionPlatformRecordsLockPath = `${submissionPlatformRecordsPath}.lock`;
+const submissionPlatformReviewSnapshotPath = path.join(managedLibraryRoot, 'validation/platform_review_snapshot.json');
 const submissionPlatformKeychainService = `go-task-monitor.submission-platform.${crypto.createHash('sha256').update(submissionPlatformBaseUrl).digest('hex').slice(0, 12)}`;
 const SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS = 2 * 60 * 1000;
 const SUBMISSION_PLATFORM_PAGE_SIZE = 50;
@@ -1648,17 +1651,22 @@ async function queuePipelineRetryFromTriage(jobId, incident, triage, { terminate
   const at = new Date().toISOString();
   job.status = 'failed';
   if (Number(job.autoRetryCount || 0) >= MAX_PIPELINE_AUTO_RETRIES) {
-    job.error = `Codex 服务连续失败，已达到 ${MAX_PIPELINE_AUTO_RETRIES} 次自动重试上限，等待人工重试`;
-    job.finishedAt = at;
-    job.updatedAt = at;
+    const retryBlockedReason = `流水线阶段连续失败，已达到 ${MAX_PIPELINE_AUTO_RETRIES} 次自动重试上限，等待人工重试`;
+    const alreadyRecorded = job.retryBlockedReason === retryBlockedReason;
+    job.retryBlockedReason = retryBlockedReason;
     delete job.retryRequestedAt;
-    job.logs = [...(job.logs || []), {
-      at,
-      level: 'warn',
-      stageId: job.currentStage || incident.stageId || null,
-      message: `已达到 ${MAX_PIPELINE_AUTO_RETRIES} 次自动重试上限，不再重复加入队列`,
-    }].slice(-300);
-    await writePipelineJob(job);
+    if (!alreadyRecorded) {
+      job.logs = [...(job.logs || []), {
+        at,
+        level: 'warn',
+        stageId: job.currentStage || incident.stageId || null,
+        message: `已达到 ${MAX_PIPELINE_AUTO_RETRIES} 次自动重试上限，不再重复加入队列`,
+      }].slice(-300);
+      // Preserve the actual failure timestamp and error. Updating them here
+      // makes the watchdog mistake its own retry decision for a newer Runner
+      // failure and reopen the same Codex triage forever.
+      await writePipelineJob(job);
+    }
     return { queued: false, reason: 'retry_exhausted' };
   }
   job.error = terminated
@@ -2819,7 +2827,7 @@ function isManualBugQueue(job) {
   return job?.status === 'waiting_resource'
     && Number.isInteger(execution.selectedBugIndex)
     && execution.selectedBugIndex > 0
-    && ['manual_start', 'manual_retry', 'user_switched'].includes(execution.lastAction)
+    && ['manual_start', 'manual_retry', 'user_switched', 'quality_rejection_recovery'].includes(execution.lastAction)
     && ['fast_lane_queued', 'fast_lane_running', 'fast_lane_switching'].includes(execution.status);
 }
 
@@ -2842,6 +2850,13 @@ function scheduleManualBugRetry(jobId, reason = '等待资源') {
   timer.unref?.();
   manualPipelineRetryTimers.set(jobId, timer);
   addLog('info', `Bug 工作台 ${jobId} 将在资源可用后继续：${String(reason).slice(0, 160)}`);
+}
+
+async function resumePausedManualBugQueues(reason = '暂停调度期间继续人工 Bug') {
+  if (pipelineControlMode !== 'paused') return;
+  for (const job of await listPipelineJobs()) {
+    if (isManualBugQueue(job)) scheduleManualBugRetry(job.id, reason);
+  }
 }
 
 async function reconcilePipelineResourceSlots() {
@@ -2869,6 +2884,7 @@ async function reconcilePipelineResourceSlots() {
           ? await readPipelineJob(jobId).catch(() => null)
           : null;
         const stage = String(owner.stageId || '');
+        const workerStage = String(owner.workerStageId || '');
         const activeStages = new Set([
           String(job?.currentStage || ''),
           String(nextPipelineStage(job) || ''),
@@ -2886,7 +2902,12 @@ async function reconcilePipelineResourceSlots() {
         }
         const stillOwnsStage = job
           && ['queued', 'running'].includes(job.status)
-          && activeStages.has(stage);
+          && (activeStages.has(stage)
+            || (workerStage && activeStages.has(workerStage))
+            // Runners started before workerStageId was added still own these
+            // virtual structured-Codex stages through their live project PID.
+            || (['codex_injection', 'codex_injection_plan'].includes(stage)
+              && Number(owner.pid) === Number(job.runnerPid)));
         stale = !stillOwnsStage;
       }
       if (!stale) continue;
@@ -3610,6 +3631,23 @@ async function resetPipelineBugForRetry(jobId, bugIndex) {
   if (isPipelineBugDeliveryComplete(job, index)) throw new Error(`Bug ${index} 已交付，不能重置`);
   const activeStage = (job.stages || []).find((stage) => stage.status === 'running' && Number(stage.bugIndex) === index);
   if (activeStage) throw new Error(`Bug ${index} 当前正在执行 ${activeStage.id}，请等待该阶段结束后再重置`);
+  const activeHandle = activePipelineProcesses.get(jobId);
+  if (activeHandle && !processIsAlive(Number(activeHandle.pid))) {
+    activePipelineProcesses.delete(jobId);
+  }
+  if (!activePipelineProcesses.has(jobId)) {
+    const liveRunner = (await scanPipelineRunnerProcesses()).get(jobId);
+    if (liveRunner && processIsAlive(liveRunner.pid)) {
+      activePipelineProcesses.set(jobId, {
+        pid: liveRunner.pid,
+        child: null,
+        adopted: true,
+        command: liveRunner.command,
+      });
+    }
+  }
+  const runnerHandle = activePipelineProcesses.get(jobId);
+  const runnerActive = Boolean(runnerHandle && processIsAlive(Number(runnerHandle.pid)));
   const taskDir = String(bug.task?.taskDir || '');
   const trajectoryCapture = taskDir
     ? await fsp.stat(path.join(taskDir, 'trajectory/trajectory.stream.jsonl')).catch(() => null)
@@ -3621,14 +3659,58 @@ async function resetPipelineBugForRetry(jobId, bugIndex) {
     const rewoundClaudeStage = missingTrajectoryCapture
       ? rewindPipelineBugAfterMissingTrajectory(current, index, resetAt)
       : false;
+    const selectedStage = nextPipelineStage({
+      ...current,
+      currentStage: `bug${index}_claude_fix`,
+      bugExecution: { ...execution, selectedBugIndex: index },
+    }) || `bug${index}_claude_fix`;
+    const selectedStageRecord = (current.stages || []).find((stage) => stage.id === selectedStage);
+    // Manual retry is an operational recovery boundary. A failed stage must
+    // become runnable again; leaving it failed makes the queued Bug appear
+    // terminal in the UI even though the live Runner will retry it.
+    if (selectedStageRecord?.status === 'failed') {
+      selectedStageRecord.status = 'pending';
+      selectedStageRecord.startedAt = null;
+      selectedStageRecord.finishedAt = null;
+      selectedStageRecord.error = '';
+      selectedStageRecord.reason = 'Bug 人工重置后从当前阶段继续';
+      delete selectedStageRecord.result;
+      delete selectedStageRecord.failureCategory;
+      delete selectedStageRecord.retryCount;
+      delete selectedStageRecord.maxRetries;
+    }
+    const selectedBug = (current.bugs || []).find((item) => Number(item.bugIndex) === index);
+    if (runnerActive) {
+      if (selectedBug) {
+        selectedBug.workerExecution = {
+          ...(selectedBug.workerExecution || {}),
+          status: 'fast_lane_queued',
+          currentStage: selectedStage,
+          startedAt: null,
+          currentAttempt: 0,
+          blockedReason: '当前 Runner 正在执行其他 Bug，等待重试队列',
+          lastAction: 'manual_retry_queued',
+          updatedAt: resetAt,
+        };
+      }
+      enqueueBugRetry(current, index, resetAt);
+      current.logs = [...(current.logs || []), {
+        at: resetAt,
+        level: 'info',
+        stageId: selectedStage,
+        message: rewoundClaudeStage
+          ? `Bug ${index} 已重置尝试次数并退回 Claude 阶段；当前 Runner 继续执行其他 Bug`
+          : `Bug ${index} 已重置尝试次数并加入项目内重试队列；当前 Runner 继续执行其他 Bug`,
+      }].slice(-300);
+      return;
+    }
     execution.selectedBugIndex = index;
     execution.status = 'fast_lane_queued';
     execution.startedAt = null;
     execution.currentAttempt = 0;
     execution.blockedReason = '等待中央调度资源';
     execution.lastAction = 'manual_retry';
-    execution.currentStage = nextPipelineStage({ ...current, bugExecution: execution });
-    const selectedBug = (current.bugs || []).find((item) => Number(item.bugIndex) === index);
+    execution.currentStage = selectedStage;
     if (selectedBug) {
       selectedBug.workerExecution = {
         ...(selectedBug.workerExecution || {}),
@@ -3653,6 +3735,12 @@ async function resetPipelineBugForRetry(jobId, bugIndex) {
         : `Bug ${index} 已人工重置轨迹尝试次数，保留历史记录并从未完成阶段继续`,
     }].slice(-300);
   });
+  if (runnerActive) {
+    return {
+      job: publicPipelineJob(updated),
+      message: `Bug ${index} 已重置尝试次数并加入重试队列，当前 Runner 继续执行其他 Bug`,
+    };
+  }
   const queued = queuePipelineManualRetry(updated, updated.updatedAt, 'bug_attempt_reset');
   await writePipelineJob(queued);
   // Nudge the central scheduler immediately instead of waiting for its
@@ -4712,6 +4800,25 @@ async function readSubmissionPlatformRecords() {
   }
 }
 
+async function readSubmissionPlatformReviewSnapshot() {
+  try {
+    const snapshot = JSON.parse(await fsp.readFile(submissionPlatformReviewSnapshotPath, 'utf8'));
+    if (!snapshot || !Array.isArray(snapshot.submissions)) throw new Error('提交平台审核快照格式损坏');
+    return snapshot;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function writeSubmissionPlatformReviewSnapshot(snapshot) {
+  await fsp.mkdir(path.dirname(submissionPlatformReviewSnapshotPath), { recursive: true });
+  const temporary = `${submissionPlatformReviewSnapshotPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fsp.writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await fsp.rename(temporary, submissionPlatformReviewSnapshotPath);
+  await fsp.chmod(submissionPlatformReviewSnapshotPath, 0o600);
+}
+
 async function writeSubmissionPlatformRecordsUnlocked(records) {
   await fsp.mkdir(path.dirname(submissionPlatformRecordsPath), { recursive: true });
   const temporary = `${submissionPlatformRecordsPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -4782,10 +4889,15 @@ async function validatePlatformVerificationCompatibility(task, submission) {
     throw new Error(`${task.bug_id} 提交前证明兼容检查失败：verify_result 无法解析：${error.message}`);
   }
   const phases = task.task_type === 'diagnosis' ? ['pre_fix'] : ['pre_fix', 'post_fix'];
+  const verifyCmds = Array.isArray(task.verify_cmds)
+    ? task.verify_cmds
+    : String(task.verify_cmds || '').split(/\r?\n/).map((command) => command.trim()).filter(Boolean);
   for (const phase of phases) {
     const proofUrl = String(verifyResult?.[phase]?.trajectory_url || '').trim();
     const artifactKind = phase === 'pre_fix' ? 'verify_pre' : 'verify_post';
-    const localProof = await readVerificationProof(task, artifactKind);
+    const localProof = task.archived
+      ? await readArchivedArtifact(task, task.archiveProofs?.[phase], `${phase} 证明`)
+      : await readVerificationProof(task, artifactKind);
     let response;
     try {
       response = await fetch(proofUrl, { redirect: 'follow', signal: AbortSignal.timeout(SUBMISSION_PLATFORM_REQUEST_TIMEOUT_MS) });
@@ -4803,7 +4915,7 @@ async function validatePlatformVerificationCompatibility(task, submission) {
     const issues = platformCompatibleVerificationProofIssues({
       phase,
       taskType: task.task_type,
-      verifyCmds: task.verify_cmds,
+      verifyCmds,
       trajectoryContent: remoteContent,
     });
     if (issues.length) throw new Error(`${task.bug_id} ${phase} 不符合提交平台证明识别格式：${issues.join('；')}`);
@@ -4828,12 +4940,13 @@ async function reconcileSubmissionPlatformReviews() {
   const sync = (async () => {
     const observedAt = new Date().toISOString();
     const remoteItems = await listRemoteSubmissions();
+    await writeSubmissionPlatformReviewSnapshot(buildPlatformReviewSnapshot(remoteItems, { observedAt }));
     let updated = 0;
     await withFileLock(submissionPlatformRecordsLockPath, async () => {
       const records = await readSubmissionPlatformRecords();
       const next = records.map((record) => {
         if (record?.status !== 'submitted' || !record?.bugId) return record;
-        const remote = findPlatformSubmissionByBugId({ items: remoteItems }, record.bugId);
+        const remote = findPlatformSubmissionForRecord({ items: remoteItems }, record);
         if (!remote) return record;
         const merged = mergePlatformSubmissionReview({
           ...record,
@@ -5045,12 +5158,20 @@ async function resubmitTaskToPlatform(taskId, submissionId) {
 }
 
 async function submissionPlatformPublicState() {
-  const records = await readSubmissionPlatformRecords();
-  const reviewCounts = records.reduce((counts, record) => {
+  const [records, remoteSnapshot] = await Promise.all([
+    readSubmissionPlatformRecords(),
+    readSubmissionPlatformReviewSnapshot(),
+  ]);
+  const localReviewCounts = records.reduce((counts, record) => {
     const status = String(record?.platformReviewStatus || '').trim();
     if (status) counts[status] = Number(counts[status] || 0) + 1;
     return counts;
   }, {});
+  const reviewCounts = remoteSnapshot?.submissions?.length
+    ? remoteSnapshot.reviewCounts || {}
+    : localReviewCounts;
+  const remotePendingSubmissions = (remoteSnapshot?.submissions || [])
+    .filter((record) => record.reviewStatus === 'PENDING_FIX');
   return {
     baseUrl: submissionPlatformBaseUrl,
     connected: Boolean(submissionPlatformCookie),
@@ -5078,6 +5199,7 @@ async function submissionPlatformPublicState() {
       reviewUpdatedAt,
       currentVersion,
     })),
+    remotePendingSubmissions,
   };
 }
 
@@ -5739,11 +5861,28 @@ async function validateTaskExcelVerification(task) {
       if (path.isAbsolute(filename) || String(filename).split(/[\\/]/).includes('..') || !String(filename).endsWith('_test.go')) {
         throw new Error(`${metadata.bug_id || task.bug_id} 禁止 Excel 导出：公开验证测试路径不安全：${filename}`);
       }
-      const sourcePath = path.join(task.taskDir, 'workspace', filename);
+      const diagnosisPublishedTest = metadata.task_type === 'diagnosis'
+        && metadata.verification_test_published === true
+        && metadata.verification_fixture_published === true
+        && metadata.verification_test_storage === 'repository-red-branch';
+      const fixtureDir = diagnosisPublishedTest ? path.resolve(String(metadata.verification_fixture_dir || '')) : '';
+      const taskRoot = path.resolve(task.taskDir);
+      if (diagnosisPublishedTest && (!fixtureDir || (fixtureDir !== taskRoot && !fixtureDir.startsWith(`${taskRoot}${path.sep}`)))) {
+        throw new Error(`${metadata.bug_id || task.bug_id} 禁止 Excel 导出：diagnosis 系统验证测试目录越出任务目录`);
+      }
+      const sourcePath = diagnosisPublishedTest
+        ? path.join(fixtureDir, filename)
+        : path.join(task.taskDir, 'workspace', filename);
       try {
         await fsp.access(sourcePath);
       } catch {
-        throw new Error(`${metadata.bug_id || task.bug_id} 禁止 Excel 导出：提交仓库工作区缺少公开验证测试：${filename}`);
+        throw new Error(`${metadata.bug_id || task.bug_id} 禁止 Excel 导出：缺少已发布公开验证测试：${filename}`);
+      }
+      if (diagnosisPublishedTest && /^[a-f0-9]{64}$/i.test(String(metadata.verification_test_sha256 || ''))) {
+        const digest = crypto.createHash('sha256').update(await fsp.readFile(sourcePath)).digest('hex');
+        if (digest !== metadata.verification_test_sha256) {
+          throw new Error(`${metadata.bug_id || task.bug_id} 禁止 Excel 导出：diagnosis 已发布验证测试哈希不一致：${filename}`);
+        }
       }
     }
   }
@@ -5770,6 +5909,21 @@ async function persistTaskProofUrl(task, artifactKind, proof, signedUrl, uploade
     ...(metadata.verification_evidence || {}),
     [phase]: { ...current, trajectory_url: signedUrl, uploaded_at: uploadedAt },
   };
+  const phases = metadata.task_type === 'diagnosis' ? ['pre_fix'] : ['pre_fix', 'post_fix'];
+  const completeEvidence = phases.every((candidate) => {
+    const evidence = metadata.verification_evidence?.[candidate];
+    return evidence?.session_id && evidence?.trajectory_url;
+  });
+  if (completeEvidence) {
+    metadata.verify_result = JSON.stringify(Object.fromEntries(phases.map((candidate) => {
+      const evidence = metadata.verification_evidence[candidate];
+      return [candidate, {
+        trajectory_url: evidence.trajectory_url,
+        session_id: evidence.session_id,
+        result: candidate === 'pre_fix' ? 'red' : 'green',
+      }];
+    })));
+  }
   const temporaryPath = `${publicPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   await fsp.writeFile(temporaryPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
   await fsp.rename(temporaryPath, publicPath);
@@ -5891,7 +6045,14 @@ async function uploadValidatedTrajectoryLocked(task, trajectory, artifactKind = 
 }
 
 async function uploadProofTrajectory(taskId, artifactKind) {
-  const task = (await discoverTasks()).find((item) => item.id === taskId);
+  let task = (await discoverTasks()).find((item) => item.id === taskId);
+  if (!task) {
+    // Active pipeline tasks can appear while a deliberately retained task
+    // snapshot is still serving UI reads. Proof upload is a write boundary, so
+    // a cache miss must be confirmed against the filesystem before failing.
+    invalidateTaskDiscoveryCache();
+    task = (await discoverTasksFresh()).find((item) => item.id === taskId);
+  }
   if (!task) throw new Error('验证证明对应的任务不存在');
   const proof = await readVerificationProof(task, artifactKind);
   return runSerializedCloudUpload(task, artifactKind, () => uploadValidatedTrajectoryLocked(task, proof, artifactKind));
@@ -8119,9 +8280,7 @@ async function restoreRuntimeAfterRestart() {
   await runSystemHealthChecks();
   if (pipelineAutoFillEnabled && datastoreHealthy) void fillPipelineSlots();
   else if (pipelineControlMode === 'paused' && datastoreHealthy) {
-    for (const job of jobs) {
-      if (isManualBugQueue(job)) scheduleManualBugRetry(job.id, '服务恢复后继续人工 Bug');
-    }
+    await resumePausedManualBugQueues('服务恢复后继续人工 Bug');
   }
   void runPipelineWatchdog();
 }
@@ -8211,6 +8370,10 @@ setInterval(() => {
     .catch((error) => addLog('warn', `恢复提交平台阶段布局失败：${error.message}`));
 }, 30_000).unref();
 setInterval(() => { void fillPipelineSlots(); }, 30_000).unref();
+setInterval(() => {
+  void resumePausedManualBugQueues('检测到外部加入的人工返修队列')
+    .catch((error) => addLog('warn', `人工返修续跑扫描失败：${error.message}`));
+}, 30_000).unref();
 setInterval(() => { void ensurePipelineRefill(); }, 30_000).unref();
 setInterval(() => { void runPipelineWatchdog(); }, PIPELINE_WATCHDOG_INTERVAL_MS).unref();
 setInterval(() => { void runSystemHealthChecks(); }, PIPELINE_HEALTH_INTERVAL_MS).unref();

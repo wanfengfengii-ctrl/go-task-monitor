@@ -122,6 +122,7 @@ export const PIPELINE_V3_DIAGNOSIS_DELIVERY_STAGES = [
   ['claude_fix', 'Claude 独立完成诊断'],
   ['trajectory_validate', '主轨迹完整性校验'],
   ['test_author', 'Codex 独立编写诊断回归测试'],
+  ['git_publication', '系统发布诊断验证测试'],
   ['pre_verify', '公开复现红测证明'],
   ['cloud_upload', '上传主轨迹与红测证明'],
   ['verification_finalize', '回填 verify_result 验证证明'],
@@ -256,6 +257,12 @@ export function markPipelineBugSkipped(job, bugIndex, reason, at = new Date().to
     stage.finishedAt = at;
     stage.error = '';
     stage.reason = bug.skipReason;
+  }
+  if (Array.isArray(job.pendingBugRetries)) {
+    job.pendingBugRetries = job.pendingBugRetries
+      .map(Number)
+      .filter((pendingBugIndex) => Number.isInteger(pendingBugIndex) && pendingBugIndex !== normalizedIndex);
+    if (job.pendingBugRetries.length === 0) delete job.pendingBugRetries;
   }
   if ((job.stages || []).find((stage) => stage.id === job.currentStage)?.bugIndex === normalizedIndex) job.currentStage = null;
   job.error = '';
@@ -574,6 +581,7 @@ export function reactivatePipelineBug(job, bugIndex, { resetAttempts = false } =
   delete bug.trajectoryDisposition;
   delete bug.trajectorySkipReason;
   delete bug.trajectorySkippedAt;
+  delete job.retryBlockedReason;
   if (!invalidatedIncompleteDelivery) invalidatePipelineVerificationAfterMissingTestAuthor(job, normalizedIndex);
   if (resetAttempts) {
     const history = Array.isArray(bug.trajectoryAttemptHistory) ? bug.trajectoryAttemptHistory : [];

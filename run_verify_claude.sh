@@ -130,6 +130,13 @@ if [[ "$has_docker_command" != "true" ]]; then
       test_files_tmp="$run_root/repository-test-files.txt"
       jq -r '.verification_test_files[]? // empty' "$proof_root/public.json" >"$test_files_tmp"
       [[ -s "$test_files_tmp" ]] || { echo "repository-tests requires verification_test_files" >&2; exit 4; }
+      repository_fixture_dir="$(jq -r '.verification_fixture_dir // empty' "$proof_root/public.json")"
+      if [[ "$task_type" == "diagnosis" && -n "$repository_fixture_dir" ]]; then
+        repository_fixture_dir="$(cd "$repository_fixture_dir" 2>/dev/null && pwd || true)"
+        task_root="$(cd "$task_dir" && pwd)"
+        [[ -n "$repository_fixture_dir" && ( "$repository_fixture_dir" == "$task_root" || "$repository_fixture_dir" == "$task_root"/* ) ]] \
+          || { echo "diagnosis repository-test source must remain inside task directory" >&2; exit 4; }
+      fi
       while IFS= read -r test_file; do
         [[ -z "$test_file" ]] && continue
         [[ "$test_file" != /* && "$test_file" != *".."* && "$test_file" == *_test.go ]] \
@@ -143,7 +150,8 @@ if [[ "$has_docker_command" != "true" ]]; then
             "$task_dir/workspace/$test_file" \
             "$task_dir/.test-author-checkpoint/workspace/$test_file" \
             "$task_dir/grader/model-tests/$test_file" \
-            "$source_dir/$test_file"; do
+            "$source_dir/$test_file" \
+            "${repository_fixture_dir:-}/$test_file"; do
             if [[ -f "$candidate" ]]; then
               repository_test="$candidate"
               break
@@ -153,13 +161,8 @@ if [[ "$has_docker_command" != "true" ]]; then
             echo "repository verification test is not materialized in task workspace, checkpoint, model-tests, or proof source: $test_file" >&2
             exit 4
           }
-          task_workspace_test="$task_dir/workspace/$test_file"
-          if [[ "$repository_test" != "$task_workspace_test" ]]; then
-            mkdir -p "$task_dir/workspace/$(dirname "$test_file")"
-            cp "$repository_test" "$task_workspace_test"
-          fi
           mkdir -p "$workspace/$(dirname "$test_file")"
-          cp "$task_workspace_test" "$workspace/$test_file"
+          cp "$repository_test" "$workspace/$test_file"
         fi
         [[ -f "$workspace/$test_file" ]] || {
           echo "repository verification test materialization failed: $test_file" >&2
@@ -203,7 +206,23 @@ session_id="$(jq -r 'select(.type == "result") | .session_id' "$raw_stream" | ta
 [[ "$session_id" =~ ^[0-9a-fA-F-]{36}$ ]] || { echo "missing verification Session UUID" >&2; exit 6; }
 native_source="$(find "$CLAUDE_CONFIG_DIR/projects" -type f -name "${session_id}.jsonl" -print -quit 2>/dev/null || true)"
 [[ -s "$native_source" ]] || { echo "missing Claude native transcript for verification session $session_id" >&2; exit 7; }
-node "$result_extractor" "$phase" "$proof_root/public.json" "$native_source" "$raw_stream" "$proof_root" >/dev/null
+extractor_stdout="$run_root/extractor.stdout.log"
+extractor_stderr="$run_root/extractor.stderr.log"
+set +e
+node "$result_extractor" "$phase" "$proof_root/public.json" "$native_source" "$raw_stream" "$proof_root" >"$extractor_stdout" 2>"$extractor_stderr"
+extractor_exit=$?
+set -e
+if [[ "$extractor_exit" -ne 0 ]]; then
+  cp "$native_source" "$output_dir/failed-trajectory_${session_id}.jsonl"
+  cp "$raw_stream" "$output_dir/failed-raw.stream.jsonl"
+  cp "$stderr_log" "$output_dir/failed-claude.stderr.log"
+  cp "$prompt_file" "$output_dir/failed-PROMPT.md"
+  cp "$extractor_stdout" "$output_dir/failed-extractor.stdout.log"
+  cp "$extractor_stderr" "$output_dir/failed-extractor.stderr.log"
+  chmod 0444 "$output_dir"/*
+  cat "$extractor_stderr" >&2
+  exit "$extractor_exit"
+fi
 [[ -s "$result_file" && -s "$proof_root/verification-command-results.jsonl" ]] || { echo "verification result extraction failed" >&2; exit 5; }
 
 expected_result="red"

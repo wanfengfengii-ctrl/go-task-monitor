@@ -32,17 +32,18 @@ import {
   triageActionPlan,
 } from './pipeline-operations.js';
 
-test('repair concurrency defaults to two workers and supports an eight-worker sprint override', () => {
-  assert.equal(pipelineRepairWorkerLimit({}), 2);
+test('repair concurrency defaults to six workers and supports an eight-worker sprint override', () => {
+  assert.equal(pipelineRepairWorkerLimit({}), 6);
   assert.equal(pipelineRepairWorkerLimit({ GO_PIPELINE_REPAIR_WORKER_LIMIT: '8' }), 8);
   assert.equal(pipelineRepairWorkerLimit({ GO_PIPELINE_REPAIR_WORKER_LIMIT: '99' }), 8);
-  assert.equal(pipelineRepairWorkerLimit({ GO_PIPELINE_REPAIR_WORKER_LIMIT: 'invalid' }), 2);
+  assert.equal(pipelineRepairWorkerLimit({ GO_PIPELINE_REPAIR_WORKER_LIMIT: 'invalid' }), 6);
 });
 
-test('structured Codex work uses two slots and contracts to one under host load', () => {
-  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 2, loadAverage: 8, cpuCount: 10 }), 2);
-  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 2, loadAverage: 12, cpuCount: 10 }), 1);
-  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 2, loadAverage: 30, cpuCount: 10 }), 1);
+test('structured Codex work uses four slots and contracts only under extreme host load', () => {
+  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 4, loadAverage: 8, cpuCount: 10 }), 4);
+  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 4, loadAverage: 30, cpuCount: 10 }), 4);
+  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 4, loadAverage: 50, cpuCount: 10 }), 2);
+  assert.equal(pipelineStructuredCodexLimit({ configuredLimit: 4, loadAverage: 70, cpuCount: 10 }), 1);
 });
 
 test('pipeline display ignores a stale completed discovery cursor', () => {
@@ -180,6 +181,9 @@ test('resource policy blocks critical disk pressure and reduces concurrency for 
   const warning = pipelineResourcePolicy({ diskUsedPercent: 80, diskFreeBytes: 80 * 1024 ** 3, freeMemoryBytes: 16 * 1024 ** 3, totalMemoryBytes: 32 * 1024 ** 3 });
   assert.equal(warning.status, 'degraded');
   assert.equal(warning.effectiveMaxConcurrency, 2);
+  const recoveredDisk = pipelineResourcePolicy({ diskUsedPercent: 89.5, diskFreeBytes: 96 * 1024 ** 3, memoryAvailablePercent: 50 });
+  assert.equal(recoveredDisk.status, 'degraded');
+  assert.equal(recoveredDisk.effectiveMaxConcurrency, 4);
   const largeDisk = pipelineResourcePolicy({ diskUsedPercent: 80, diskFreeBytes: 180 * 1024 ** 3, freeMemoryBytes: 16 * 1024 ** 3, totalMemoryBytes: 32 * 1024 ** 3 });
   assert.equal(largeDisk.status, 'healthy');
   assert.equal(largeDisk.effectiveMaxConcurrency, 4);
@@ -329,14 +333,14 @@ test('daily project and trajectory counters are unlimited by default', () => {
 });
 
 test('pipeline stages reserve capacity according to their resource cost', () => {
-  assert.deepEqual(pipelineStageResourceProfile('project_plan'), { pool: 'codex-structured', limit: 2, weight: 1 });
-  assert.deepEqual(pipelineStageResourceProfile('codex_injection_plan'), { pool: 'codex-structured', limit: 2, weight: 1 });
-  assert.deepEqual(pipelineStageResourceProfile('codex_injection'), { pool: 'codex-structured', limit: 2, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('project_plan'), { pool: 'codex-structured', limit: 4, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('codex_injection_plan'), { pool: 'codex-structured', limit: 4, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('codex_injection'), { pool: 'codex-structured', limit: 4, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('project_generate'), { pool: 'project-generation', limit: 4, weight: 1 });
-  assert.deepEqual(pipelineStageResourceProfile('bug1_bug_discovery'), { pool: 'compute-analysis', limit: 4, weight: 1 });
-  assert.deepEqual(pipelineStageResourceProfile('bug1_bug_source_prepare'), { pool: 'compute-analysis', limit: 4, weight: 1 });
-  assert.deepEqual(pipelineStageResourceProfile('bug1_claude_fix'), { pool: 'compute-repair', limit: 2, weight: 1 });
-  assert.deepEqual(pipelineStageResourceProfile('bug1_test_author'), { pool: 'codex-structured', limit: 2, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('bug1_bug_discovery'), { pool: 'compute-analysis', limit: 6, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('bug1_bug_source_prepare'), { pool: 'compute-analysis', limit: 6, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('bug1_claude_fix'), { pool: 'compute-repair', limit: 6, weight: 1 });
+  assert.deepEqual(pipelineStageResourceProfile('bug1_test_author'), { pool: 'codex-structured', limit: 4, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('bug1_red_green'), { pool: 'compute-docker', limit: 2, weight: 1 });
   assert.deepEqual(pipelineStageResourceProfile('bug1_docker_validation'), { pool: 'compute-docker', limit: 2, weight: 1 });
   assert.equal(pipelineStageWeight('bug1_pre_verify'), 1);
@@ -366,7 +370,7 @@ test('two legacy Gold-heavy jobs still leave two global runner slots for project
   ];
   const pools = pipelineResourcePoolState(jobs, 4);
   assert.deepEqual(pools['codex-structured'], {
-    pool: 'codex-structured', limit: 2, occupied: 0, available: 2,
+    pool: 'codex-structured', limit: 4, occupied: 0, available: 4,
   });
   assert.deepEqual(pools['compute-heavy'], {
     pool: 'compute-heavy', limit: 2, occupied: 2, available: 0,
@@ -383,7 +387,7 @@ test('two Sol Bug discovery stages use the lightweight analysis pool', () => {
   ];
   const pools = pipelineResourcePoolState(jobs, 2);
   assert.deepEqual(pools['compute-analysis'], {
-    pool: 'compute-analysis', limit: 4, occupied: 2, available: 2,
+    pool: 'compute-analysis', limit: 6, occupied: 2, available: 4,
   });
   assert.equal(pipelineStageStartCapacity(jobs, 'bug2_bug_discovery', 2).allowed, false);
   assert.equal(pipelineStageWeight('bug1_bug_discovery'), 1);
@@ -396,7 +400,7 @@ test('two Claude repair stages use the lightweight repair pool', () => {
   ];
   const pools = pipelineResourcePoolState(jobs, 2);
   assert.deepEqual(pools['compute-repair'], {
-    pool: 'compute-repair', limit: 2, occupied: 2, available: 0,
+    pool: 'compute-repair', limit: 6, occupied: 2, available: 4,
   });
   assert.equal(pipelineStageStartCapacity(jobs, 'bug3_claude_fix', 2).allowed, false);
   assert.equal(pipelineStageWeight('bug1_claude_fix'), 1);
@@ -449,10 +453,10 @@ test('stopped workbench cursors do not reserve the Claude repair pool', () => {
     ],
   }], 2);
   assert.deepEqual(pools['compute-repair'], {
-    pool: 'compute-repair', limit: 2, occupied: 0, available: 2,
+    pool: 'compute-repair', limit: 6, occupied: 0, available: 6,
   });
   assert.deepEqual(pools['codex-structured'], {
-    pool: 'codex-structured', limit: 2, occupied: 1, available: 1,
+    pool: 'codex-structured', limit: 4, occupied: 1, available: 3,
   });
 });
 
@@ -476,7 +480,7 @@ test('queued Bug workers do not reserve test-author capacity before they run', (
     ],
   }], 2);
   assert.deepEqual(pools['codex-structured'], {
-    pool: 'codex-structured', limit: 2, occupied: 1, available: 1,
+    pool: 'codex-structured', limit: 4, occupied: 1, available: 3,
   });
 });
 
@@ -524,18 +528,18 @@ test('project pools cannot bypass the global dynamic limit', () => {
   assert.equal(pipelineStageStartCapacity(jobs, 'project_plan', 4).allowed, false);
   assert.equal(pipelineStageStartCapacity(jobs, 'project_generate', 4).allowed, false);
   assert.deepEqual(pipelineResourcePoolState(jobs, 2)['codex-structured'], {
-    pool: 'codex-structured', limit: 2, occupied: 2, available: 0, waiting: 2,
+    pool: 'codex-structured', limit: 4, occupied: 4, available: 0,
   });
 });
 
 test('resource pool reporting uses live cross-runner leases and separates waiters', () => {
-  const jobs = Array.from({ length: 4 }, (_, index) => ({
+  const jobs = Array.from({ length: 8 }, (_, index) => ({
     id: `repair-${index + 1}`,
     status: 'running',
     currentStage: `bug${index + 1}_claude_fix`,
   }));
   assert.deepEqual(pipelineResourcePoolState(jobs, 4, { 'compute-repair': 2 })['compute-repair'], {
-    pool: 'compute-repair', limit: 2, occupied: 2, available: 0, waiting: 2,
+    pool: 'compute-repair', limit: 6, occupied: 2, available: 4, waiting: 2,
   });
 });
 
@@ -544,7 +548,7 @@ test('stage admission uses live leases instead of counting internal waiters as o
     id: `analysis-${jobIndex + 1}`,
     status: 'running',
     currentStage: `bug${jobIndex + 1}_bug_source_prepare`,
-    bugs: Array.from({ length: jobIndex === 0 ? 2 : 1 }, (_, bugIndex) => ({
+    bugs: Array.from({ length: 2 }, (_, bugIndex) => ({
       workerExecution: {
         status: 'fast_lane_running',
         currentStage: `bug${jobIndex * 2 + bugIndex + 1}_bug_source_prepare`,
@@ -558,7 +562,7 @@ test('stage admission uses live leases instead of counting internal waiters as o
   });
   assert.equal(capacity.allowed, true);
   assert.equal(capacity.occupied, 2);
-  assert.equal(capacity.available, 2);
+  assert.equal(capacity.available, 4);
 });
 
 test('independent verification and Gold pools no longer need cross-lane fairness', () => {

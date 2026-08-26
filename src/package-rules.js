@@ -1,6 +1,7 @@
 import { goEmbeddedDistDirectories, isGoEmbeddedDistPath } from './embedded-assets.js';
 import {
   CURRENT_PROJECT_PACKAGE_POLICY_VERSION,
+  MANAGED_PROJECT_PACKAGE_POLICY_VERSION,
   isBugReproPath,
   projectPackageRuleOptions,
   validateReadmeProjectIntroduction,
@@ -117,7 +118,8 @@ export function normalizePackageEntries(entries) {
 export function validateGoPackage(rawEntries, options = {}) {
   const { enforcePinnedToolchain = true } = options;
   const packageOptions = projectPackageRuleOptions(options);
-  const usesCurrentPolicy = packageOptions.projectPackagePolicyVersion >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION;
+  const usesManagedPolicy = packageOptions.projectPackagePolicyVersion >= MANAGED_PROJECT_PACKAGE_POLICY_VERSION;
+  const requiresStandardDockerfile = packageOptions.projectPackagePolicyVersion >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION;
   const { rootPrefix, entries } = normalizePackageEntries(rawEntries);
   const entryMap = new Map(entries.map((entry) => [entry.path, entry]));
   const paths = [...entryMap.keys()];
@@ -134,6 +136,7 @@ export function validateGoPackage(rawEntries, options = {}) {
   for (const filename of PACKAGE_REQUIRED_FILES) {
     if (!entryMap.has(filename)) add(`Git 项目根目录缺少 ${filename}`);
   }
+  if (requiresStandardDockerfile && !entryMap.has('Dockerfile')) addPolicy('Git 项目根目录缺少 Dockerfile');
   const goMod = asText(entryMap.get('go.mod')?.content);
   const hasModuleDependencies = /^\s*require(?:\s|\()/im.test(goMod);
   if (entryMap.has('go.mod') && !/^\s*go\s+\d+\.\d+(?:\.\d+)?\s*(?:\/\/[^\n]*)?$/im.test(goMod)) add('go.mod 必须包含明确的 go 语言版本指令（例如 go 1.23）');
@@ -152,12 +155,13 @@ export function validateGoPackage(rawEntries, options = {}) {
   if (frontendDir && !entryMap.has(`${frontendDir}/package-lock.json`)) add(`${frontendDir}/ 缺少 package-lock.json`);
 
   const dockerfile = asText(entryMap.get('benzhi.Dockerfile')?.content);
+  const standardDockerfile = asText(entryMap.get('Dockerfile')?.content);
   const dockerignore = asText(entryMap.get('.dockerignore')?.content);
   const bugReproEntries = entries.filter((entry) => isBugReproPath(entry.path));
-  if (usesCurrentPolicy && bugReproEntries.length) {
+  if (usesManagedPolicy && bugReproEntries.length) {
     addPolicy(`新项目不能包含 BUG_REPRO.md：${bugReproEntries.slice(0, 3).map((entry) => entry.path).join('、')}`);
   }
-  const bugRepro = usesCurrentPolicy
+  const bugRepro = usesManagedPolicy
     ? inspectExpectedFailureCommands(packageOptions.expectedFailureCommands, packageOptions.expectedFailureCommands.length > 0)
     : inspectBugRepro(entryMap.get('BUG_REPRO.md')?.content);
   const ignoredDockerTestPaths = dockerignore
@@ -166,8 +170,11 @@ export function validateGoPackage(rawEntries, options = {}) {
     .filter((line) => line && !line.startsWith('#') && !line.startsWith('!'))
     .filter((line) => /(?:^|\/)testdata(?:\/|$)|_test\.go(?:$|\s)/i.test(line));
   if (ignoredDockerTestPaths.length) add(`.dockerignore 不能排除公开测试源码或 testdata：${ignoredDockerTestPaths.slice(0, 3).join('、')}`);
-  if (!usesCurrentPolicy && entryMap.has('BUG_REPRO.md') && !bugRepro.commands.length) add('BUG_REPRO.md 必须在 shell 代码块中写明用于复现故障的 go build、go test、go run 或 npm run build 命令');
-  if (!usesCurrentPolicy && entryMap.has('BUG_REPRO.md') && !bugRepro.declaresExpectedFailure) add('BUG_REPRO.md 必须明确说明复现命令预期失败或报错');
+  if (!usesManagedPolicy && entryMap.has('BUG_REPRO.md') && !bugRepro.commands.length) add('BUG_REPRO.md 必须在 shell 代码块中写明用于复现故障的 go build、go test、go run 或 npm run build 命令');
+  if (!usesManagedPolicy && entryMap.has('BUG_REPRO.md') && !bugRepro.declaresExpectedFailure) add('BUG_REPRO.md 必须明确说明复现命令预期失败或报错');
+  if (requiresStandardDockerfile && entryMap.has('Dockerfile') && dockerfile && standardDockerfile !== dockerfile) {
+    addPolicy('Dockerfile 必须与系统维护的 benzhi.Dockerfile 完全一致');
+  }
   if (dockerfile) {
     if (/^\s*#\s*syntax\s*=/im.test(dockerfile)) add('benzhi.Dockerfile 禁止使用外部 # syntax= 前端指令，必须使用系统维护的内置 Dockerfile 语法');
     const fromLines = dockerfile.match(/^\s*FROM\s+[^\n]+/gim) || [];
@@ -175,7 +182,7 @@ export function validateGoPackage(rawEntries, options = {}) {
     const systemTemplate = templateMatch?.[1] || '';
     if (systemTemplate) {
       if (fromLines.length !== 2) add('系统 Docker 交付模板必须包含 benzhi-build 与 benzhi-runtime 两个固定阶段');
-      if (!/^\s*FROM\s+--platform=\$BUILDPLATFORM\s+golang:[^\s]+\s+AS\s+benzhi-build\s*$/im.test(dockerfile)) add('系统 Docker 模板必须在 BUILDPLATFORM 上执行 Go 原生交叉编译');
+      if (!/^\s*FROM\s+golang:[^\s]+\s+AS\s+benzhi-build\s*$/im.test(dockerfile)) add('系统 Docker 模板构建阶段必须兼容不注入 BUILDPLATFORM 的云端 Docker builder');
       if (!/^\s*FROM\s+golang:[^\s]+\s+AS\s+benzhi-runtime\s*$/im.test(dockerfile)) add('系统 Docker 模板必须使用固定 benzhi-runtime 运行阶段');
       if (frontendDir && systemTemplate !== 'frontend-v2') add('包含前端的项目必须使用系统 frontend-v2 Docker 模板');
       if (!frontendDir && systemTemplate !== 'backend-v2') add('纯后端项目必须使用系统 backend-v2 Docker 模板');
@@ -202,7 +209,7 @@ export function validateGoPackage(rawEntries, options = {}) {
     const dockerfileLogicalLines = dockerfile.replace(/\\[ \t]*(?:\r?\n|$)/g, ' ');
     if (!/^\s*RUN\b[^\n]*\bgo\s+mod\s+download\b/im.test(dockerfileLogicalLines) && !vendorAllowed && hasModuleDependencies) add('benzhi.Dockerfile 必须在构建阶段执行 go mod download；仅无外部依赖或明确使用 -mod=vendor 时可以例外');
     if (!/RUN[^\n]*\bgo\s+build\s+\.\/\.\.\./i.test(dockerfile) && !bugRepro.hasGoBuildCommand) {
-      add(usesCurrentPolicy
+      add(usesManagedPolicy
         ? 'benzhi.Dockerfile 必须执行 go build ./...；仅任务元数据明确声明构建预期失败时可以例外'
         : 'benzhi.Dockerfile 必须执行 go build ./...；若题目故意保留 Go 构建 Bug，需用 BUG_REPRO.md 说明复现命令和预期失败');
     }
@@ -217,7 +224,7 @@ export function validateGoPackage(rawEntries, options = {}) {
       if (!new RegExp(`COPY\\s+${escapedFrontendDir}/package\\*\\.json`, 'i').test(dockerfile)) add(`benzhi.Dockerfile 必须先复制 ${frontendDir}/package*.json 以缓存前端依赖`);
       if (!new RegExp(`(?:cd|--prefix)\\s+${escapedFrontendDir}[^\\n]*npm\\s+(?:ci|install)`, 'i').test(dockerfile)) add(`benzhi.Dockerfile 必须在构建阶段通过 npm ci 或 npm install 预装 ${frontendDir}/ 前端依赖`);
       if (!new RegExp(`(?:cd|--prefix)\\s+${escapedFrontendDir}[^\\n]*npm\\s+run\\s+build`, 'i').test(dockerfile) && !bugRepro.hasFrontendCommand) {
-        add(usesCurrentPolicy
+        add(usesManagedPolicy
           ? `benzhi.Dockerfile 必须验证 ${frontendDir}/ 前端构建；仅任务元数据明确声明前端构建预期失败时可以例外`
           : `benzhi.Dockerfile 必须验证 ${frontendDir}/ 前端构建；若题目故意保留前端构建 Bug，需用 BUG_REPRO.md 说明复现命令和预期失败`);
       }
@@ -248,7 +255,7 @@ export function validateGoPackage(rawEntries, options = {}) {
   }
 
   if (readme) {
-    if (usesCurrentPolicy) {
+    if (usesManagedPolicy) {
       for (const issue of validateReadmeProjectIntroduction(readme, packageOptions).issues) addPolicy(issue);
     }
     if (!/build_benzhi_docker\.sh/i.test(readme) || !/docker\s+run/i.test(readme)) add('BENZHI_README.md 必须包含镜像构建和 docker run 命令');

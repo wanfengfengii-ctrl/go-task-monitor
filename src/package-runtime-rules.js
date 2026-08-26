@@ -1,6 +1,6 @@
 import { inspectBugRepro, normalizePackageEntries } from './package-rules.js';
 import {
-  CURRENT_PROJECT_PACKAGE_POLICY_VERSION,
+  MANAGED_PROJECT_PACKAGE_POLICY_VERSION,
   projectPackageRuleOptions,
 } from './project-package-policy.js';
 
@@ -49,8 +49,8 @@ export function createContainerVerificationPlan(rawEntries, frontendDir = '', op
   const { entries } = normalizePackageEntries(rawEntries);
   const entryMap = new Map(entries.map((entry) => [entry.path, entry]));
   const packageOptions = projectPackageRuleOptions(options);
-  const usesCurrentPolicy = packageOptions.projectPackagePolicyVersion >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION;
-  const expectedFailureCommands = usesCurrentPolicy
+  const usesManagedPolicy = packageOptions.projectPackagePolicyVersion >= MANAGED_PROJECT_PACKAGE_POLICY_VERSION;
+  const expectedFailureCommands = usesManagedPolicy
     ? packageOptions.expectedFailureCommands
     : inspectBugRepro(entryMap.get('BUG_REPRO.md')?.content).commands;
   const readme = asText(entryMap.get('BENZHI_README.md')?.content);

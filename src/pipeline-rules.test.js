@@ -100,6 +100,7 @@ test('project-level manual retry queues failed V3 Bugs instead of starting an em
     workflowVersion: 3,
     status: 'stopped',
     error: '项目仅交付 1/3 个合格 Bug',
+    retryBlockedReason: '流水线阶段连续失败，等待人工重试',
     finishedAt: '2026-08-25T00:00:00.000Z',
     bugs: [
       { bugIndex: 1, disposition: 'delivered' },
@@ -125,6 +126,7 @@ test('project-level manual retry queues failed V3 Bugs instead of starting an em
   assert.equal(job.bugs[2].workerExecution.currentStage, 'bug3_platform_submit');
   assert.equal(job.currentStage, 'bug2_test_author');
   assert.equal(job.error, '');
+  assert.equal(job.retryBlockedReason, undefined);
   assert.equal(job.finishedAt, null);
 });
 
@@ -490,7 +492,8 @@ test('V3 diagnosis runs its single pre-fix proof after the read-only model sessi
   const names = stages.filter((stage) => stage.scope === 'bug').map((stage) => stage.stage);
   assert.ok(names.indexOf('claude_fix') < names.indexOf('pre_verify'));
   assert.ok(names.indexOf('trajectory_validate') < names.indexOf('test_author'));
-  assert.ok(names.indexOf('test_author') < names.indexOf('pre_verify'));
+  assert.ok(names.indexOf('test_author') < names.indexOf('git_publication'));
+  assert.ok(names.indexOf('git_publication') < names.indexOf('pre_verify'));
   assert.equal(names.includes('post_verify'), false);
   assert.equal(names.includes('verification_coverage'), false);
 });
@@ -559,6 +562,7 @@ test('one failed V2 bug can be skipped without discarding completed work or late
   const job = {
     currentStage: 'bug2_claude_fix',
     error: 'trajectory failed',
+    pendingBugRetries: [2, 3],
     bugs: [{ bugIndex: 1 }, { bugIndex: 2 }, { bugIndex: 3 }],
     stages,
   };
@@ -570,6 +574,7 @@ test('one failed V2 bug can be skipped without discarding completed work or late
   assert.equal(job.stages.find((stage) => stage.id === 'bug2_gold_fix').status, 'passed');
   assert.equal(job.stages.find((stage) => stage.id === 'bug2_claude_fix').status, 'skipped');
   assert.equal(job.stages.find((stage) => stage.id === 'bug3_gold_fix').status, 'pending');
+  assert.deepEqual(job.pendingBugRetries, [3]);
   assert.equal(job.currentStage, null);
   assert.equal(job.error, '');
 });

@@ -44,3 +44,18 @@ test('withFileLock reclaims an old dead owner', async () => {
   }
 });
 
+test('withFileLock reclaims an old ownerless lock directory', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'task-monitor-lock-ownerless-'));
+  const lockPath = path.join(root, 'state.lock');
+  try {
+    await fsp.mkdir(lockPath);
+    await fsp.writeFile(path.join(lockPath, 'owner.json'), '');
+    const old = new Date(Date.now() - 20 * 60_000);
+    await fsp.utimes(lockPath, old, old);
+    let entered = false;
+    await withFileLock(lockPath, async () => { entered = true; }, { timeoutMs: 1000, retryMs: 5, staleMs: 1 });
+    assert.equal(entered, true);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});

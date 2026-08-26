@@ -65,11 +65,17 @@ export function verificationExportMetadataIssues(metadata = {}, { aggregatedVeri
       if (!/^[a-f0-9]{64}$/i.test(String(metadata.verification_fixture_sha256 || ''))) {
         issues.push('diagnosis private-fixture 必须声明有效的 verification_fixture_sha256');
       }
-      if (metadata.verification_fixture_materialized === true || metadata.verification_fixture_published === true) {
-        issues.push('diagnosis 外置验证测试禁止写入工作区或 Git 分支');
-      }
+      issues.push('diagnosis private-fixture 只是测试作者阶段的中间态，导出前必须由系统发布到 red 分支并切换为 repository-tests');
     } else if (testFiles.length && overlay !== 'repository-tests') {
       issues.push('V5 含 verification_test_files 的任务必须使用 verification_test_overlay=repository-tests');
+    }
+    if (taskType === 'diagnosis' && overlay === 'repository-tests') {
+      if (metadata.verification_test_published !== true || metadata.verification_fixture_published !== true) {
+        issues.push('diagnosis repository-tests 必须已由系统发布到 red 分支');
+      }
+      if (String(metadata.verification_test_storage || '') !== 'repository-red-branch') {
+        issues.push('diagnosis 已发布验证测试必须声明 verification_test_storage=repository-red-branch');
+      }
     }
     for (const filename of testFiles) {
       if (filename.startsWith('/') || filename.split(/[\\/]/).includes('..') || !filename.endsWith('_test.go')) {

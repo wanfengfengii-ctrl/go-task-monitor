@@ -17,6 +17,7 @@ import { goEmbeddedDistDirectories } from '../src/embedded-assets.js';
 import { findFrontendDir, scanAnswerLeakage } from '../src/package-rules.js';
 import {
   CURRENT_PROJECT_PACKAGE_POLICY_VERSION,
+  MANAGED_PROJECT_PACKAGE_POLICY_VERSION,
   isBugReproPath,
   projectPackageRuleOptions,
   validateProjectPackagePlan,
@@ -81,7 +82,7 @@ import {
 } from '../src/bug-policy.js';
 import { assessProjectDomain, prohibitedProjectDomainPolicyText } from '../src/project-domain-rules.js';
 import { buildVerificationResult, VERIFICATION_POLICY_VERSION } from '../src/verification-evidence.js';
-import { directPublicVerifyCommandIssues, isConcurrencyVerificationRecord, verificationCommandsSha256 } from '../src/verification-proof.js';
+import { directPublicVerifyCommandIssues, goTargetTestRedIssues, isConcurrencyVerificationRecord, validateVerificationProofBundle, verificationCommandsSha256 } from '../src/verification-proof.js';
 import { verificationTestNamesFromCommand, buildModelVerificationPlan, goTestNames, isTableDrivenGoTest, modelVerificationPlanIssues, verificationTestPackage } from '../src/model-verification.js';
 import { normalizeDiagnosisPublicCommand, normalizeDiagnosisVerificationSource } from '../src/diagnosis-verification.js';
 import {
@@ -102,6 +103,7 @@ import { selectClaudeGateway } from './select-claude-gateway.mjs';
 const monitorRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectValidatorPath = path.join(monitorRoot, 'scripts/validate-go-package.mjs');
 const trajectoryValidatorPath = path.join(monitorRoot, 'scripts/validate-trajectories.mjs');
+const v4GitPublisherPath = path.join(monitorRoot, 'scripts/publish-v4-git-layout.sh');
 const taskRunnerPath = path.join(monitorRoot, 'run_one_claude.sh');
 const verificationRunnerPath = path.join(monitorRoot, 'run_verify_claude.sh');
 const codexBin = process.env.GO_PIPELINE_CODEX_BIN || 'codex';
@@ -199,18 +201,21 @@ const configuredClaudeFixTimeoutMs = Number(process.env.GO_PIPELINE_CLAUDE_FIX_T
 const CLAUDE_FIX_TIMEOUT_MS = Number.isFinite(configuredClaudeFixTimeoutMs) && configuredClaudeFixTimeoutMs > 0
   ? configuredClaudeFixTimeoutMs
   : 120 * 60_000;
-// File progress is recorded for observability only. A repair Session may spend
-// a long time reading ordinary source before its first edit, so never kill a
-// healthy child merely because 1200 seconds passed without a file mutation.
-// The explicit command budget and activity-aware idle guard remain in force.
-const configuredClaudeFixProgressTimeoutMs = Number(process.env.GO_PIPELINE_CLAUDE_FIX_PROGRESS_TIMEOUT_MS || 0);
+// Tool output proves liveness, not repair progress. Allow a generous initial
+// analysis window, then recycle Sessions that keep consuming a repair slot
+// without changing the isolated workspace.
+const configuredClaudeFixProgressTimeoutMs = Number(process.env.GO_PIPELINE_CLAUDE_FIX_PROGRESS_TIMEOUT_MS || 15 * 60_000);
 const CLAUDE_FIX_PROGRESS_TIMEOUT_MS = Number.isFinite(configuredClaudeFixProgressTimeoutMs) && configuredClaudeFixProgressTimeoutMs > 0
   ? configuredClaudeFixProgressTimeoutMs
-  : 0;
-const configuredClaudeFixInitialProgressGraceMs = Number(process.env.GO_PIPELINE_CLAUDE_FIX_INITIAL_PROGRESS_GRACE_MS || 0);
+  : 15 * 60_000;
+const configuredClaudeFixInitialProgressGraceMs = Number(process.env.GO_PIPELINE_CLAUDE_FIX_INITIAL_PROGRESS_GRACE_MS || 15 * 60_000);
 const CLAUDE_FIX_INITIAL_PROGRESS_GRACE_MS = Number.isFinite(configuredClaudeFixInitialProgressGraceMs) && configuredClaudeFixInitialProgressGraceMs > 0
   ? configuredClaudeFixInitialProgressGraceMs
-  : 0;
+  : 15 * 60_000;
+const configuredClaudeEditRequiredTimeoutMs = Number(process.env.GO_PIPELINE_CLAUDE_EDIT_REQUIRED_TIMEOUT_MS || 4 * 60_000);
+const CLAUDE_EDIT_REQUIRED_TIMEOUT_MS = Number.isFinite(configuredClaudeEditRequiredTimeoutMs) && configuredClaudeEditRequiredTimeoutMs > 0
+  ? configuredClaudeEditRequiredTimeoutMs
+  : 4 * 60_000;
 // Natural Bug discovery may need a full cross-package read and a temporary
 // reproduction harness before it can emit the structured candidate pool. Give
 // each parallel partition enough time to finish rather than treating a slow
@@ -313,6 +318,7 @@ const RESOURCE_SLOT_ACQUIRE_GRACE_MS = 30_000;
 const FAST_COPY_MODE = fs.constants.COPYFILE_FICLONE || 0;
 const activeChildren = new Set();
 let activeJobFile = '';
+let runnerStopping = false;
 let runnerHeartbeatTimer = null;
 let jobUpdateTail = Promise.resolve();
 const publicMetadataUpdateTails = new Map();
@@ -644,8 +650,9 @@ export function bugfixModel(environment = process.env) {
 }
 
 export function bugfixEffort(attempt = 1, environment = process.env) {
-  const retry = Number(attempt) > 1;
-  const fallback = retry ? 'medium' : 'low';
+  const normalizedAttempt = Number(attempt);
+  const retry = normalizedAttempt > 1;
+  const fallback = normalizedAttempt >= 3 ? 'high' : retry ? 'medium' : 'low';
   const configured = String(retry
     ? environment.GO_PIPELINE_BUGFIX_RETRY_EFFORT || fallback
     : environment.GO_PIPELINE_BUGFIX_EFFORT || fallback).trim().toLowerCase();
@@ -668,6 +675,23 @@ function projectGeneratorEnvironment(config, isolatedConfigDir = '') {
       CLAUDE_CODE_EFFORT_LEVEL: config.effort,
     },
     unsetEnv: [],
+  };
+}
+
+export async function createProjectDockerEnvironment(environment = process.env) {
+  const dockerConfigRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-pipeline-public-docker-config-'));
+  const desktopPluginDir = '/Applications/Docker.app/Contents/Resources/cli-plugins';
+  const config = { auths: {} };
+  if (await fsp.stat(desktopPluginDir).catch(() => null)) config.cliPluginsExtraDirs = [desktopPluginDir];
+  const configPath = path.join(dockerConfigRoot, 'config.json');
+  await fsp.writeFile(configPath, `${JSON.stringify(config)}\n`, 'utf8');
+  return {
+    env: {
+      DOCKER_CONFIG: dockerConfigRoot,
+      BUILDX_CONFIG: environment.BUILDX_CONFIG || path.join(os.homedir(), '.docker/buildx'),
+    },
+    configPath,
+    cleanup: () => fsp.rm(dockerConfigRoot, { recursive: true, force: true }),
   };
 }
 
@@ -1320,7 +1344,7 @@ export function projectGenerationPrompt(plan, { phase = 'complete', failure = ''
     'Do not intentionally inject a known bug, weaken tests, or leave answer/solution artifacts.',
     'Never access, modify, rename, or delete anything outside the current directory. Never run rm -rf with an absolute path or a parent-directory target.',
     `Read ${GENERATED_PROJECT_SPEC_FILE} before inspecting or writing Go code. It is the approved source of truth and must not be modified, replaced, or deleted during code generation.`,
-    ...(Number(plan.project_package_policy_version || 0) >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION ? [
+    ...(Number(plan.project_package_policy_version || 0) >= MANAGED_PROJECT_PACKAGE_POLICY_VERSION ? [
       'Never create BUG_REPRO.md in the repository or any subdirectory. Bug reproduction evidence belongs to external task metadata, not project files.',
       `BENZHI_README.md must begin with this exact single-line project introduction before its heading: ${plan.project_summary}`,
     ] : []),
@@ -1348,7 +1372,7 @@ export function projectGenerationPrompt(plan, { phase = 'complete', failure = ''
           'Complete the existing Go project foundation according to every applicable item in the supplied plan.',
           'If go.mod is missing, create it as your first filesystem action. Inspect and extend existing files instead of restarting or replacing working code.',
           `The final project must be non-trivial and usable: at least ${targetProductionFiles} production Go files and ${targetProductionLines} effective production Go lines excluding tests${largeProject ? '' : ' (target about 2500 lines and keep the standard project near 2000-3000 lines)'}, across at least 4 meaningful packages, with real persistence and restart recovery, at least 4 public test files containing at least 12 public tests, and enough state/error/control-flow logic to exercise the planned behavior. These numeric thresholds are eligibility floors, not permission to invent code. Every counted file and line must implement documented behavior and be reachable from the executable. Blank lines, comments, generated padding, repeated declarations, frontend code, test-only inflation, unused packages, and duplicate implementations do not count. Do not submit a thin domain-only demo.`,
-          'The repository root must include benzhi.Dockerfile, build_benzhi_docker.sh, BENZHI_README.md, and run_benzhi_smoke.sh. The smoke script must use bash with fail-fast behavior, run a real public CLI command or start the service and probe its local health/API behavior, clean up every process and temporary file, finish deterministically without external network access, and must not merely call go test. With pipefail enabled, never validate a response using curl | grep -q because grep can close the pipe early and make curl fail with SIGPIPE; capture the curl response in a variable and assert that variable instead. Docker must support linux/arm64 and linux/amd64 through the script platform argument, retain a full official Go toolchain, pre-download dependencies, and run go build ./....',
+          `The repository root must include benzhi.Dockerfile${Number(plan.project_package_policy_version || 0) >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION ? ', an identical standard Dockerfile' : ''}, build_benzhi_docker.sh, BENZHI_README.md, and run_benzhi_smoke.sh. The smoke script must use bash with fail-fast behavior, run a real public CLI command or start the service and probe its local health/API behavior, clean up every process and temporary file, finish deterministically without external network access, and must not merely call go test. With pipefail enabled, never validate a response using curl | grep -q because grep can close the pipe early and make curl fail with SIGPIPE; capture the curl response in a variable and assert that variable instead. Docker must support linux/arm64 and linux/amd64 through the script platform argument, retain a full official Go toolchain, pre-download dependencies, and run go build ./....`,
           'Run gofmt, go mod tidy, go test ./..., and go vet ./... before finishing. Every imported module must be declared in go.mod and recorded in go.sum.',
         ];
   return [...instructions, ...common, '', JSON.stringify(plan, null, 2)].join('\n');
@@ -1959,10 +1983,44 @@ async function clearSchedulerAdmission(jobFile, stageId, { release = false } = {
   });
 }
 
+export function orderStageResourceWaiters(waiters = []) {
+  return [...waiters].sort((left, right) => {
+    const leftTime = Date.parse(left?.requestedAt || '') || Number.MAX_SAFE_INTEGER;
+    const rightTime = Date.parse(right?.requestedAt || '') || Number.MAX_SAFE_INTEGER;
+    if (leftTime !== rightTime) return leftTime - rightTime;
+    return String(left?.id || '').localeCompare(String(right?.id || ''));
+  });
+}
+
+export function stageResourceWaiterId(jobFile, stageId, waiterKey = '', nonce = crypto.randomUUID()) {
+  return crypto.createHash('sha256')
+    .update(`${path.resolve(jobFile)}\0${stageId}\0${waiterKey}\0${nonce}`)
+    .digest('hex')
+    .slice(0, 20);
+}
+
+async function structuredCodexWaiterHasTurn(poolRoot, waiterPath) {
+  const entries = await fsp.readdir(poolRoot, { withFileTypes: true }).catch(() => []);
+  const waiters = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith('waiter-') || !entry.name.endsWith('.json')) continue;
+    const filename = path.join(poolRoot, entry.name);
+    const waiter = await readJson(filename, null);
+    if (!waiter?.pid || !processIsAlive(Number(waiter.pid))) {
+      await fsp.rm(filename, { force: true }).catch(() => {});
+      continue;
+    }
+    waiters.push({ ...waiter, id: entry.name, filename });
+  }
+  return orderStageResourceWaiters(waiters)[0]?.filename === waiterPath;
+}
+
 async function acquireStageResourceSlot(jobFile, stageId, {
   waitForCapacity = false,
   optional = false,
   preserveJobCursor = false,
+  waiterKey = '',
+  workerStageId = '',
 } = {}) {
   const profile = pipelineStageResourceProfile(stageId);
   if (!profile.pool || !profile.limit) return async () => {};
@@ -1970,9 +2028,32 @@ async function acquireStageResourceSlot(jobFile, stageId, {
   const libraryRoot = path.dirname(jobsRoot);
   const poolRoot = path.join(libraryRoot, 'pipeline-refill', 'resource-slots', profile.pool);
   await fsp.mkdir(poolRoot, { recursive: true });
+  const fairWaiterPath = waitForCapacity && profile.pool === 'codex-structured'
+    ? path.join(poolRoot, `waiter-${stageResourceWaiterId(jobFile, stageId, waiterKey)}.json`)
+    : '';
+  const waiterRequestedAt = now();
+  const ensureFairWaiter = async () => {
+    if (!fairWaiterPath) return;
+    const existingWaiter = await readJson(fairWaiterPath, null);
+    if (!existingWaiter || !processIsAlive(Number(existingWaiter.pid))) {
+      await writeJsonAtomic(fairWaiterPath, {
+        pid: process.pid,
+        jobFile: path.resolve(jobFile),
+        stageId,
+        workerStageId,
+        waiterKey,
+        requestedAt: waiterRequestedAt,
+      });
+    }
+  };
+  await ensureFairWaiter();
   let transientAcquireRetries = 0;
   let waitLoggedAt = 0;
   while (true) {
+  // A winning sibling from the same Runner must never be able to strand this
+  // request by deleting a shared waiter. Re-publish our unique ticket if a
+  // cleanup race removes it while capacity is still unavailable.
+  await ensureFairWaiter();
   const effectiveSlotLimit = profile.pool === 'codex-structured'
     ? pipelineStructuredCodexLimit({
         configuredLimit: profile.limit,
@@ -1980,7 +2061,8 @@ async function acquireStageResourceSlot(jobFile, stageId, {
         cpuCount: os.cpus().length,
       })
     : profile.limit;
-  for (let slot = 1; slot <= effectiveSlotLimit; slot += 1) {
+  const fairWaiterHasTurn = !fairWaiterPath || await structuredCodexWaiterHasTurn(poolRoot, fairWaiterPath);
+  for (let slot = 1; fairWaiterHasTurn && slot <= effectiveSlotLimit; slot += 1) {
     const slotDir = path.join(poolRoot, `slot-${slot}`);
     const ownerPath = path.join(slotDir, 'owner.json');
     try {
@@ -1989,8 +2071,34 @@ async function acquireStageResourceSlot(jobFile, stageId, {
         pid: process.pid,
         jobFile: path.resolve(jobFile),
         stageId,
+        workerStageId,
         acquiredAt: now(),
       });
+      if (fairWaiterPath) await fsp.rm(fairWaiterPath, { force: true }).catch(() => {});
+      if (workerStageId) {
+        try {
+          const acquiredAt = now();
+          await updateJob(jobFile, (current) => {
+            const stageBugIndex = Number(String(workerStageId).match(/^bug(\d+)_/)?.[1]);
+            const bug = Number.isInteger(stageBugIndex)
+              ? (current.bugs || []).find((item) => Number(item.bugIndex) === stageBugIndex)
+              : null;
+            if (!bug) return;
+            bug.workerExecution = {
+              ...(bug.workerExecution || {}),
+              status: 'fast_lane_running',
+              currentStage: workerStageId,
+              startedAt: bug.workerExecution?.startedAt || acquiredAt,
+              updatedAt: acquiredAt,
+              lastHeartbeatAt: acquiredAt,
+              blockedReason: '',
+            };
+          });
+        } catch (error) {
+          await fsp.rm(slotDir, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
+      }
       return async () => {
         const owner = await readJson(ownerPath, null);
         if (Number(owner?.pid) === process.pid && owner?.jobFile === path.resolve(jobFile) && owner?.stageId === stageId) {
@@ -2007,7 +2115,10 @@ async function acquireStageResourceSlot(jobFile, stageId, {
         await new Promise((resolve) => setTimeout(resolve, 25));
         continue;
       }
-      if (error.code !== 'EEXIST') throw error;
+      if (error.code !== 'EEXIST') {
+        if (fairWaiterPath) await fsp.rm(fairWaiterPath, { force: true }).catch(() => {});
+        throw error;
+      }
       const owner = await readJson(ownerPath, null);
       if (owner?.pid) {
         if (!processIsAlive(Number(owner.pid))) await fsp.rm(slotDir, { recursive: true, force: true });
@@ -2022,38 +2133,45 @@ async function acquireStageResourceSlot(jobFile, stageId, {
   if (waitForCapacity) {
     if (Date.now() - waitLoggedAt >= 60_000) {
       waitLoggedAt = Date.now();
-      if (!preserveJobCursor) {
-        await updateJob(jobFile, (current) => {
-          const stageBugIndex = Number(String(stageId).match(/^bug(\d+)_/)?.[1]);
-          const bug = Number.isInteger(stageBugIndex)
-            ? (current.bugs || []).find((item) => Number(item.bugIndex) === stageBugIndex)
-            : null;
-          if (bug) bug.workerExecution = {
-            ...(bug.workerExecution || {}),
-            status: 'fast_lane_queued',
-            currentStage: stageId,
-            startedAt: null,
-            updatedAt: now(),
-            blockedReason: `等待 ${profile.pool} 内部资源`,
-          };
-          const execution = normalizeBugExecution(current.bugExecution);
-          if (stageBugIndex === execution.selectedBugIndex) current.bugExecution = {
-            ...execution,
-            status: 'fast_lane_queued',
-            startedAt: null,
-            currentStage: stageId,
-            updatedAt: now(),
-            blockedReason: `等待 ${profile.pool} 内部资源`,
-          };
-          current.currentStage = stageId;
-        });
-      }
+      const statusStageId = workerStageId || stageId;
+      await updateJob(jobFile, (current) => {
+        const changedAt = now();
+        const stageBugIndex = Number(String(statusStageId).match(/^bug(\d+)_/)?.[1]);
+        const bug = Number.isInteger(stageBugIndex)
+          ? (current.bugs || []).find((item) => Number(item.bugIndex) === stageBugIndex)
+          : null;
+        if (bug) bug.workerExecution = {
+          ...(bug.workerExecution || {}),
+          status: 'fast_lane_queued',
+          currentStage: statusStageId,
+          startedAt: null,
+          updatedAt: changedAt,
+          lastHeartbeatAt: changedAt,
+          blockedReason: `等待 ${profile.pool} 内部资源`,
+        };
+        if (preserveJobCursor) return;
+        const execution = normalizeBugExecution(current.bugExecution);
+        if (stageBugIndex === execution.selectedBugIndex) current.bugExecution = {
+          ...execution,
+          status: 'fast_lane_queued',
+          startedAt: null,
+          currentStage: statusStageId,
+          updatedAt: changedAt,
+          lastHeartbeatAt: changedAt,
+          blockedReason: `等待 ${profile.pool} 内部资源`,
+        };
+        current.currentStage = statusStageId;
+      });
       await appendLog(jobFile, 'info', `${currentStageLabel(stageId)}等待 ${profile.pool} 内部资源；同项目其他 Bug 继续运行`, stageId);
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));
     continue;
   }
-  if (optional) return null;
+  if (optional) {
+    if (fairWaiterPath) await fsp.rm(fairWaiterPath, { force: true }).catch(() => {});
+    return null;
+  }
+  if (fairWaiterPath) await fsp.rm(fairWaiterPath, { force: true }).catch(() => {});
   await yieldToCentralScheduler(jobFile, stageId, 'pool_full');
   }
 }
@@ -2287,6 +2405,19 @@ async function hasActiveWorkProcess(rootPid) {
 }
 
 function runCommand(command, args, options = {}) {
+  if (runnerStopping) {
+    return Promise.resolve({
+      command,
+      exitCode: null,
+      signal: 'SIGTERM',
+      error: 'Pipeline Runner 正在停止，未启动新的子进程',
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      progressTimedOut: false,
+      durationMs: 0,
+    });
+  }
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const stdoutStream = options.stdoutPath ? fs.createWriteStream(options.stdoutPath, { flags: 'w' }) : null;
@@ -2459,6 +2590,8 @@ function runCommand(command, args, options = {}) {
     const progressTimeoutMs = Number(options.progressTimeoutMs || 0);
     const initialProgressGraceMs = Number(options.initialProgressGraceMs || 0);
     const activeWorkGraceMs = Number(options.activeWorkGraceMs || 0);
+    const editRequiredPath = String(options.editRequiredPath || '').trim();
+    const editRequiredTimeoutMs = Number(options.editRequiredTimeoutMs || 0);
     const progressDeadlineEnabled = Boolean(progressPaths.length || progressTreePaths.length || activityPaths.length)
       && Number.isFinite(progressTimeoutMs) && progressTimeoutMs > 0;
     const activityObserverEnabled = activityPaths.length > 0
@@ -2545,6 +2678,18 @@ function runCommand(command, args, options = {}) {
         // workspace clock indefinitely: repeated Go/Docker commands without a
         // source, test, checkpoint, or phase transition are still a stall.
         const checkedAt = Date.now();
+        const editRequiredStat = editRequiredPath
+          ? await fsp.stat(editRequiredPath).catch(() => null)
+          : null;
+        if (!hasRealProgress
+          && editRequiredStat?.isFile()
+          && Number.isFinite(editRequiredTimeoutMs)
+          && editRequiredTimeoutMs > 0
+          && checkedAt - editRequiredStat.mtimeMs >= editRequiredTimeoutMs) {
+          const timeoutSeconds = Math.max(1, Math.round(editRequiredTimeoutMs / 1000));
+          terminate(`修复前探索已关闭后连续 ${timeoutSeconds} 秒仍未修改生产源码，已提前终止`, { timeout: true, progress: true });
+          return;
+        }
         if (Number.isFinite(activeWorkGraceMs) && activeWorkGraceMs > 0) {
           const activeWork = await hasActiveWorkProcess(child.pid);
           if (activeWork && activeWorkStartedAt === 0) activeWorkStartedAt = checkedAt;
@@ -2830,6 +2975,8 @@ async function runInjectionCodexJson(options) {
   const releaseStructuredCodex = await acquireStageResourceSlot(options.jobFile, 'codex_injection', {
     waitForCapacity: true,
     preserveJobCursor: true,
+    waiterKey: options.name,
+    workerStageId: options.stageId,
   });
   try {
     return await runCodexJson({
@@ -3211,6 +3358,8 @@ async function preparePrivateVerificationFixture(jobFile, bugIndex, bugBaseDir, 
     timeoutMs: 20 * 60 * 1000,
   });
   if (red.exitCode === 0) throw new Error(`Bug ${bugIndex} 私有验证夹具在 BUG_BASE 上未复现红测`);
+  const redIssues = goTargetTestRedIssues(command, `${red.stdout || ''}\n${red.stderr || ''}`);
+  if (redIssues.length) throw new Error(`Bug ${bugIndex} 私有验证夹具没有形成有效 Red：${redIssues.join('；')}`);
   const value = {
     directory,
     testFile: fixture.testFile,
@@ -3330,6 +3479,8 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
   ];
   const red = await runCommand('go', focusedArgs, { cwd: redDir, env: goEnv, timeoutMs: 20 * 60 * 1000 });
   if (red.exitCode === 0) throw new Error(`Bug ${bugIndex} Codex 回归测试在 BUG_BASE 上未复现红测`);
+  const redIssues = goTargetTestRedIssues(plan.verify_cmds[0], `${red.stdout || ''}\n${red.stderr || ''}`);
+  if (redIssues.length) throw new Error(`Bug ${bugIndex} Codex 回归测试没有形成有效 Red：${redIssues.join('；')}`);
   const green = await runCommand('go', focusedArgs, { cwd: authorDir, env: goEnv, timeoutMs: 20 * 60 * 1000 });
   if (green.exitCode !== 0) throw new Error(`Bug ${bugIndex} Codex 回归测试在修复代码上未通过：exit=${green.exitCode}`);
   const sourceDir = path.join(taskDir, `verification-test-bug${bugIndex}-attempt-${attemptId}`);
@@ -3421,9 +3572,8 @@ async function freezeDiagnosisVerificationTest({
   const red = await runCommand('go', focusedArgs, { cwd: redDir, env: goEnv, timeoutMs: 20 * 60 * 1000 });
   if (red.exitCode === 0) throw new Error(`Bug ${bugIndex} Codex 诊断回归测试在 BUG_BASE 上未复现红测`);
   const output = `${red.stdout || ''}\n${red.stderr || ''}`;
-  if (/\b(?:undefined|cannot find package|no required module provides|build failed)\b/i.test(output)) {
-    throw new Error(`Bug ${bugIndex} Codex 诊断回归测试未能编译并断言目标行为`);
-  }
+  const redIssues = goTargetTestRedIssues(plan.verify_cmds[0], output);
+  if (redIssues.length) throw new Error(`Bug ${bugIndex} Codex 诊断回归测试没有形成有效 Red：${redIssues.join('；')}`);
   const verificationDir = path.join(taskDir, `verification-test-bug${bugIndex}-attempt-${attemptId}`);
   await fsp.mkdir(path.dirname(path.join(verificationDir, descriptor.test_file)), { recursive: true });
   await copyFileReplacing(path.join(authorDir, descriptor.test_file), path.join(verificationDir, descriptor.test_file));
@@ -3740,9 +3890,9 @@ async function prepareV3BugfixGitLayout(jobFile, bugIndex, fixedDir, testFile) {
   return value;
 }
 
-// Diagnosis publishes its immutable source-only R1 before Claude starts. The
-// independent verification test is a system fixture and must never be added
-// to workspace or any submitted Git branch.
+// Diagnosis keeps its main workspace and source-only R1 immutable. After the
+// read-only trajectory, the trusted publisher adds the independent system test
+// only to the submitted Red branch.
 export async function finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, testSourceDir, testFile) {
   const job = await readJson(jobFile);
   const bug = job.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
@@ -3752,7 +3902,28 @@ export async function finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, te
     throw new Error(`Bug ${bugIndex} 缺少 diagnosis R1 工作区或安全外置测试文件`);
   }
   const redBranch = bug.redBranch || numberedRedBranch(bugIndex);
-  const sourceCommit = String(bug.diagnosisSourceCommit || (!bug.redCommit ? bug.bugBaseCommit : '') || '').trim();
+  const existingMetadata = await readJson(path.join(taskDir, 'public.json'));
+  const existingPublishedCommit = String(existingMetadata.red_commit || '');
+  if (existingMetadata.verification_test_overlay === 'repository-tests'
+    && existingMetadata.verification_test_published === true
+    && /^[a-f0-9]{40}$/i.test(existingPublishedCommit)) {
+    const existingRemoteCommit = await remoteHead(job.request.cloneUrl, redBranch, bugBaseDir);
+    if (existingRemoteCommit !== existingPublishedCommit) {
+      throw new Error(`Bug ${bugIndex} diagnosis 已发布测试提交与远端 ${redBranch} 不一致`);
+    }
+    await ensureDiagnosisWorkspaceUnchanged(taskDir, { testFile, sha256: existingMetadata.verification_test_sha256 });
+    await updateJob(jobFile, (current) => {
+      const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+      Object.assign(currentBug, {
+        redBranch,
+        redCommit: existingPublishedCommit,
+        bugBaseCommit: existingPublishedCommit,
+        diagnosisVerificationTestSha256: existingMetadata.verification_test_sha256,
+      });
+    });
+    return { redCommit: existingPublishedCommit, redBranch, testSha: existingMetadata.verification_test_sha256, publishedTest: true, reused: true };
+  }
+  const sourceCommit = String(bug.diagnosisSourceCommit || bug.redCommit || bug.bugBaseCommit || '').trim();
   let redCommit = String(bug.redCommit || bug.bugBaseCommit || '').trim();
   if (!/^[a-f0-9]{40}$/i.test(sourceCommit)) throw new Error(`Bug ${bugIndex} 缺少 diagnosis 原始源提交`);
   if (!/^[a-f0-9]{40}$/i.test(redCommit)) throw new Error(`Bug ${bugIndex} 缺少 diagnosis 红分支提交`);
@@ -3831,7 +4002,27 @@ export async function finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, te
     diagnosis_workspace_policy_version: 1,
     diagnosis_workspace_unchanged: true,
   }));
-  return { redCommit, redBranch, testSha, sourceOnly: true };
+  const diagnosisSessionId = String(await fsp.readFile(path.join(taskDir, 'trajectory/session_id.txt'), 'utf8').catch(() => '')).trim();
+  if (!diagnosisSessionId) throw new Error(`Bug ${bugIndex} 缺少 diagnosis 主轨迹 Session，不能发布系统验证测试`);
+  const published = await runRequired(
+    `发布 Bug ${bugIndex} diagnosis 系统验证测试`,
+    '/bin/bash',
+    [v4GitPublisherPath, taskDir, path.join(taskDir, 'workspace'), diagnosisSessionId],
+    { cwd: monitorRoot, timeoutMs: 20 * 60 * 1000 },
+  );
+  const publishedCommit = String(published.stdout || '').trim().split(/\r?\n/).filter(Boolean).at(-1) || '';
+  if (!/^[a-f0-9]{40}$/i.test(publishedCommit)) throw new Error(`Bug ${bugIndex} diagnosis Git 发布未返回有效提交`);
+  await updateJob(jobFile, (current) => {
+    const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+    Object.assign(currentBug, {
+      diagnosisSourceCommit: sourceCommit,
+      redBranch,
+      redCommit: publishedCommit,
+      bugBaseCommit: publishedCommit,
+      diagnosisVerificationTestSha256: testSha,
+    });
+  });
+  return { redCommit: publishedCommit, redBranch, testSha, publishedTest: true };
 }
 
 export async function existingDiagnosisVerificationPlan(root, command) {
@@ -3952,7 +4143,7 @@ async function writeFileIfChanged(filename, content) {
 
 async function normalizeProjectSupportFiles(projectDir, plan) {
   const packageOptions = projectPackageRuleOptions(plan);
-  if (packageOptions.projectPackagePolicyVersion >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION) {
+  if (packageOptions.projectPackagePolicyVersion >= MANAGED_PROJECT_PACKAGE_POLICY_VERSION) {
     const removeBugReproFiles = async (directory) => {
       for (const child of await fsp.readdir(directory, { withFileTypes: true })) {
         if (child.name === '.git') continue;
@@ -4027,7 +4218,7 @@ async function validateGeneratedProjectDelivery(jobFile, projectDir, plan) {
   let repairCount = 0;
   let checkpointHits = 0;
   const packageOptions = projectPackageRuleOptions(plan);
-  const packageValidationArgs = packageOptions.projectPackagePolicyVersion >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION
+  const packageValidationArgs = packageOptions.projectPackagePolicyVersion >= MANAGED_PROJECT_PACKAGE_POLICY_VERSION
     ? [
         `--package-policy-version=${packageOptions.projectPackagePolicyVersion}`,
         `--project-type=${packageOptions.projectType}`,
@@ -4577,7 +4768,9 @@ async function runClaudeProjectSession({ jobFile, cwd, plan, phase, failure = ''
   const isolatedConfigDir = generatorConfig.provider === 'deepseek'
     ? await fsp.mkdtemp(path.join(os.tmpdir(), 'go-pipeline-deepseek-claude-config-'))
     : '';
+  const dockerRuntime = await createProjectDockerEnvironment();
   const generatorEnvironment = projectGeneratorEnvironment(generatorConfig, isolatedConfigDir);
+  Object.assign(generatorEnvironment.env, dockerRuntime.env);
   if (generatorConfig.provider === DEFAULT_PROJECT_GENERATOR_PROVIDER) {
     const claudeSettings = await readJson(path.join(os.homedir(), '.claude/settings.json'), {});
     const routing = await projectGeneratorGatewayEnvironment(generatorConfig, { settings: claudeSettings });
@@ -4631,6 +4824,7 @@ async function runClaudeProjectSession({ jobFile, cwd, plan, phase, failure = ''
       modelMismatch,
     };
   } finally {
+    await dockerRuntime.cleanup().catch(() => {});
     if (isolatedConfigDir) await fsp.rm(isolatedConfigDir, { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -5726,6 +5920,7 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
   }
 
   for (let planningAttempt = recoveredPlanningAttempts + 1; planningAttempt <= maxPlanningAttempts; planningAttempt += 1) {
+    const attemptName = planningAttempt === 1 ? key : `${key}-batch-${planningAttempt}`;
     const planningBatch = injectionPlanningBatch(bugIndexes, accepted.length);
     if (planningBatch.totalRemaining <= 0) break;
     const attemptPrompt = [
@@ -5747,6 +5942,8 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
       releaseStructuredCodex = await acquireStageResourceSlot(jobFile, 'codex_injection_plan', {
         waitForCapacity: true,
         preserveJobCursor: true,
+        waiterKey: attemptName,
+        workerStageId: stageId,
       });
       result = await runCodexJson({
         jobFile,
@@ -6131,15 +6328,26 @@ export async function prepareVerificationProofInputs(taskDir, phase, sourceDir) 
     throw new Error(`${phase} 证明前置检查失败：repository-tests 未声明 verification_test_files`);
   }
   const taskWorkspace = path.join(taskDir, 'workspace');
+  const diagnosisRepositoryTests = metadata.task_type === 'diagnosis';
   const recoveryRoots = [
     taskWorkspace,
     path.join(taskDir, '.test-author-checkpoint', 'workspace'),
     path.join(taskDir, 'grader', 'model-tests'),
     path.resolve(String(sourceDir || '')),
+    ...(diagnosisRepositoryTests ? [path.resolve(String(metadata.verification_fixture_dir || ''))] : []),
   ];
   for (const filename of testFiles) {
     if (!safeVerificationTestPath(filename)) {
       throw new Error(`${phase} 证明前置检查失败：验证测试路径不安全：${filename}`);
+    }
+    if (diagnosisRepositoryTests) {
+      const publishedSource = recoveryRoots.find((root) => root
+        && (root === path.resolve(taskDir) || root.startsWith(`${path.resolve(taskDir)}${path.sep}`) || root === path.resolve(String(sourceDir || '')))
+        && fs.existsSync(path.join(root, filename)));
+      if (!publishedSource) {
+        throw new Error(`${phase} 证明前置检查失败：diagnosis 已发布验证测试不存在：${filename}`);
+      }
+      continue;
     }
     const destination = path.join(taskWorkspace, filename);
     let materialized = await fsp.stat(destination).then((stat) => stat.isFile()).catch(() => false);
@@ -7118,9 +7326,9 @@ async function createTask({ job, jobFile, bugIndex, bug, bugRecord, gold, goldDi
     await fsp.writeFile(path.join(taskDir, '.verification-policy-v5'), `main-trajectory=integrity-and-originality-only
 verify-cmds=single-direct-go-test-command-for-bugfix-and-diagnosis
 verification-test-source=independent-codex-test-author-after-repair
-verification-test-overlay=${taskType === 'diagnosis' ? 'private-fixture-after-trajectory' : 'repository-tests'}
+verification-test-overlay=${taskType === 'diagnosis' ? 'system-test-published-after-read-only-trajectory' : 'repository-tests'}
 diagnosis-workspace=${taskType === 'diagnosis' ? 'immutable-source-and-tests' : 'not-applicable'}
-diagnosis-git=${taskType === 'diagnosis' ? 'source-only-no-verification-fixture' : 'not-applicable'}
+diagnosis-git=${taskType === 'diagnosis' ? 'red-branch-with-system-test-after-trajectory' : 'not-applicable'}
 coverage=user-query-hard-contract-success-criteria-clarification-only
 pre-fix=fresh-claude-session-red
 post-fix=fresh-claude-session-green-for-bugfix
@@ -7725,6 +7933,51 @@ async function latestVerificationManifestPath(taskDir, phase) {
   return '';
 }
 
+async function validateRestoredVerificationManifest(taskDir, phase, manifestPath, manifest, taskType) {
+  const metadata = await readJson(path.join(taskDir, 'public.json'));
+  const proofDir = path.dirname(manifestPath);
+  const trajectoryPath = path.resolve(proofDir, String(manifest.trajectory_filename || ''));
+  if (!manifest.trajectory_filename || !trajectoryPath.startsWith(`${path.resolve(proofDir)}${path.sep}`)) {
+    throw new Error(`${phase} 轨迹路径越出证明目录或文件名为空`);
+  }
+  const [trajectoryContent, rawStreamContent, promptContent, resultContent, commandResultsContent] = await Promise.all([
+    fsp.readFile(trajectoryPath, 'utf8'),
+    fsp.readFile(path.join(proofDir, 'raw.stream.jsonl'), 'utf8'),
+    fsp.readFile(path.join(proofDir, 'PROMPT.md'), 'utf8'),
+    fsp.readFile(path.join(proofDir, 'verification-result.json'), 'utf8'),
+    fsp.readFile(path.join(proofDir, 'verification-command-results.jsonl'), 'utf8'),
+  ]);
+  const otherPhase = phase === 'pre_fix' ? 'post_fix' : 'pre_fix';
+  const effectiveTaskType = metadata.task_type || taskType;
+  const evidence = metadata.verification_evidence?.[phase] || manifest;
+  const allowHistoricalDiagnosisModelRepro = effectiveTaskType === 'diagnosis'
+    && Array.isArray(metadata.verify_cmds)
+    && metadata.verify_cmds.length > 0
+    && metadata.verify_cmds.every((command) => /^MODEL_REPRO=1\s+go\s+test\b/i.test(String(command).trim()))
+    && evidence.verify_cmds_sha256 === verificationCommandsSha256(metadata.verify_cmds);
+  const checked = validateVerificationProofBundle({
+    phase,
+    taskName: metadata.bug_id || metadata.sample_id || path.basename(taskDir),
+    taskType: effectiveTaskType,
+    mainSessionId: metadata.test_model_fix_session_id,
+    otherSessionId: metadata.verification_evidence?.[otherPhase]?.session_id,
+    bugBaseCommit: metadata.bug_base_commit,
+    testModelFixCommit: metadata.test_model_fix_commit,
+    verifyCmds: metadata.verify_cmds,
+    evidence,
+    manifest,
+    trajectoryContent,
+    rawStreamContent,
+    promptContent,
+    resultContent,
+    commandResultsContent,
+    allowHistoricalDiagnosisModelRepro,
+  });
+  if (!checked.ok) {
+    throw new Error(`${phase} 验证证明不完整或绑定失效：${checked.issues.join('；')}`);
+  }
+}
+
 export async function restoreVerificationEvidenceFromManifests(jobFile, bugIndex, taskDir, taskType = 'bugfix') {
   const phases = taskType === 'diagnosis' ? ['pre_fix'] : ['pre_fix', 'post_fix'];
   const restored = [];
@@ -7738,6 +7991,7 @@ export async function restoreVerificationEvidenceFromManifests(jobFile, bugIndex
     try {
       if (!manifestPath) throw new Error(`${phase} 本地证明 manifest 不存在`);
       const manifest = await readJson(manifestPath);
+      await validateRestoredVerificationManifest(taskDir, phase, manifestPath, manifest, taskType);
       const evidence = await persistVerificationManifest(taskDir, phase, manifest, manifestPath);
       await updateJob(jobFile, (job) => {
         const bug = (job.bugs || []).find((item) => Number(item.bugIndex) === Number(bugIndex));
@@ -8333,6 +8587,10 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
   }
   for (let localAttempt = 1; localAttempt <= remainingAttempts; localAttempt += 1) {
     const attempt = attemptOffset + localAttempt;
+    const infrastructureRetryCount = Number(initialJob.bugs
+      .find((item) => Number(item.bugIndex) === Number(bugIndex))
+      ?.stageAutoRetries?.[`bug${bugIndex}_claude_fix`]?.retryCount || 0);
+    const effortAttempt = Math.max(attempt, infrastructureRetryCount + 1);
     task.attempt = attempt;
     let failedStage = '';
     const attemptStartedAt = now();
@@ -8382,7 +8640,7 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
             GO_PIPELINE_PHASE_RESOURCE_HANDSHAKE: '1',
             GO_PIPELINE_REPAIR_ONLY: '1',
             GO_PIPELINE_BUGFIX_MODEL: bugfixModel(),
-            CLAUDE_EFFORT: bugfixEffort(attempt),
+            CLAUDE_EFFORT: bugfixEffort(effortAttempt),
             ANTHROPIC_MODEL: bugfixModel(),
             ANTHROPIC_DEFAULT_OPUS_MODEL: bugfixModel(),
             ANTHROPIC_DEFAULT_SONNET_MODEL: bugfixModel(),
@@ -8398,8 +8656,12 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
           stderrPath: path.join(task.taskDir, `pipeline-claude-attempt-${attempt}.stderr.log`),
           timeoutMs: CLAUDE_FIX_TIMEOUT_MS,
           idleTimeoutMs: CLAUDE_FIX_IDLE_TIMEOUT_MS,
-          progressPaths: [path.join(task.taskDir, '.claude-progress.json')],
+          // The UI phase marker changes during runner setup. Watch only the
+          // source marker so startup cannot impersonate a production edit.
+          progressPaths: [path.join(task.taskDir, '.claude-source-progress.json')],
           activityPaths: [path.join(task.taskDir, '.claude-activity.json')],
+          editRequiredPath: path.join(task.taskDir, '.claude-edit-required.json'),
+          editRequiredTimeoutMs: CLAUDE_EDIT_REQUIRED_TIMEOUT_MS,
           initialProgressGraceMs: CLAUDE_FIX_INITIAL_PROGRESS_GRACE_MS,
           progressTimeoutMs: CLAUDE_FIX_PROGRESS_TIMEOUT_MS,
           phaseRequestPath: path.join(task.taskDir, '.runner-phase-request.json'),
@@ -8543,8 +8805,24 @@ async function runTrajectoryCycle(jobFile, bugIndex) {
     `bug${bugIndex}_trajectory_validate`,
     `bug${bugIndex}_sol_quality`,
   ]);
+  const incompleteCycleStage = (job.stages || []).find((stage) => (
+    cycleStages.has(stage.id) && !['passed', 'skipped'].includes(stage.status)
+  ));
+  const bug = (job.bugs || []).find((item) => Number(item.bugIndex) === Number(bugIndex));
+  const trajectoryStream = bug?.task?.taskDir
+    ? path.join(bug.task.taskDir, 'trajectory/trajectory.stream.jsonl')
+    : '';
+  const completedCycleIsReusable = Number(job.workflowVersion || 1) >= CURRENT_WORKFLOW_VERSION
+    && !incompleteCycleStage
+    && (bug?.attempts || []).some((attempt) => attempt?.status === 'passed')
+    && Boolean(trajectoryStream)
+    && Boolean(await fsp.stat(trajectoryStream).catch(() => null));
+  // Revalidation is local work and must not reacquire a Claude repair slot.
+  // Otherwise a completed trajectory can sit behind an unrelated repair and
+  // delay its independent test-authoring stage indefinitely.
+  if (completedCycleIsReusable) return runTrajectoryCycleCore(jobFile, bugIndex);
   const stageId = Number(job.workflowVersion || 1) >= CURRENT_WORKFLOW_VERSION
-    ? (job.stages || []).find((stage) => cycleStages.has(stage.id) && !['passed', 'skipped'].includes(stage.status))?.id
+    ? incompleteCycleStage?.id
       || `bug${bugIndex}_claude_fix`
     : nextPipelineStage(job);
   if (!cycleStages.has(stageId)) return runTrajectoryCycleCore(jobFile, bugIndex);
@@ -8677,6 +8955,7 @@ async function runPostClaudeDelivery(jobFile, bugIndex, { releaseResource = asyn
         // runStage owns the Docker slot. The phase handshake releases that
         // slot before network-only Git publication starts.
         GO_PIPELINE_PHASE_RESOURCE_HANDSHAKE: '1',
+        GO_PIPELINE_REQUIRE_REPAIR_CHECKPOINT: '1',
         GO_PIPELINE_REPAIR_ONLY: '0',
         GO_PIPELINE_BUGFIX_MODEL: bugfixModel(),
         CLAUDE_EFFORT: bugfixEffort(1),
@@ -9661,6 +9940,7 @@ async function runPipeline(jobFile) {
   });
 
   const processBug = async (bugIndex) => {
+    if (runnerStopping) return;
     let job = await readJson(jobFile);
     try {
       job = await readJson(jobFile);
@@ -10035,7 +10315,12 @@ async function runPipeline(jobFile) {
           taskType: 'diagnosis',
           concurrency: isConcurrencyBug(afterClaudeBug.discovery),
         });
-        await finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, authored.sourceDir, authored.testFile);
+        await runStage(jobFile, `bug${bugIndex}_git_publication`, async () => finalizeV3DiagnosisImmutableDelivery(
+          jobFile,
+          bugIndex,
+          authored.sourceDir,
+          authored.testFile,
+        ));
         await restoreVerificationEvidenceFromManifests(jobFile, bugIndex, afterClaudeBug.task.taskDir, 'diagnosis');
         await runStage(jobFile, `bug${bugIndex}_pre_verify`, async () => {
           const latest = await readJson(jobFile);
@@ -10184,10 +10469,45 @@ async function runPipeline(jobFile) {
       // Resource yielding is a normal scheduler hand-off, not a failed Bug.
       // Preserve waiting_resource so the central scheduler can resume this job.
       if (error?.code === 'PIPELINE_RESOURCE_WAIT') throw error;
+      // stopJob owns the state rollback after SIGTERM/SIGINT. A worker that was
+      // interrupted by shutdown must not enqueue a new attempt or mark the Bug
+      // as a terminal failure.
+      if (runnerStopping) return;
       const failedAt = now();
       const latest = await readJson(jobFile);
       const failedStage = (latest.stages || []).findLast((stage) => Number(stage.bugIndex) === bugIndex
         && ['running', 'failed'].includes(stage.status))?.id || `bug${bugIndex}_bug_discovery`;
+
+      if (/CANDIDATE_CONTRACT_CONFLICT=1/.test(error?.message || '')) {
+        const conflictTask = latest.bugs?.find((item) => Number(item.bugIndex) === Number(bugIndex))?.task;
+        const reason = '候选题与仓库公开契约冲突：修复要求与现有公开测试对同一 API 输入要求相反，已保留冲突轨迹并停止该 Bug';
+        await updateJob(jobFile, (current) => {
+          markPipelineBugSkipped(current, bugIndex, reason, failedAt);
+          const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+          if (currentBug) {
+            currentBug.candidateContractConflict = {
+              detectedAt: failedAt,
+              stage: failedStage,
+              reportPath: conflictTask?.taskDir ? path.join(conflictTask.taskDir, '.candidate-contract-conflict.json') : '',
+              reason,
+            };
+            currentBug.workerExecution = {
+              ...(currentBug.workerExecution || {}),
+              status: 'fast_lane_completed',
+              currentStage: failedStage,
+              currentAttempt: 0,
+              updatedAt: failedAt,
+              lastAction: 'candidate_contract_conflict_skipped',
+              blockedReason: '',
+            };
+          }
+          current.status = 'running';
+          current.error = '';
+          current.finishedAt = null;
+        });
+        await appendLog(jobFile, 'warn', `Bug ${bugIndex} 的修复轨迹确认候选题与公开契约冲突，已保留证据并跳过该候选`, failedStage);
+        return;
+      }
 
       // Older jobs may already have marked a zero-patch Claude Session as a
       // reusable trajectory. Revalidate it before downstream work and, when it
@@ -10206,7 +10526,7 @@ async function runPipeline(jobFile) {
             stage.startedAt = null;
             stage.finishedAt = null;
             stage.error = '';
-            stage.reason = '无有效生产补丁，已从 BUG_BASE 重新启动 Claude 修复';
+            stage.reason = '生产补丁未通过有效性或全量公开测试，已保留定位轨迹并从 BUG_BASE 重新修复';
             delete stage.result;
             delete stage.failureCategory;
           }
@@ -10349,6 +10669,13 @@ async function runPipeline(jobFile) {
         'docker_infrastructure',
         'git_baseline_conflict',
       ]).has(failureCategory);
+      const retryableBugInfrastructureFailure = (
+        failureCategory === 'runner_infrastructure'
+          && /^bug\d+_(?:claude_fix|trajectory_validate)$/.test(failedStage)
+      ) || (
+        failureCategory === 'codex_infrastructure'
+          && /^bug\d+_/.test(failedStage)
+      );
       // Only an explicitly enabled coverage policy may invalidate the model
       // attempt. Legacy jobs retain the stage for history, but that retired
       // review must never reset an already validated Claude fix.
@@ -10470,7 +10797,9 @@ async function runPipeline(jobFile) {
         await appendLog(jobFile, 'warn', `Bug ${bugIndex} 验证覆盖复核失败，保留现有证明并仅重试覆盖复核`, failedStage);
         throw error;
       }
-      if (!infrastructureFailure && workflowVersion >= CURRENT_WORKFLOW_VERSION && /^bug\d+_/.test(failedStage)) {
+      if ((!infrastructureFailure || retryableBugInfrastructureFailure)
+        && workflowVersion >= CURRENT_WORKFLOW_VERSION
+        && /^bug\d+_/.test(failedStage)) {
         let stageRetry;
         await updateJob(jobFile, (current) => {
           stageRetry = queuePipelineBugStageRetry(current, bugIndex, {
@@ -10639,6 +10968,7 @@ async function runPipeline(jobFile) {
     }
     throw error;
   }
+  if (runnerStopping) return;
 
   // A live Runner never interrupts its current workers for a manual retry.
   // Hand the queued Bug back to the central scheduler once this batch has
@@ -10752,6 +11082,9 @@ async function runPipeline(jobFile) {
 }
 
 async function stopJob(signal) {
+  // Set the fence before the first await. Otherwise a worker can observe its
+  // killed child, enqueue a retry, and spawn it after activeChildren was read.
+  runnerStopping = true;
   const stopRequestPath = activeJobFile ? path.join(path.dirname(activeJobFile), 'stop-request.json') : '';
   const stopRequest = stopRequestPath ? await readJson(stopRequestPath, null) : null;
   const stopReason = String(stopRequest?.reason || 'external_signal');
@@ -10764,17 +11097,32 @@ async function stopJob(signal) {
     external_signal: '外部进程信号',
   };
   const stopLabel = stopLabels[stopReason] || stopLabels.external_signal;
+  const jobAtStop = activeJobFile ? await readJson(activeJobFile, null) : null;
+  const activeStageIdsAtStop = new Set((jobAtStop?.stages || [])
+    .filter((stage) => stage.status === 'running')
+    .map((stage) => stage.id));
   await Promise.all([...activeChildren].map((child) => terminateProcessTree(child.pid)));
   if (activeJobFile) {
     await updateJob(activeJobFile, (job) => {
       const stoppedAt = now();
       const activeStageBugIndexes = new Set((job.stages || [])
-        .filter((stage) => stage.status === 'running')
+        .filter((stage) => stage.status === 'running' || activeStageIdsAtStop.has(stage.id))
         .map((stage) => Number(stage.bugIndex))
         .filter((bugIndex) => Number.isInteger(bugIndex)));
       for (const stage of job.stages || []) {
-        if (stage.status !== 'running') continue;
+        const interruptedByStop = activeStageIdsAtStop.has(stage.id);
+        if (stage.status !== 'running' && !interruptedByStop) continue;
+        if (interruptedByStop) {
+          const interruptedAttempt = [...(stage.attempts || [])].reverse()
+            .find((attempt) => attempt?.startedAt === stage.startedAt);
+          if (interruptedAttempt) {
+            interruptedAttempt.status = 'interrupted';
+            interruptedAttempt.finishedAt = stoppedAt;
+            delete interruptedAttempt.error;
+          }
+        }
         stage.status = 'pending';
+        stage.startedAt = null;
         stage.finishedAt = null;
         stage.error = '';
       }

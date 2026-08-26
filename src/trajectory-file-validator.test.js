@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   diagnosisBashMutationIntents,
   parseTrajectoryJson,
+  sourceInspectionKind,
   validateDiagnosisReadOnlyEvents,
   validateTrajectoryEvents,
   validateTrajectoryIntegrityEvents,
@@ -18,6 +19,21 @@ function toolUse(id, name, input) {
 function toolResult(id, isError = false) {
   return { type: 'user', session_id: sessionId, message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content: '' }] } };
 }
+
+test('source inspection ignores explicit test exclusions without hiding actual test reads', () => {
+  assert.equal(sourceInspectionKind('Bash', {
+    command: 'grep -rn "RetryDeviceCall" internal/app/*.go | grep -iv "_test.go"',
+  }).kind, 'implementation');
+  assert.notEqual(sourceInspectionKind('Bash', {
+    command: 'grep -rn "RetryDeviceCall" internal/app/device_retry_test.go | grep -v "vendor"',
+  }).kind, 'implementation');
+  assert.equal(sourceInspectionKind('Bash', {
+    command: "find internal -type f ! -name '*_test.go' -exec grep -n Retry {} +",
+  }).kind, '');
+  assert.equal(sourceInspectionKind('Bash', {
+    command: "rg -g '!**/*_test.go' RetryDeviceCall internal/app/review.go",
+  }).kind, 'implementation');
+});
 
 function baseEvents(extra = []) {
   return [
@@ -198,6 +214,43 @@ test('diagnosis read-only validation accepts read-only commands and stderr redir
     ],
   });
   assert.equal(result.ok, true, result.errors.map((item) => item.message).join('; '));
+});
+
+test('V4 forbids diagnosis test-source inspection and keeps bugfix source-first ordering', () => {
+  const prompt = '请诊断设备重试后状态没有推进的问题。';
+  const testFirst = normalizedEvents([
+    toolUse('test-source', 'Read', { file_path: `${workspace}/internal/app/device_retry_test.go` }), toolResult('test-source'),
+    toolUse('implementation', 'Read', { file_path: `${workspace}/internal/app/review.go` }), toolResult('implementation'),
+    toolUse('repro', 'Bash', { command: "go test ./internal/app -run '^TestPressRetry$' -count=1" }), toolResult('repro', true),
+  ], prompt);
+  const rejected = validateTrajectoryEvents(testFirst, {
+    filename: `trajectory_${sessionId}.jsonl`,
+    taskType: 'diagnosis',
+    executionPolicyVersion: 4,
+    workspaceRoot: workspace,
+  });
+  assert.equal(rejected.errors.some((item) => item.code === 'diagnosis-test-source-inspection'), true);
+
+  const implementationFirst = normalizedEvents([
+    toolUse('implementation', 'Read', { file_path: `${workspace}/internal/app/review.go` }), toolResult('implementation'),
+    toolUse('test-source', 'Read', { file_path: `${workspace}/internal/app/device_retry_test.go` }), toolResult('test-source'),
+    toolUse('repro', 'Bash', { command: "go test ./internal/app -run '^TestPressRetry$' -count=1" }), toolResult('repro', true),
+  ], prompt);
+  const diagnosisStillRejected = validateTrajectoryEvents(implementationFirst, {
+    filename: `trajectory_${sessionId}.jsonl`,
+    taskType: 'diagnosis',
+    executionPolicyVersion: 4,
+    workspaceRoot: workspace,
+  });
+  assert.equal(diagnosisStillRejected.errors.some((item) => item.code === 'diagnosis-test-source-inspection'), true);
+
+  const acceptedBugfixOrder = validateTrajectoryEvents(implementationFirst, {
+    filename: `trajectory_${sessionId}.jsonl`,
+    taskType: 'bugfix',
+    executionPolicyVersion: 4,
+    workspaceRoot: workspace,
+  });
+  assert.equal(acceptedBugfixOrder.errors.some((item) => item.code === 'test-source-before-implementation'), false);
 });
 
 test('diagnosis read-only validation accepts a CLI-denied read-only command without a post snapshot', () => {

@@ -3,11 +3,13 @@ import { findRuntimeSmokeBinary } from './package-runtime-rules.js';
 import { goEmbeddedDistDirectories, isGoEmbeddedDistPath } from './embedded-assets.js';
 import {
   CURRENT_PROJECT_PACKAGE_POLICY_VERSION,
+  MANAGED_PROJECT_PACKAGE_POLICY_VERSION,
   projectPackageRuleOptions,
   validateProjectPackagePlan,
 } from './project-package-policy.js';
 
 export const GENERATED_PACKAGE_FILES = new Set([
+  'Dockerfile',
   'benzhi.Dockerfile',
   'build_benzhi_docker.sh',
   'BENZHI_README.md',
@@ -83,7 +85,8 @@ export function createPackageSupportFiles(task, workspaceEntries) {
   ]);
   const frontendDir = findFrontendDir(paths);
   const packageOptions = projectPackageRuleOptions(task);
-  const usesCurrentPolicy = packageOptions.projectPackagePolicyVersion >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION;
+  const usesManagedPolicy = packageOptions.projectPackagePolicyVersion >= MANAGED_PROJECT_PACKAGE_POLICY_VERSION;
+  const includesStandardDockerfile = packageOptions.projectPackagePolicyVersion >= CURRENT_PROJECT_PACKAGE_POLICY_VERSION;
   const packagePlan = validateProjectPackagePlan(task, {
     policyVersion: packageOptions.projectPackagePolicyVersion,
     frontendRequired: Boolean(frontendDir),
@@ -93,7 +96,7 @@ export function createPackageSupportFiles(task, workspaceEntries) {
   const usesVendor = paths.some((entryPath) => entryPath.startsWith('vendor/'));
   const bugReproEntry = workspaceEntries.find((entry) => entry.path === 'BUG_REPRO.md');
   const hasRuntimeSmoke = paths.includes('run_benzhi_smoke.sh');
-  const bugRepro = usesCurrentPolicy
+  const bugRepro = usesManagedPolicy
     ? inspectBugRepro(`预期失败。\n\n\`\`\`bash\n${packageOptions.expectedFailureCommands.join('\n')}\n\`\`\``)
     : inspectBugRepro(bugReproEntry?.content);
   const workspaceEntryMap = new Map(workspaceEntries.map((entry) => [entry.path, entry]));
@@ -103,7 +106,7 @@ export function createPackageSupportFiles(task, workspaceEntries) {
   const imageName = taskImageName(task);
   const templateName = frontendDir ? 'frontend-v2' : 'backend-v2';
   const dockerLines = [
-    `FROM --platform=$BUILDPLATFORM golang:${version} AS benzhi-build`,
+    `FROM golang:${version} AS benzhi-build`,
     'ARG TARGETOS=linux',
     'ARG TARGETARCH',
     'ARG GOPROXY=https://goproxy.cn,direct',
@@ -168,9 +171,9 @@ export function createPackageSupportFiles(task, workspaceEntries) {
     localCommands.push(`${usesVendor ? 'GOFLAGS=-mod=vendor ' : ''}go build -o ${runtimeSmokeBinary.outputPath} ${runtimeSmokeBinary.packagePath}`);
   }
   if (!bugRepro.hasGoCommand) localCommands.push(`${usesVendor ? 'GOFLAGS=-mod=vendor ' : ''}go test ./...`);
-  if (!usesCurrentPolicy && bugRepro.commands.length) localCommands.push('# 以下命令预期失败；详情见 BUG_REPRO.md。', ...bugRepro.commands);
+  if (!usesManagedPolicy && bugRepro.commands.length) localCommands.push('# 以下命令预期失败；详情见 BUG_REPRO.md。', ...bugRepro.commands);
   const readme = [
-    ...(usesCurrentPolicy ? [packageOptions.projectSummary, ''] : []),
+    ...(usesManagedPolicy ? [packageOptions.projectSummary, ''] : []),
     `# ${task?.bug_id || task?.name || 'Go task'}`,
     '',
     '本 Git 项目来自模型完成任务后的 workspace，不包含嵌套 .git 记录或本地构建产物。',
@@ -186,6 +189,7 @@ export function createPackageSupportFiles(task, workspaceEntries) {
     '## Docker 构建与运行',
     '',
     '```bash',
+    ...(includesStandardDockerfile ? [`docker build --platform linux/amd64 -t ${imageName}:latest .`] : []),
     `./build_benzhi_docker.sh ${imageName} linux/arm64`,
     `docker run --rm -it --platform linux/arm64 ${imageName}:latest`,
     `./build_benzhi_docker.sh ${imageName} linux/amd64`,
@@ -194,7 +198,7 @@ export function createPackageSupportFiles(task, workspaceEntries) {
     '',
     `构建脚本第二个参数为目标平台，必须分别完成 linux/arm64 和 linux/amd64 构建与容器验证；未提供时按照规范默认使用 linux/amd64。系统 ${templateName} 模板通过 Go 原生交叉编译生成目标架构的 /usr/local/bin/benzhi-app，镜像默认直接运行该入口。`,
     ...(usesVendor ? ['', '本项目刻意使用 vendor 模式，构建命令固定 `GOFLAGS=-mod=vendor`，依赖来自项目内的 `vendor/`。'] : []),
-    ...(!usesCurrentPolicy && bugRepro.commands.length ? ['', '本题的容器内故障复现步骤记录在 `BUG_REPRO.md`。'] : []),
+    ...(!usesManagedPolicy && bugRepro.commands.length ? ['', '本题的容器内故障复现步骤记录在 `BUG_REPRO.md`。'] : []),
     '',
   ].join('\n');
   const dockerignore = [
@@ -221,8 +225,10 @@ export function createPackageSupportFiles(task, workspaceEntries) {
     '.benzhi-build/',
     '',
   ].join('\n');
+  const dockerfileContent = new TextEncoder().encode(`${dockerLines.join('\n')}`);
   return [
-    { path: 'benzhi.Dockerfile', content: new TextEncoder().encode(`${dockerLines.join('\n')}`), mode: 0o100644 },
+    ...(includesStandardDockerfile ? [{ path: 'Dockerfile', content: dockerfileContent.slice(), mode: 0o100644 }] : []),
+    { path: 'benzhi.Dockerfile', content: dockerfileContent, mode: 0o100644 },
     { path: 'build_benzhi_docker.sh', content: new TextEncoder().encode(buildScript), mode: 0o100755 },
     { path: 'BENZHI_README.md', content: new TextEncoder().encode(readme), mode: 0o100644 },
     { path: '.dockerignore', content: new TextEncoder().encode(dockerignore), mode: 0o100644 },
