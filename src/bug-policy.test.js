@@ -151,3 +151,22 @@ test('V4 rejects shallow SQL filters and collection argument swaps despite claim
   assert.equal(argument.ok, false);
   assert.match(argument.issues.join('；'), /当前单项/);
 });
+
+test('V4 accepts cross-layer persistence identity defects that require schema and query changes', () => {
+  const assessment = assessBugDifficulty(difficultBug({
+    target_files: ['internal/store/schema.go', 'internal/store/curing.go', 'internal/app/curing.go'],
+    runtime_mechanisms: [
+      'persistence_recovery_or_replay',
+      'aliasing_or_shared_state_pollution',
+      'cross_layer_data_flow',
+    ],
+    affected_layers: [
+      'command_or_api',
+      'domain_state_machine',
+      'persistence_or_transaction',
+      'external_observable_behavior',
+    ],
+    failure_mechanism: 'curing_cells 的主键和查询范围没有 task_id，写入不记录任务标识，读取只按 generation，导致多个任务共享同一持久化命名空间。',
+  }));
+  assert.equal(assessment.ok, true, assessment.issues.join('；'));
+});

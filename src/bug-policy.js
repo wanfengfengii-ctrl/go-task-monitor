@@ -177,6 +177,7 @@ function uniqueStrings(values) {
 export function assessBugDifficulty(record = {}) {
   const runtimeMechanisms = uniqueStrings(record.runtime_mechanisms);
   const affectedLayers = uniqueStrings(record.affected_layers);
+  const targetFiles = uniqueStrings(record.target_files);
   const stateOrResourceImpact = String(record.state_or_resource_impact || '').trim();
   const difficultyEvidence = String(record.difficulty_evidence || '').trim();
   const issues = [];
@@ -190,7 +191,13 @@ export function assessBugDifficulty(record = {}) {
   }
   if (unknownLayers.length) issues.push(`affected_layers 包含未知值：${unknownLayers.join(', ')}`);
   const failureMechanism = String(record.failure_mechanism || '').trim();
+  const structuralPersistenceScope = targetFiles.length >= 2
+    && affectedLayers.length >= 3
+    && runtimeMechanisms.includes('persistence_recovery_or_replay')
+    && runtimeMechanisms.some((value) => ['aliasing_or_shared_state_pollution', 'cross_layer_data_flow'].includes(value))
+    && /(?:主键|复合键|唯一键|唯一索引|表结构|schema)[\s\S]{0,220}(?:没有|缺少|未包含|遗漏)[\s\S]{0,100}(?:task_id|tenant|scope|命名空间|任务标识)/iu.test(failureMechanism);
   for (const shallow of DECLARED_SHALLOW_MECHANISM_PATTERNS) {
+    if (structuralPersistenceScope && shallow.issue.includes('SQL WHERE')) continue;
     if (shallow.pattern.test(failureMechanism)) issues.push(shallow.issue);
   }
   return {
