@@ -55,6 +55,7 @@ import {
   prepareRemoteRepairHandoff,
 } from '../src/distributed-workers.js';
 import { assertProtectedSnapshotPath, claudeGenerationSandbox, criticalSnapshotTarOptions } from '../src/data-protection.js';
+import { GIT_COMMIT_LAYOUT_POLICY_VERSION } from '../src/git-delivery-layout.js';
 import { assessProjectComplexity, PROJECT_COMPLEXITY_LIMITS } from '../src/project-complexity.js';
 import {
   assessGeneratedProjectPlan,
@@ -2942,8 +2943,14 @@ async function runCodexJson({
     ? createCodexStreamRecoveryMonitor(recoveryWindowMs)
     : undefined;
   const codexToolDir = path.isAbsolute(codexBin) ? path.dirname(codexBin) : '';
+  const codexGoCacheDir = process.env.GO_PIPELINE_CODEX_GOCACHE || path.join(
+    os.tmpdir(),
+    `go-task-monitor-codex-${crypto.createHash('sha256').update(os.homedir()).digest('hex').slice(0, 12)}-go-build`,
+  );
+  await fsp.mkdir(codexGoCacheDir, { recursive: true });
   const codexEnvironment = {
     ...env,
+    GOCACHE: env.GOCACHE || codexGoCacheDir,
     PATH: [...new Set([codexToolDir, env.PATH || '', process.env.PATH || ''].filter(Boolean))].join(path.delimiter),
   };
   const result = await runCommand(codexBin, args, {
@@ -3249,6 +3256,63 @@ export async function inspectBugfixRepairWorkspace(baselineDir, fixedDir) {
     ...[...baseline.keys()].filter((filename) => !fixed.has(filename)),
   ])].sort();
   return { valid: changedNonTestFiles.length > 0, changedNonTestFiles };
+}
+
+export async function restorePublishedBugfixWorkspace(task) {
+  if (task?.taskType !== 'bugfix' || !task?.taskDir) return { restored: false, reason: 'not_bugfix' };
+  const taskDir = path.resolve(task.taskDir);
+  const pristineDir = path.join(taskDir, 'pristine');
+  const workspaceDir = path.join(taskDir, 'workspace');
+  const current = await inspectBugfixRepairWorkspace(pristineDir, workspaceDir)
+    .catch(() => ({ valid: false, changedNonTestFiles: [] }));
+  if (current.valid) return { restored: false, reason: 'workspace_valid', changedNonTestFiles: current.changedNonTestFiles };
+
+  const layout = await readJson(path.join(taskDir, '.git-layout.json'), null);
+  const layoutDir = path.resolve(String(layout?.repository || ''));
+  const expectedLayoutDir = path.join(taskDir, '.git-layout');
+  if (layoutDir !== expectedLayoutDir
+    || !/^[a-f0-9]{40}$/i.test(String(layout?.green_commit || ''))
+    || !layout?.green_branch
+    || !safeVerificationTestPath(String(layout?.test_file || ''))
+    || !/^[a-f0-9]{64}$/i.test(String(layout?.test_sha256 || ''))) {
+    throw new Error('已发布 Green 工作区恢复元数据不完整或越出任务目录');
+  }
+  const localGreen = (await git(layoutDir, ['rev-parse', `refs/heads/${layout.green_branch}`], '读取本地 Green 提交')).stdout.trim();
+  if (localGreen !== layout.green_commit) throw new Error(`本地 Green 分支已漂移：${localGreen} != ${layout.green_commit}`);
+
+  const cloneDir = path.join(taskDir, `.green-workspace-clone-${process.pid}-${Date.now()}`);
+  const replacementDir = path.join(taskDir, `.green-workspace-replacement-${process.pid}-${Date.now()}`);
+  try {
+    await runRequired('恢复已发布 Green 工作区', 'git', [
+      'clone', '--quiet', '--branch', layout.green_branch, '--single-branch', layoutDir, cloneDir,
+    ], { cwd: taskDir, timeoutMs: 10 * 60 * 1000 });
+    const clonedCommit = (await git(cloneDir, ['rev-parse', 'HEAD'], '校验恢复的 Green 提交')).stdout.trim();
+    if (clonedCommit !== layout.green_commit) throw new Error(`恢复的 Green 提交不一致：${clonedCommit} != ${layout.green_commit}`);
+    const testBytes = await fsp.readFile(path.join(cloneDir, layout.test_file));
+    const testSha = crypto.createHash('sha256').update(testBytes).digest('hex');
+    if (testSha !== layout.test_sha256) throw new Error('恢复的 Green 回归测试哈希不一致');
+    await copyWithoutGit(cloneDir, replacementDir);
+    const inspection = await inspectBugfixRepairWorkspace(pristineDir, replacementDir);
+    if (!inspection.valid) throw new Error('已发布 Green 提交不包含有效生产补丁');
+
+    const historyRoot = path.join(path.dirname(path.dirname(taskDir)), 'retry-history', path.basename(taskDir));
+    const archivedWorkspace = path.join(historyRoot, `workspace-before-green-recovery-${now().replace(/[:.]/g, '-')}`);
+    await fsp.mkdir(historyRoot, { recursive: true });
+    const hadWorkspace = Boolean(await fsp.stat(workspaceDir).catch(() => null));
+    if (hadWorkspace) await fsp.rename(workspaceDir, archivedWorkspace);
+    try {
+      await fsp.rename(replacementDir, workspaceDir);
+    } catch (error) {
+      if (hadWorkspace && !await fsp.stat(workspaceDir).catch(() => null)) {
+        await fsp.rename(archivedWorkspace, workspaceDir).catch(() => {});
+      }
+      throw error;
+    }
+    return { restored: true, commit: clonedCommit, changedNonTestFiles: inspection.changedNonTestFiles };
+  } finally {
+    await fsp.rm(cloneDir, { recursive: true, force: true });
+    await fsp.rm(replacementDir, { recursive: true, force: true });
+  }
 }
 
 async function assertBugfixRepairWorkspace(task, fixedDir = path.join(task.taskDir, 'workspace'), baselineDir = path.join(task.taskDir, 'pristine')) {
@@ -3839,6 +3903,7 @@ async function prepareV3BugfixGitLayout(jobFile, bugIndex, fixedDir, testFile) {
       }
     }
     await updatePublicMetadata(taskDir, (metadata) => Object.assign(metadata, {
+      git_commit_layout_policy_version: GIT_COMMIT_LAYOUT_POLICY_VERSION,
       test_model_fix_commit: existing.green_commit,
       test_model_fix_pushed: publicationPassed,
       test_model_fix_branch: existing.green_branch,
@@ -3879,6 +3944,7 @@ async function prepareV3BugfixGitLayout(jobFile, bugIndex, fixedDir, testFile) {
   const value = { version: 1, repository: layoutDir, green_branch: greenBranch, green_commit: greenCommit, red_branch: redBranch, red_commit: redCommit, bug_base_commit: bugBaseCommit, test_file: testFile, test_sha256: testSha, prepared_at: now() };
   await writeJsonAtomic(layoutMetaPath, value);
   await updatePublicMetadata(taskDir, (metadata) => Object.assign(metadata, {
+    git_commit_layout_policy_version: GIT_COMMIT_LAYOUT_POLICY_VERSION,
     test_model_fix_commit: greenCommit,
     test_model_fix_pushed: false,
     test_model_fix_branch: greenBranch,
@@ -3912,6 +3978,9 @@ export async function finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, te
       throw new Error(`Bug ${bugIndex} diagnosis 已发布测试提交与远端 ${redBranch} 不一致`);
     }
     await ensureDiagnosisWorkspaceUnchanged(taskDir, { testFile, sha256: existingMetadata.verification_test_sha256 });
+    await updatePublicMetadata(taskDir, (metadata) => Object.assign(metadata, {
+      git_commit_layout_policy_version: GIT_COMMIT_LAYOUT_POLICY_VERSION,
+    }));
     await updateJob(jobFile, (current) => {
       const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
       Object.assign(currentBug, {
@@ -3984,6 +4053,7 @@ export async function finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, te
     });
   });
   await updatePublicMetadata(taskDir, (metadata) => Object.assign(metadata, {
+    git_commit_layout_policy_version: GIT_COMMIT_LAYOUT_POLICY_VERSION,
     red_branch: redBranch,
     red_commit: redCommit,
     red_pushed: true,
@@ -5284,7 +5354,7 @@ async function reviewBroadInjectedBug(jobFile, stageId, cwd, baseCommit, bug, in
     'Approve only if the complete diff introduces exactly one realistic deterministic bug, remains proportionate to that behavior, does not weaken or modify tests, does not leak the answer, and does not include unrelated rewrites or cleanup. Configuration, dependency, Docker, build-script, and Go-source bugs are all allowed when they are genuinely required by the selected behavior.',
     ...(enforceDifficulty ? [
       bugDifficultyPolicyText(),
-      'Reject a shallow one-point edit even when the Bug record labels it as a runtime mechanism. In particular, renaming a flag, replacing one literal or prefix, adding one enum case or nil check, changing one comparison/operator/counter/offset, or enabling one decoder option is insufficient when the actual investigation and fix are local. Approve an arithmetic or boundary defect only when the diff and surrounding code establish a substantive transaction, concurrent, recovery, resource, or cross-layer invariant rather than merely a dramatic downstream symptom.',
+      'Reject a shallow one-point edit even when the Bug record labels it as a runtime mechanism. In particular, renaming a flag, replacing one literal or prefix, adding one enum case or nil check, changing one comparison/operator/counter/offset, enabling one decoder option, adding or removing one SQL WHERE/filter term, or replacing a collection argument with the current item is insufficient when the actual investigation and fix are local. Approve an arithmetic or boundary defect only when the diff and surrounding code establish a substantive transaction, concurrent, recovery, resource, or cross-layer invariant rather than merely a dramatic downstream symptom.',
     ] : []),
     `Selected bug record:\n${JSON.stringify(bug, null, 2)}`,
     'Return JSON matching the supplied schema and cite concrete diff evidence for each issue.',
@@ -5309,7 +5379,7 @@ async function reviewNaturalBugDifficulty(jobFile, stageId, cwd, bug, bugIndex) 
   const prompt = [
     'Perform a strictly read-only difficulty review of one naturally discovered benchmark Bug. Inspect the actual reachable production code, but do not modify files, create files, run tests, or create commits.',
     bugDifficultyPolicyText(),
-    'Approve only when the reported runtime mechanism and propagation chain are supported by the code and locating the root cause plus verifying the invariant requires reasoning across at least two meaningful boundaries. Reject unused or toy components and reject a local typo, mapping, nil check, string normalization, decoder option, simple comparator, index, counter, or offset repair even when the report describes a severe downstream symptom.',
+    'Approve only when the reported runtime mechanism and propagation chain are supported by the code and locating the root cause plus verifying the invariant requires reasoning across at least two meaningful boundaries. Reject unused or toy components and reject a local typo, mapping, nil check, string normalization, decoder option, simple comparator, index, counter, offset, one-term SQL WHERE/filter change, or collection-to-current-item argument replacement even when the report describes a severe downstream symptom.',
     'An overflow or boundary defect may pass only when the actual mechanism includes a substantive transaction, persistence, concurrency, recovery, or resource invariant and the required regression evidence verifies that invariant, such as preventing an orphan persisted Session after a failed reservation.',
     `Candidate Bug record:\n${JSON.stringify(bug, null, 2)}`,
     'Return JSON matching the supplied schema. Cite exact files, symbols, control flow, and affected runtime state for approval or rejection.',
@@ -5417,9 +5487,10 @@ async function reviewNaturalBugCandidateBatch({ jobFile, stageId, projectDir, jo
   const reviewDir = path.join(jobDir, `analysis-${name}`);
   await cloneAt(projectDir, 'main', reviewDir, jobDir);
   const prompt = [
-    'Perform one strictly read-only batch review of the following naturally discovered Bug candidates. Inspect only the production paths needed to decide these candidates. Do not modify files, create files, run tests, or create commits.',
+    'Perform one strictly read-only batch review of the following naturally discovered Bug candidates. Inspect only the production paths and directly related repository-owned public tests needed to decide these candidates. Do not modify files, create files, run tests, or create commits.',
     bugDifficultyPolicyText(),
     'Return exactly one review for every candidate bug_id. Approve only candidates supported by reachable code, concrete reproduction evidence, a substantive runtime invariant, and at least two meaningful boundaries. Reject semantic duplicates by approving only the stronger one. Reject dead code, toy components, shallow local fixes, invented evidence, and candidates that merely restate another failure.',
+    'For each candidate, use targeted symbol, endpoint, command, or test-name search to inspect the directly related existing *_test.go contract before approval. Reject the candidate when its user_query or success_criteria requires a different outcome for the same public API or command input that a retained public test explicitly expects to succeed or fail. Report this hard rejection as PUBLIC_CONTRACT_CONFLICT; a benchmark must not require breaking an already passing repository-owned public behavior. Test inspection is exclusion-only: do not scan unrelated tests, inspect testdata, or invent test-versus-production discriminators.',
     'Score approved candidates from 1 to 5 for evidence strength, runtime depth, public observability, and independence. A rejected candidate still receives a score and concrete issue evidence.',
     `Candidate records:\n${JSON.stringify(candidates.map((item) => item.candidate), null, 2)}`,
     'Return only JSON matching the supplied schema.',
@@ -5875,7 +5946,7 @@ async function ensureInjectionPlan(jobFile, projectDir, naturalBatch) {
     userQueryAuthoringPolicyText(),
     bugNarrativeLanguageInstruction(),
     `Current root-cause-file counts are ${JSON.stringify(filePolicy.counts)} and the per-file ceiling is ${Number.isFinite(filePolicy.limit) ? filePolicy.limit : 'not-applicable'}. Do not plan duplicate files beyond that limit and do not repeat a mechanism.`,
-    'Reject shallow literal, flag-name, enum, nil-only, decoder-option, comparator, index, counter, offset, or string-normalization mutations. Every planned defect must cross at least two meaningful runtime boundaries and modify reachable behavior, not dead or test-only code.',
+    'Reject shallow literal, flag-name, enum, nil-only, decoder-option, comparator, index, counter, offset, string-normalization, one-term SQL WHERE/filter, or collection-to-current-item argument mutations. Every planned defect must cross at least two meaningful runtime boundaries and modify reachable behavior, not dead or test-only code.',
     job.request.taskType === 'diagnosis'
       ? 'Every planned diagnosis Bug must describe one directly observable behavior and a legal read-only command shape when one is known. Do not execute the command or require it to be red during injection planning; the final pre_fix red proof is produced after the model trajectory with the isolated verifier overlay. Never use temporary paths, pipes, redirects, Git, hidden tests, or external network access in the eventual public command.'
       : 'Each planned bugfix must be exposable by a focused repository-owned TestModel_ regression test after injection.',
@@ -6034,7 +6105,7 @@ async function reviewGoldBugDifficulty(jobFile, stageId, goldDir, bug, gold, bug
     'Perform a strictly read-only final difficulty audit of this benchmark Bug using the BUG_BASE, current Gold diff, regression test, and structured Gold root cause. Do not modify files or create commits.',
     `Use ${bugBaseCommit} as the BUG_BASE when inspecting the current Gold diff.`,
     bugDifficultyPolicyText(),
-    'Reject if the concrete Gold root cause reveals that the task is essentially a one-line typo, one missing enum/nil/decoder check, string normalization, or a simple comparator/index/counter/offset change without a substantive runtime invariant. Do not approve because the user_query or difficulty fields exaggerate the impact.',
+    'Reject if the concrete Gold root cause reveals that the task is essentially a one-line typo, one missing enum/nil/decoder check, string normalization, a simple comparator/index/counter/offset change, one SQL WHERE/filter term, or replacing a collection argument with the current item without a substantive runtime invariant. Do not approve because the user_query or difficulty fields exaggerate the impact.',
     'Approve only when the Gold test exercises the stated runtime and cross-boundary invariant through public observable behavior. Concurrent tasks must use the race detector or a deterministic synchronization barrier that directly proves the race or lifecycle ordering.',
     `Selected Bug record:\n${JSON.stringify(bug, null, 2)}`,
     `Structured Gold result:\n${JSON.stringify(gold, null, 2)}`,
@@ -7623,12 +7694,33 @@ async function sha256File(filename) {
   return crypto.createHash('sha256').update(await fsp.readFile(filename)).digest('hex');
 }
 
+export function hasDurableTrajectoryReuseCheckpoint(job, bugIndex) {
+  const requiredStages = [
+    'trajectory_validate',
+    'test_author',
+    'pre_verify',
+    ...(job?.request?.taskType === 'bugfix' ? ['post_verify'] : []),
+    'docker_validation',
+    'git_publication',
+  ];
+  return requiredStages.every((stageName) => job?.stages?.some((stage) => (
+    Number(stage.bugIndex) === Number(bugIndex)
+      && stage.stage === stageName
+      && stage.status === 'passed'
+  )));
+}
+
 export async function restoreArchivedTrajectoryArtifacts(job, task, bugRecord) {
   const taskName = String(task?.taskName || '');
   const taskDir = String(task?.taskDir || '');
   const trustedSessionIds = new Set((bugRecord?.attempts || [])
     .filter((attempt) => attempt?.status === 'passed' && attempt?.sessionId)
     .map((attempt) => String(attempt.sessionId)));
+  const checkpointSessionId = String(bugRecord?.verificationTestAuthor?.repairSessionId || '');
+  if (hasDurableTrajectoryReuseCheckpoint(job, bugRecord?.bugIndex)
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(checkpointSessionId)) {
+    trustedSessionIds.add(checkpointSessionId);
+  }
   if (!taskName || path.basename(taskName) !== taskName || !taskDir || !trustedSessionIds.size) {
     return { restored: false, reason: 'missing_trusted_attempt' };
   }
@@ -7875,7 +7967,11 @@ export async function persistVerificationManifest(taskDir, phase, manifest, mani
 
   const publicPath = path.join(taskDir, 'public.json');
   const metadata = await readJson(publicPath);
-  const expectedCommit = phase === 'pre_fix' ? metadata.bug_base_commit : metadata.test_model_fix_commit;
+  const expectedCommit = phase === 'pre_fix'
+    ? Number(metadata.git_commit_layout_policy_version || 0) >= GIT_COMMIT_LAYOUT_POLICY_VERSION
+      ? metadata.red_commit
+      : metadata.bug_base_commit
+    : metadata.test_model_fix_commit;
   if (!/^[a-f0-9]{40}$/i.test(String(expectedCommit || '')) || manifest.source_commit !== expectedCommit) {
     throw new Error(`${phase} 证明绑定的源码 commit 已失效`);
   }
@@ -7962,6 +8058,9 @@ async function validateRestoredVerificationManifest(taskDir, phase, manifestPath
     mainSessionId: metadata.test_model_fix_session_id,
     otherSessionId: metadata.verification_evidence?.[otherPhase]?.session_id,
     bugBaseCommit: metadata.bug_base_commit,
+    preFixCommit: Number(metadata.git_commit_layout_policy_version || 0) >= GIT_COMMIT_LAYOUT_POLICY_VERSION
+      ? metadata.red_commit
+      : metadata.bug_base_commit,
     testModelFixCommit: metadata.test_model_fix_commit,
     verifyCmds: metadata.verify_cmds,
     evidence,
@@ -8334,6 +8433,31 @@ async function cleanPostFixSource(jobFile, bugIndex) {
   return sourceDir;
 }
 
+async function cleanPreFixSource(jobFile, bugIndex, fallbackSourceDir) {
+  const job = await readJson(jobFile);
+  const bug = job.bugs.find((item) => item.bugIndex === bugIndex);
+  const taskDir = bug?.task?.taskDir;
+  if (!taskDir) throw new Error(`Bug ${bugIndex} 缺少任务目录，不能检出 pre_fix Red 提交`);
+  const metadata = await readJson(path.join(taskDir, 'public.json'));
+  if (Number(metadata.git_commit_layout_policy_version || 0) < GIT_COMMIT_LAYOUT_POLICY_VERSION) {
+    return fallbackSourceDir;
+  }
+  const expectedCommit = String(metadata.red_commit || '');
+  const redBranch = String(metadata.red_branch || numberedRedBranch(bugIndex));
+  if (!/^[a-f0-9]{40}$/i.test(expectedCommit)) throw new Error(`Bug ${bugIndex} 缺少合法 red_commit`);
+  const preparedLayout = await readJson(path.join(taskDir, '.git-layout.json'), null);
+  const sourceDir = path.join(path.dirname(jobFile), `pre-verify-bug${bugIndex}`);
+  if (preparedLayout?.repository && preparedLayout.red_commit === expectedCommit) {
+    await cloneAt(path.resolve(preparedLayout.repository), preparedLayout.red_branch || redBranch, sourceDir, path.dirname(jobFile));
+  } else {
+    await cloneAt(job.request.cloneUrl, redBranch, sourceDir, path.dirname(jobFile));
+  }
+  const actualCommit = (await git(sourceDir, ['rev-parse', 'HEAD'])).stdout.trim();
+  if (actualCommit !== expectedCommit) throw new Error(`pre_fix Red 提交不一致：${actualCommit} != ${expectedCommit}`);
+  await assertCleanGit(sourceDir, 'pre_fix Red 干净克隆');
+  return sourceDir;
+}
+
 async function runBugfixProofStages(jobFile, bugIndex, projectDir) {
   const job = await readJson(jobFile);
   const bug = job.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
@@ -8349,7 +8473,8 @@ async function runBugfixProofStages(jobFile, bugIndex, projectDir) {
   const runPre = () => runStage(jobFile, `bug${bugIndex}_pre_verify`, async () => {
     const latest = await readJson(jobFile);
     const currentBug = latest.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
-    return runVerificationProof(jobFile, bugIndex, 'pre_fix', currentBug.bugBaseDir || projectDir);
+    const sourceDir = await cleanPreFixSource(jobFile, bugIndex, currentBug.bugBaseDir || projectDir);
+    return runVerificationProof(jobFile, bugIndex, 'pre_fix', sourceDir);
   });
   const runPost = () => runStage(jobFile, `bug${bugIndex}_post_verify`, async () => {
     const sourceDir = await cleanPostFixSource(jobFile, bugIndex);
@@ -8507,8 +8632,10 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
   const qualityStageStatus = qualityStage ? qualityStage.status : 'skipped';
   const trajectoryStageStatus = initialJob.stages.find((stage) => stage.id === `bug${bugIndex}_trajectory_validate`)?.status;
   const trajectoryStream = path.join(task.taskDir, 'trajectory/trajectory.stream.jsonl');
+  const durableTrajectoryCheckpoint = hasDurableTrajectoryReuseCheckpoint(initialJob, bugIndex);
+  const hasPassedRepairAttempt = (bugRecord.attempts || []).some((attempt) => attempt?.status === 'passed');
   if (trajectoryStageStatus === 'passed'
-    && (bugRecord.attempts || []).some((attempt) => attempt?.status === 'passed')
+    && (hasPassedRepairAttempt || durableTrajectoryCheckpoint)
     && !await fsp.stat(trajectoryStream).catch(() => null)) {
     const recovery = await restoreArchivedTrajectoryArtifacts(initialJob, task, bugRecord);
     if (recovery.restored) {
@@ -8528,16 +8655,23 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
   }
   // A stale stream can survive a failed attempt or a manual reset. It is only
   // a reusable delivery artifact after the trajectory validation stage and a
-  // corresponding model attempt both completed successfully. Otherwise the
-  // runner must launch Claude again so it cannot skip repair and fail later in
-  // the independent proof phase (for example with an empty verify_cmds).
+  // corresponding model attempt completed successfully. A complete downstream
+  // checkpoint can recover a historical job whose attempt index was lost.
   const reusableTrajectory = trajectoryStageStatus === 'passed'
-    && (bugRecord.attempts || []).some((attempt) => attempt?.status === 'passed');
+    && (hasPassedRepairAttempt || durableTrajectoryCheckpoint);
   if (reusableTrajectory && ['passed', 'skipped'].includes(qualityStageStatus)
     && await fsp.stat(trajectoryStream).catch(() => null)) {
+    if (durableTrajectoryCheckpoint) await restorePublishedBugfixWorkspace(task);
     const trajectory = await exportTrajectoryJson(task.taskDir);
     const validation = await runTrajectoryValidator(task, trajectory);
     await updateTaskAfterTrajectory(task.taskDir, trajectory, validation);
+    if (durableTrajectoryCheckpoint && !hasPassedRepairAttempt) {
+      await setStage(jobFile, `bug${bugIndex}_claude_fix`, 'passed', {
+        resumed: true,
+        durableCheckpoint: true,
+        sessionId: trajectory.sessionId,
+      });
+    }
     await setStage(jobFile, `bug${bugIndex}_trajectory_validate`, 'passed', {
       sessionId: trajectory.sessionId,
       reportPath: validation.reportPath,
@@ -8547,9 +8681,17 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
   }
   if (reusableTrajectory && await fsp.stat(trajectoryStream).catch(() => null)) {
     try {
+      if (durableTrajectoryCheckpoint) await restorePublishedBugfixWorkspace(task);
       const trajectory = await exportTrajectoryJson(task.taskDir);
       const validation = await runTrajectoryValidator(task, trajectory);
       await updateTaskAfterTrajectory(task.taskDir, trajectory, validation);
+      if (durableTrajectoryCheckpoint && !hasPassedRepairAttempt) {
+        await setStage(jobFile, `bug${bugIndex}_claude_fix`, 'passed', {
+          resumed: true,
+          durableCheckpoint: true,
+          sessionId: trajectory.sessionId,
+        });
+      }
       await setStage(jobFile, `bug${bugIndex}_trajectory_validate`, 'passed', { sessionId: trajectory.sessionId, reportPath: validation.reportPath, reused: true });
       if (qualityStage) {
         await setStage(jobFile, `bug${bugIndex}_sol_quality`, 'skipped', { summary: '新规则暂停轨迹内容质检', policy: 'capture-only-no-trajectory-audit' });
@@ -8559,6 +8701,10 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
     } catch (error) {
       await appendLog(jobFile, 'warn', `Bug ${bugIndex} 现有轨迹无法复用：${error.message}`, `bug${bugIndex}_trajectory_validate`);
     }
+  }
+  const savedContractConflict = await readJson(path.join(task.taskDir, '.candidate-contract-conflict.json'), null);
+  if (savedContractConflict?.status === 'candidate_contract_conflict') {
+    throw new Error(`CANDIDATE_CONTRACT_CONFLICT=1\n${savedContractConflict.summary || '候选题与仓库公开测试契约冲突'}`);
   }
   const attemptOffset = countedBugTrajectoryAttempts(bugRecord);
   const remainingAttempts = remainingBugTrajectoryAttempts(bugRecord);
@@ -8719,6 +8865,29 @@ async function runTrajectoryCycleCore(jobFile, bugIndex, phaseResources = {}) {
       failedStage ||= (latest.stages || []).find((stage) => Number(stage.bugIndex) === bugIndex
         && ['running', 'failed'].includes(stage.status))?.id || `bug${bugIndex}_claude_fix`;
       const feedback = error.message;
+      if (/CANDIDATE_CONTRACT_CONFLICT=1/.test(feedback)) {
+        await setStage(jobFile, failedStage, 'failed', { attempt, error: feedback });
+        const attemptSessionId = String(await fsp.readFile(path.join(task.taskDir, 'trajectory/session_id.txt'), 'utf8').catch(() => '')).trim();
+        await updateJob(jobFile, (current) => {
+          const bug = current.bugs.find((item) => item.bugIndex === bugIndex);
+          Object.assign(bug, finishBugAttempt(bug, {
+            status: 'failed',
+            stage: failedStage,
+            sessionId: attemptSessionId,
+            error: feedback,
+            action: attempt > 1 ? 'automatic_retry' : 'manual_start',
+          }, now()));
+          bug.workerExecution = {
+            ...(bug.workerExecution || {}),
+            status: 'fast_lane_failed',
+            currentAttempt: 0,
+            currentStage: failedStage,
+            updatedAt: now(),
+            lastHeartbeatAt: now(),
+          };
+        });
+        throw error;
+      }
       if (isSystemTrajectoryFailure(feedback)) {
         const failureCategory = classifyTrajectoryAttemptFailure(feedback);
         const publicationCheckpointFailure = failureCategory === 'git_infrastructure'
@@ -10266,11 +10435,12 @@ async function runPipeline(jobFile) {
         await runStage(jobFile, `bug${bugIndex}_pre_verify`, async () => {
           const latest = await readJson(jobFile);
           const currentBug = latest.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+          const sourceDir = await cleanPreFixSource(jobFile, bugIndex, currentBug.bugBaseDir || projectDir);
           return runVerificationProof(
             jobFile,
             bugIndex,
             'pre_fix',
-            currentBug.bugBaseDir || projectDir,
+            sourceDir,
           );
         });
         await runStage(jobFile, `bug${bugIndex}_post_verify`, async () => {
@@ -10480,6 +10650,7 @@ async function runPipeline(jobFile) {
 
       if (/CANDIDATE_CONTRACT_CONFLICT=1/.test(error?.message || '')) {
         const conflictTask = latest.bugs?.find((item) => Number(item.bugIndex) === Number(bugIndex))?.task;
+        const conflictStage = `bug${bugIndex}_claude_fix`;
         const reason = '候选题与仓库公开契约冲突：修复要求与现有公开测试对同一 API 输入要求相反，已保留冲突轨迹并停止该 Bug';
         await updateJob(jobFile, (current) => {
           markPipelineBugSkipped(current, bugIndex, reason, failedAt);
@@ -10487,14 +10658,14 @@ async function runPipeline(jobFile) {
           if (currentBug) {
             currentBug.candidateContractConflict = {
               detectedAt: failedAt,
-              stage: failedStage,
+              stage: conflictStage,
               reportPath: conflictTask?.taskDir ? path.join(conflictTask.taskDir, '.candidate-contract-conflict.json') : '',
               reason,
             };
             currentBug.workerExecution = {
               ...(currentBug.workerExecution || {}),
               status: 'fast_lane_completed',
-              currentStage: failedStage,
+              currentStage: conflictStage,
               currentAttempt: 0,
               updatedAt: failedAt,
               lastAction: 'candidate_contract_conflict_skipped',
@@ -10505,7 +10676,7 @@ async function runPipeline(jobFile) {
           current.error = '';
           current.finishedAt = null;
         });
-        await appendLog(jobFile, 'warn', `Bug ${bugIndex} 的修复轨迹确认候选题与公开契约冲突，已保留证据并跳过该候选`, failedStage);
+        await appendLog(jobFile, 'warn', `Bug ${bugIndex} 的修复轨迹确认候选题与公开契约冲突，已保留证据并跳过该候选`, conflictStage);
         return;
       }
 

@@ -258,6 +258,26 @@ else
   green_commit=""
 fi
 
+red_commit_count="$(git -C "$delivery_repo" rev-list --count "$red_commit")"
+[[ "$red_commit_count" == 1 ]] || { echo "$red_branch must contain exactly one commit, found $red_commit_count" >&2; exit 5; }
+if [[ "$task_type" == "bugfix" ]]; then
+  green_commit_count="$(git -C "$delivery_repo" rev-list --count "$green_commit")"
+  [[ "$green_commit_count" == 2 ]] || { echo "$green_branch must contain exactly two commits, found $green_commit_count" >&2; exit 5; }
+fi
+
+# Refresh the remote snapshot after every push. The earlier snapshot is used
+# only for force-with-lease; delivery succeeds only when the final remote heads
+# resolve to the exact commits that passed the local topology checks.
+git -C "$delivery_repo" ls-remote --heads origin >"$remote_heads"
+require_remote "$red_branch" "$red_commit"
+if [[ "$task_type" == "bugfix" ]]; then
+  require_remote "$green_branch" "$green_commit"
+else
+  diagnosis_green_branch="bug${bug_index}_green"
+  [[ -z "$(remote_head "$diagnosis_green_branch")" ]] \
+    || { echo "diagnosis remote must not contain $diagnosis_green_branch" >&2; exit 5; }
+fi
+
 repository_web="${repository%.git}"
 repository_web="${repository_web%/}"
 updated_meta="$publish_root/public.json"
@@ -269,7 +289,8 @@ jq \
   --arg red_commit "$red_commit" \
   --arg green_commit "${green_commit:-}" \
   --arg fixture_sha "$fixture_sha" \
-  '.test_model_fix_commit = $commit
+  '.git_commit_layout_policy_version = 1
+   | .test_model_fix_commit = $commit
    | .test_model_fix_pushed = true
    | .test_model_fix_branch = $branch
    | .test_model_fix_session_id = $session

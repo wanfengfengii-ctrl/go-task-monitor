@@ -493,7 +493,9 @@ export function validateVerificationProofBundle(input = {}) {
     && taskType === 'diagnosis'
     && verifyCmds.length > 0
     && verifyCmds.every((command) => /^MODEL_REPRO=1\s+go\s+test\b/i.test(String(command).trim()));
-  const expectedSourceCommit = phase === 'pre_fix' ? String(input.bugBaseCommit || '') : String(input.testModelFixCommit || '');
+  const expectedSourceCommit = phase === 'pre_fix'
+    ? String(input.preFixCommit || input.bugBaseCommit || '')
+    : String(input.testModelFixCommit || '');
   const promptContent = String(input.promptContent || '').trim();
   const directPromptVariants = [
     verificationProofPrompt(phase, verifyCmds),

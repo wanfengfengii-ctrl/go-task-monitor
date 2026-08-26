@@ -696,9 +696,27 @@ export function rewindPipelineBugAfterMissingTrajectory(job, bugIndex, at = new 
   const claudeStage = (job.stages || []).find((stage) => stage.id === `bug${normalizedIndex}_claude_fix`);
   if (claudeStage?.status !== 'passed') return false;
 
+  // The live trajectory directory is rotated before a new Runner attempt.
+  // Once every immutable repair, proof, Docker and publication checkpoint has
+  // passed, a temporarily missing live stream is an artifact recovery issue,
+  // not evidence that Claude failed. Keep those checkpoints and resume the
+  // first incomplete delivery stage instead of destroying valid red/green
+  // proof metadata.
+  const stagesBySuffix = new Map((job.stages || [])
+    .filter((stage) => Number(stage.bugIndex) === normalizedIndex)
+    .map((stage) => [String(stage.id || '').replace(`bug${normalizedIndex}_`, ''), stage]));
+  const requiredCheckpointSuffixes = [
+    'trajectory_validate', 'test_author', 'pre_verify',
+    'docker_validation', 'git_publication',
+  ];
+  const postVerifyStage = stagesBySuffix.get('post_verify');
+  if (postVerifyStage && postVerifyStage.status !== 'skipped') requiredCheckpointSuffixes.push('post_verify');
+  if (requiredCheckpointSuffixes.every((suffix) => stagesBySuffix.get(suffix)?.status === 'passed')) return false;
+
   const resetSuffixes = new Set([
-    'claude_fix', 'trajectory_validate', 'test_author', 'pre_verify',
-    'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready',
+    'claude_fix', 'trajectory_validate', 'test_author', 'pre_verify', 'post_verify',
+    'docker_validation', 'git_publication', 'cloud_upload',
+    'verification_finalize', 'platform_submit', 'delivery_ready',
   ]);
   for (const stage of job.stages || []) {
     if (Number(stage.bugIndex) !== normalizedIndex) continue;

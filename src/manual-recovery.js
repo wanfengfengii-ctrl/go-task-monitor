@@ -51,8 +51,11 @@ export function validateManualRecoveryBundle({
     issues.push('人工恢复测试文件哈希不一致');
   }
 
+  const expectedPreFixCommit = Number(metadata?.git_commit_layout_policy_version || 0) >= 1
+    ? metadata?.red_commit
+    : metadata?.bug_base_commit;
   for (const [phase, manifest, expectedResult, expectedExitCode, expectedCommit] of [
-    ['pre_fix', preManifest, 'red', 1, metadata?.bug_base_commit],
+    ['pre_fix', preManifest, 'red', 1, expectedPreFixCommit],
     ['post_fix', postManifest, 'green', 0, greenCommit],
   ]) {
     if (manifest?.mode !== 'manual_recovery_after_datastore_loss'

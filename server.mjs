@@ -20,6 +20,7 @@ import { parseTrajectoryJson } from './src/trajectory-file-validator.js';
 import { resolveTrajectoryManifestPrompt, validateTrajectoryManifest } from './src/trajectory-v4.js';
 import { platformCompatibleVerificationProofIssues, validateVerificationProofBundle, verificationCommandsSha256 } from './src/verification-proof.js';
 import { assertVerificationExportMetadata } from './src/verification-export-rules.js';
+import { assertRemoteGitDeliveryLayout, GIT_COMMIT_LAYOUT_POLICY_VERSION, usesFixedGitCommitLayout } from './src/git-delivery-layout.js';
 import { buildGoldRootCause, requireDockerHarness } from './src/export-rules.js';
 import { createExportValidationTokenStore, EXCEL_EXPORT_VALIDATION_BATCH_SIZE } from './src/export-coordinator.js';
 import { extractClaudeCodeVersion, getClaudeHarnessIssues, upsertClaudeCodeHarness } from './src/harness-rules.js';
@@ -134,7 +135,7 @@ import { assertVerificationCoverage, VERIFICATION_COVERAGE_POLICY_VERSION } from
 import { modelVerificationPlanIssues } from './src/model-verification.js';
 import { PROJECT_QUALITY_POLICY_VERSION } from './src/generated-project-quality.js';
 import { CURRENT_PROJECT_PACKAGE_POLICY_VERSION, projectPackageRuleOptions } from './src/project-package-policy.js';
-import { assignFrontendFlags, validateUserQueryDraft } from './src/bug-policy.js';
+import { assessBugDifficulty, BUG_DIFFICULTY_POLICY_VERSION, assignFrontendFlags, validateUserQueryDraft } from './src/bug-policy.js';
 import { isInjectionReviewStale, isUserQueryReviewStale, INJECTION_REVIEW_AUTO_CONTINUE_TIMEOUT_MS, USER_QUERY_AUTO_CONFIRM_TIMEOUT_MS } from './src/pipeline-review.js';
 import { classifySubmissionQualityIncident, isContributorQualityBlocked, normalizeSubmissionQualityState, recordSubmissionQualityIncident } from './src/submission-quality.js';
 import { DOCKER_RUN_CPU_LIMIT, explicitDockerVerifyCmds, packagedDockerVerifyCmds, publicTargetCommandForTask } from './scripts/run-production-pipeline.mjs';
@@ -4922,6 +4923,19 @@ async function validatePlatformVerificationCompatibility(task, submission) {
   }
 }
 
+async function validatePlatformBugDifficulty(task, jobOverride = null) {
+  const jobId = String(task?.pipeline_job_id || task?.pipelineJobId || '').trim();
+  const job = jobOverride || (jobId ? await readPipelineJob(jobId) : null);
+  if (!job || Number(job.request?.bugPolicyVersion || 0) < BUG_DIFFICULTY_POLICY_VERSION) return;
+  const bugIndex = Number(task?.bug_index ?? task?.bugIndex);
+  const bug = (job.bugs || []).find((item) => Number(item?.bugIndex) === bugIndex);
+  if (!bug?.discovery) throw new Error(`${task.bug_id} 缺少可复核的原始 Bug 难度记录`);
+  const assessment = assessBugDifficulty(bug.discovery);
+  if (!assessment.ok) {
+    throw new Error(`${task.bug_id} 平台提交前难度门禁未通过：${assessment.issues.join('；')}`);
+  }
+}
+
 function platformReviewFields(record = {}) {
   return JSON.stringify([
     record.platformSubmissionId || '',
@@ -5008,10 +5022,12 @@ async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId, { a
     throw new Error('提交平台节点与验证完成节点状态不一致');
   }
   const task = await loadPipelineReviewTask(job, bugIndex, taskId);
+  await validatePlatformBugDifficulty(task, job);
   const qualified = (await readReviewStatuses()).some((record) => record.taskId === task.id && record.status === 'qualified');
   if (!qualified) throw new Error(`${task.bug_id} 尚未通过本地交付审核`);
   await validateTaskExcelVerification(task);
   if (task.ruleIssues?.length) throw new Error(`${task.bug_id} 尚未满足交付规则：${task.ruleIssues.join('；')}`);
+  if (!legacyBackfill && usesFixedGitCommitLayout(task)) await assertRemoteGitDeliveryLayout(task);
   await readTrajectoryMetadata(task, { requireV4: await requiresV4Trajectory(task) });
 
   const schema = await submissionPlatformRequest('/form/fields');
@@ -5097,10 +5113,13 @@ async function resubmitTaskToPlatform(taskId, submissionId) {
   const task = (await discoverTasksFresh()).find((item) => item.id === taskId);
   if (!task) throw new Error('没有找到待返修任务');
   if (task.status !== 'passed') throw new Error(`${task.bug_id} 尚未完成，不能返修提交`);
-  const qualified = (await readReviewStatuses()).some((record) => record.taskId === task.id && record.status === 'qualified');
+  const qualified = (await readReviewStatuses()).some((record) => record.taskId === task.id && record.status === 'qualified')
+    || (task.archived === true && task.archiveExportReady === true && task.reviewStatus === 'qualified');
   if (!qualified) throw new Error(`${task.bug_id} 尚未通过本地交付审核`);
+  await validatePlatformBugDifficulty(task);
   await validateTaskExcelVerification(task);
   if (task.ruleIssues?.length) throw new Error(`${task.bug_id} 尚未满足交付规则：${task.ruleIssues.join('；')}`);
+  if (usesFixedGitCommitLayout(task)) await assertRemoteGitDeliveryLayout(task);
   await readTrajectoryMetadata(task, { requireV4: await requiresV4Trajectory(task) });
 
   const [schema, editable] = await Promise.all([
@@ -5700,6 +5719,9 @@ async function readVerificationProof(task, artifactKind) {
     mainSessionId: metadata.test_model_fix_session_id,
     otherSessionId: metadata.verification_evidence?.[otherPhase]?.session_id,
     bugBaseCommit: metadata.bug_base_commit,
+    preFixCommit: Number(metadata.git_commit_layout_policy_version || 0) >= GIT_COMMIT_LAYOUT_POLICY_VERSION
+      ? metadata.red_commit
+      : metadata.bug_base_commit,
     testModelFixCommit: metadata.test_model_fix_commit,
     verifyCmds: metadata.verify_cmds,
     evidence,

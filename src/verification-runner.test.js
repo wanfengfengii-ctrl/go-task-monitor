@@ -153,6 +153,41 @@ test('V5 proof validator rejects wrapper-script verification evidence', () => {
   assert.match(checked.issues.join(';'), /V5 .*direct|V5 .*verify_cmds/);
 });
 
+test('new bugfix proof policy binds pre-fix evidence to the Red commit', () => {
+  const verifyCmds = ['go test ./internal/service -run TestRegression -count=1'];
+  const manifest = {
+    policy_version: 5,
+    phase: 'pre_fix',
+    command_mode: 'direct_verify_cmds_v2',
+    command_count: 1,
+    session_id: '11111111-1111-4111-8111-111111111111',
+    source_commit: 'b'.repeat(40),
+    verify_cmds_sha256: verificationCommandsSha256(verifyCmds),
+    result: 'red',
+  };
+  const checked = validateVerificationProofBundle({
+    phase: 'pre_fix',
+    taskType: 'bugfix',
+    bugBaseCommit: 'a'.repeat(40),
+    preFixCommit: 'b'.repeat(40),
+    verifyCmds,
+    evidence: manifest,
+    manifest,
+  });
+  assert.doesNotMatch(checked.issues.join(';'), /源码 commit 与任务元数据不一致/);
+
+  const stale = validateVerificationProofBundle({
+    phase: 'pre_fix',
+    taskType: 'bugfix',
+    bugBaseCommit: 'a'.repeat(40),
+    preFixCommit: 'c'.repeat(40),
+    verifyCmds,
+    evidence: manifest,
+    manifest,
+  });
+  assert.match(stale.issues.join(';'), /源码 commit 与任务元数据不一致/);
+});
+
 test('historical diagnosis proof accepts MODEL_REPRO while retaining the raw command binding', () => {
   const verifyCmds = ["MODEL_REPRO=1 go test ./internal/service -run '^TestRegression$' -count=1 -v"];
   const manifest = {

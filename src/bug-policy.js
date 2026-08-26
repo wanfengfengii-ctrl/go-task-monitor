@@ -1,5 +1,5 @@
 export const BUG_TAXONOMY_POLICY_VERSION = 2;
-export const BUG_DIFFICULTY_POLICY_VERSION = 3;
+export const BUG_DIFFICULTY_POLICY_VERSION = 4;
 export const BUG_QUERY_POLICY_VERSION = 4;
 export const BUG_POLICY_VERSION = BUG_QUERY_POLICY_VERSION;
 export const USER_QUERY_SIMILARITY_THRESHOLD = 0.72;
@@ -154,8 +154,21 @@ export const BUG_DIFFICULTY_POLICY = Object.freeze({
     '单个比较符、下标、计数器或偏移量错误',
     '字符串前缀、空白、转义或分隔符处理错误',
     '漏调单个 decoder 或 validator 配置项',
+    '单个 SQL WHERE、查询或过滤条件增删',
+    '把集合、字段或函数参数替换成当前单项',
   ]),
 });
+
+const DECLARED_SHALLOW_MECHANISM_PATTERNS = Object.freeze([
+  {
+    pattern: /(?:SQL|UPDATE|SELECT|WHERE|查询|过滤)[\s\S]{0,180}(?:只按|只匹配|改为只|移除|删除|漏掉|遗漏|追加\s*(?:AND|OR)|增删)[\s\S]{0,100}(?:条件|字段|参数|行|匹配)?/iu,
+    issue: 'failure_mechanism 属于单个 SQL WHERE、查询或过滤条件增删',
+  },
+  {
+    pattern: /(?:把|将)[\s\S]{0,120}(?:集合|切片|参数|字段|目标)[\s\S]{0,120}(?:替换为|改为|传成|构造为|只检查)[\s\S]{0,100}(?:当前|单个|请求|错误|另一)/u,
+    issue: 'failure_mechanism 属于把集合、字段或函数参数替换成当前单项',
+  },
+]);
 
 function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean))];
@@ -176,6 +189,10 @@ export function assessBugDifficulty(record = {}) {
     issues.push(`affected_layers 至少需要 ${BUG_DIFFICULTY_POLICY.minimumAffectedLayers} 个不同边界`);
   }
   if (unknownLayers.length) issues.push(`affected_layers 包含未知值：${unknownLayers.join(', ')}`);
+  const failureMechanism = String(record.failure_mechanism || '').trim();
+  for (const shallow of DECLARED_SHALLOW_MECHANISM_PATTERNS) {
+    if (shallow.pattern.test(failureMechanism)) issues.push(shallow.issue);
+  }
   return {
     ok: issues.length === 0,
     issues,

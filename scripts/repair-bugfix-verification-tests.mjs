@@ -163,7 +163,9 @@ async function prepareMetadata(taskDir, before) {
 
 async function runProof(taskDir, phase, repository, branch) {
   const current = await readJson(path.join(taskDir, 'public.json'));
-  const expectedCommit = phase === 'pre_fix' ? current.bug_base_commit : current.test_model_fix_commit;
+  const expectedCommit = phase === 'pre_fix'
+    ? Number(current.git_commit_layout_policy_version || 0) >= 1 ? current.red_commit : current.bug_base_commit
+    : current.test_model_fix_commit;
   const expectedPromptSha = sha256(`${verificationProofPrompt(phase, current.verify_cmds)}\n`);
   const existing = current.verification_evidence?.[phase];
   if (existing?.source_commit === expectedCommit && existing?.local_manifest) {

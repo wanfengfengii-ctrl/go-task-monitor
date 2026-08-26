@@ -15,6 +15,10 @@ export function classifySubmissionQualityIncident(job = {}) {
   const stageError = (job.stages || []).find((item) => item?.id === stage)?.error || '';
   const error = `${text(job.error)}\n${text(stageError)}`;
   if (/Docker (?:Desktop|daemon)|Cannot connect to the Docker daemon|TLS handshake timeout|no space left on device|云盘|数据快照|SEEK_HOLE|snapshot lock|网关|\b429\b|\b5\d\d\b/i.test(error)) return null;
+  // Proof binding is an orchestrator/artifact compatibility failure. It does
+  // not say that the project failed to produce a deterministic red or green
+  // result, so it must never count toward a contributor quality breaker.
+  if (/(?:验证)?证明.{0,80}(?:绑定失效|提示词与系统固定提示不一致|源码 commit 与任务元数据不一致|manifest|Session|附件|哈希).{0,80}(?:不完整|不一致|失效|缺少)?/i.test(error)) return null;
   if (/verify_cmds.{0,120}(?:无关|不相关|不匹配)|(?:目标|验证)命令.{0,80}(?:与|和).{0,30}(?:Bug|故障).{0,20}(?:无关|不相关|不匹配)/i.test(error)) {
     return { type: 'unrelated_verify_cmds', reason: error };
   }

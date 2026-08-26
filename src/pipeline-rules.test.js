@@ -327,6 +327,33 @@ test('missing trajectory capture rewinds a false-positive Claude stage', () => {
   assert.equal(job.bugs[0].stageAutoRetries, undefined);
 });
 
+test('missing live trajectory preserves a durable repair checkpoint after cloud upload failure', () => {
+  const evidence = {
+    pre_fix: { result: 'red', session_id: 'pre-proof' },
+    post_fix: { result: 'green', session_id: 'post-proof' },
+  };
+  const job = {
+    bugs: [{ bugIndex: 3, verificationEvidence: evidence }],
+    stages: [
+      { id: 'bug3_claude_fix', bugIndex: 3, status: 'passed', finishedAt: '2026-08-26T02:04:35Z' },
+      { id: 'bug3_trajectory_validate', bugIndex: 3, status: 'passed' },
+      { id: 'bug3_test_author', bugIndex: 3, status: 'passed', result: { testFile: 'model_bug3_test.go' } },
+      { id: 'bug3_pre_verify', bugIndex: 3, status: 'passed', result: { result: 'red' } },
+      { id: 'bug3_post_verify', bugIndex: 3, status: 'passed', result: { result: 'green' } },
+      { id: 'bug3_docker_validation', bugIndex: 3, status: 'passed' },
+      { id: 'bug3_git_publication', bugIndex: 3, status: 'passed' },
+      { id: 'bug3_cloud_upload', bugIndex: 3, status: 'failed', error: 'proof upload failed' },
+      { id: 'bug3_delivery_ready', bugIndex: 3, status: 'pending' },
+    ],
+  };
+
+  assert.equal(rewindPipelineBugAfterMissingTrajectory(job, 3, '2026-08-26T03:00:00Z'), false);
+  assert.equal(job.stages[0].status, 'passed');
+  assert.equal(job.stages[7].status, 'failed');
+  assert.deepEqual(job.bugs[0].verificationEvidence, evidence);
+  assert.equal(job.bugs[0].verificationEvidenceHistory, undefined);
+});
+
 test('missing independent test author invalidates stale downstream verification checkpoints', () => {
   const oldEvidence = { pre_fix: { result: 'red', session_id: 'old-proof' } };
   const job = {

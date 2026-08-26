@@ -242,7 +242,11 @@ cp "$result_file" "$output_dir/verification-result.json"
 cp "$proof_root/verification-command-results.jsonl" "$output_dir/verification-command-results.jsonl"
 cp "$prompt_file" "$output_dir/PROMPT.md"
 
-source_commit="$(jq -r --arg phase "$phase" 'if $phase == "pre_fix" then .bug_base_commit else .test_model_fix_commit end // empty' "$task_dir/public.json")"
+source_commit="$(jq -r --arg phase "$phase" '
+  if $phase == "pre_fix" then
+    if (.git_commit_layout_policy_version // 0) >= 1 then .red_commit else .bug_base_commit end
+  else .test_model_fix_commit end // empty
+' "$task_dir/public.json")"
 [[ "$source_commit" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "$phase source commit is missing or invalid" >&2; exit 9; }
 verify_cmds_sha256="$(jq -c '.verify_cmds' "$task_dir/public.json" | shasum -a 256 | awk '{print $1}')"
 trajectory_sha256="$(shasum -a 256 "$output_dir/$trajectory_filename" | awk '{print $1}')"

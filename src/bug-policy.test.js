@@ -48,9 +48,9 @@ test('frontend assignment maintains a rolling contributor ratio of at least 30 p
   assert.equal(frontendRatioStatus(14, 5).ok, true);
 });
 
-test('V4 keeps V3 difficulty and adds independent user-query authorship policy', () => {
+test('V4 combines strict difficulty with independent user-query authorship policy', () => {
   assert.equal(BUG_POLICY_VERSION, BUG_QUERY_POLICY_VERSION);
-  assert.ok(BUG_QUERY_POLICY_VERSION > BUG_DIFFICULTY_POLICY_VERSION);
+  assert.equal(BUG_QUERY_POLICY_VERSION, BUG_DIFFICULTY_POLICY_VERSION);
   assert.equal(validateBugDifficulty(difficultBug()).ok, true);
   assert.equal(validateBugDifficulty(difficultBug({
     runtime_mechanisms: ['concurrency_race', 'resource_lifecycle'],
@@ -120,6 +120,8 @@ test('V3 bug difficulty rejects records that only describe shallow local edits',
     ['截止时间应使用大于而非大于等于', '单个比较符、下标、计数器或偏移量错误'],
     ['memory DSN 多拼接 file 前缀', '字符串前缀、空白、转义或分隔符处理错误'],
     ['漏调 DisallowUnknownFields', '漏调单个 decoder 或 validator 配置项'],
+    ['查询只按 operation_id 并移除 task_id 条件', '单个 SQL WHERE、查询或过滤条件增删'],
+    ['覆盖检查把全部孔位集合替换成当前请求孔', '把集合、字段或函数参数替换成当前单项'],
   ];
   for (const [description] of shallowCases) {
     const assessment = assessBugDifficulty({
@@ -134,4 +136,18 @@ test('V3 bug difficulty rejects records that only describe shallow local edits',
   const policy = bugDifficultyPolicyText();
   for (const [, policyPhrase] of shallowCases) assert.match(policy, new RegExp(policyPhrase));
   assert.throws(() => validateBugDifficulty({}), /Bug 难度门禁未通过/);
+});
+
+test('V4 rejects shallow SQL filters and collection argument swaps despite claimed cross-layer impact', () => {
+  const sql = assessBugDifficulty(difficultBug({
+    failure_mechanism: '把查询从 WHERE task_id=? AND operation_id=? 改为只按 operation_id=? 查找，并同步移除 taskID 参数。',
+  }));
+  assert.equal(sql.ok, false);
+  assert.match(sql.issues.join('；'), /SQL WHERE/);
+
+  const argument = assessBugDifficulty(difficultBug({
+    failure_mechanism: '将覆盖检查的全部孔位集合参数改为只检查当前请求孔，随后状态机提前推进。',
+  }));
+  assert.equal(argument.ok, false);
+  assert.match(argument.issues.join('；'), /当前单项/);
 });
