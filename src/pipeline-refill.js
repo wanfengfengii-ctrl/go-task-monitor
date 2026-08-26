@@ -9,8 +9,8 @@ export const PIPELINE_REFILL_FAILURE_COOLDOWN_MS = 60_000;
 // Match the four-project scheduler so the final healthy slot can be planned
 // instead of remaining idle behind a lower work-in-progress ceiling.
 export const PIPELINE_INCOMPLETE_PROJECT_LIMIT = 4;
-export const PIPELINE_TASK_TYPE_POLICY_VERSION = 2;
-export const PIPELINE_TASK_TYPE_RATIO = Object.freeze({ bugfix: 6, diagnosis: 4 });
+export const PIPELINE_TASK_TYPE_POLICY_VERSION = 3;
+export const PIPELINE_TASK_TYPE_RATIO = Object.freeze({ bugfix: 7, diagnosis: 3 });
 export const PIPELINE_LARGE_PROJECT_CANARY_LIMIT = 10;
 
 // A project remains part of the work-in-progress budget until it reaches a
@@ -315,7 +315,12 @@ export function normalizePipelineRefillPlan(value, {
       projectBrief,
       projectDomain: projectDomain.id,
       projectDomainLabel: projectDomain.label,
-      taskType: taskTypes[index] || (index < Math.ceil(count * 0.6) ? 'bugfix' : 'diagnosis'),
+      taskType: taskTypes[index] || (
+        index < Math.ceil(count * PIPELINE_TASK_TYPE_RATIO.bugfix
+          / (PIPELINE_TASK_TYPE_RATIO.bugfix + PIPELINE_TASK_TYPE_RATIO.diagnosis))
+          ? 'bugfix'
+          : 'diagnosis'
+      ),
       bugCount,
       projectTier,
       frontendRequired: Boolean(frontendFlags[index]),

@@ -18,11 +18,11 @@ import {
   shouldStartPipelineRefill,
 } from './pipeline-refill.js';
 
-test('new task-type allocation starts from zero and keeps a cumulative 6/4 split', () => {
+test('new task-type allocation starts from zero and keeps a cumulative 7/3 split', () => {
   const firstTen = allocatePipelineTaskTypes(10);
-  assert.equal(firstTen.filter((taskType) => taskType === 'bugfix').length, 6);
-  assert.equal(firstTen.filter((taskType) => taskType === 'diagnosis').length, 4);
-  assert.deepEqual(advancePipelineTaskTypeCounts({}, firstTen), { bugfix: 6, diagnosis: 4 });
+  assert.equal(firstTen.filter((taskType) => taskType === 'bugfix').length, 7);
+  assert.equal(firstTen.filter((taskType) => taskType === 'diagnosis').length, 3);
+  assert.deepEqual(advancePipelineTaskTypeCounts({}, firstTen), { bugfix: 7, diagnosis: 3 });
 });
 
 test('small replacement batches continue the new ratio without reading history', () => {
@@ -30,7 +30,7 @@ test('small replacement batches continue the new ratio without reading history',
   const counts = advancePipelineTaskTypeCounts({}, first);
   const second = allocatePipelineTaskTypes(2, counts);
   assert.deepEqual(first, ['bugfix', 'bugfix']);
-  assert.deepEqual(second, ['diagnosis', 'bugfix']);
+  assert.deepEqual(second, ['bugfix', 'diagnosis']);
   assert.deepEqual(advancePipelineTaskTypeCounts(counts, second), { bugfix: 3, diagnosis: 1 });
 });
 
@@ -74,11 +74,11 @@ function plan() {
   };
 }
 
-test('pipeline refill plan creates ten distinct standard questions with a deterministic 6/4 task split', () => {
+test('pipeline refill plan creates ten distinct standard questions with a deterministic 7/3 task split', () => {
   const questions = normalizePipelineRefillPlan(plan(), { count: 10 });
   assert.equal(questions.length, 10);
-  assert.equal(questions.filter((item) => item.taskType === 'bugfix').length, 6);
-  assert.equal(questions.filter((item) => item.taskType === 'diagnosis').length, 4);
+  assert.equal(questions.filter((item) => item.taskType === 'bugfix').length, 7);
+  assert.equal(questions.filter((item) => item.taskType === 'diagnosis').length, 3);
   assert.equal(questions.filter((item) => item.projectTier === 'large').length, 0);
   assert.equal(questions.filter((item) => item.projectTier === 'standard').length, 10);
   assert.deepEqual(questions.map((item) => item.bugCount), Array(10).fill(10));
