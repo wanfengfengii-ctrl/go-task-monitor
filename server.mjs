@@ -329,7 +329,9 @@ const PIPELINE_EVENT_THROTTLE_MS = 15_000;
 
 function invalidateTaskDiscoveryCache({ graceMs = 0 } = {}) {
   taskDiscoveryCache.expiresAt = taskDiscoveryCache.value && graceMs > 0
-    ? Math.max(taskDiscoveryCache.expiresAt, Date.now() + graceMs)
+    // Cap the stale snapshot's remaining lifetime. A sliding deadline would
+    // keep an old task list alive forever while busy pipelines write files.
+    ? Math.min(taskDiscoveryCache.expiresAt, Date.now() + graceMs)
     : 0;
   taskDiscoveryCache.generation += 1;
   if (!graceMs) workspaceProjectValidationCache.clear();
@@ -6189,7 +6191,11 @@ async function discoverTasks({ allowStale = false } = {}) {
   const generation = taskDiscoveryCache.generation;
   const discovery = discoverTasksFresh().then((value) => {
     if (generation !== taskDiscoveryCache.generation) {
-      taskDiscoveryCache.expiresAt = 0;
+      // The scan is still newer than the snapshot currently shown to the UI.
+      // Keep it briefly as a stale-while-revalidate value, but do not grant the
+      // normal cache lifetime because files changed while it was being built.
+      taskDiscoveryCache.value = value;
+      taskDiscoveryCache.expiresAt = Date.now() + TASK_DISCOVERY_DIRTY_SNAPSHOT_TTL_MS;
       return value;
     }
     taskDiscoveryCache.value = value;
@@ -6206,7 +6212,10 @@ async function discoverTasks({ allowStale = false } = {}) {
       addLog('warn', `任务索引刷新失败：${error.message}`);
     },
   );
-  if (allowStale && taskDiscoveryCache.value) return taskDiscoveryCache.value;
+  if (allowStale && taskDiscoveryCache.value) {
+    discovery.then(() => broadcast('data'), () => {});
+    return taskDiscoveryCache.value;
+  }
   return discovery;
 }
 
@@ -7906,7 +7915,10 @@ const server = http.createServer(async (request, response) => {
       }
     }
     if (request.url === '/api/run/status' && request.method === 'GET') {
-      const tasks = await discoverTasks();
+      // Building the full task index validates hundreds of repositories and
+      // can take over a minute. Serve the last complete snapshot immediately
+      // while discoverTasks refreshes it in the background.
+      const tasks = await discoverTasks({ allowStale: true });
       const pending = tasks.filter((task) => task.status === 'queued' && !task.pipelineManaged);
       const completed = tasks.filter((task) => task.status === 'passed');
       const reviewCounts = Object.fromEntries(['pending', 'qualified', 'unqualified'].map((status) => [status, completed.filter((task) => task.reviewStatus === status).length]));

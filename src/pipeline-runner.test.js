@@ -3664,14 +3664,33 @@ test('export record writes invalidate the task snapshot before the UI refreshes 
   assert.doesNotMatch(writer, /graceMs/);
 });
 
-test('an invalidated in-flight task discovery cannot republish its stale snapshot', async () => {
+test('an invalidated in-flight task discovery publishes only a short-lived snapshot', async () => {
   const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
   const start = server.indexOf('async function discoverTasks({ allowStale = false } = {})');
   const end = server.indexOf('async function discoverTasksFresh()', start);
   const discovery = server.slice(start, end);
   assert.ok(start >= 0 && end > start);
-  assert.match(discovery, /if \(generation !== taskDiscoveryCache\.generation\) \{\s*taskDiscoveryCache\.expiresAt = 0;\s*return value;\s*\}/);
+  assert.match(discovery, /if \(generation !== taskDiscoveryCache\.generation\) \{[\s\S]*taskDiscoveryCache\.value = value;[\s\S]*Date\.now\(\) \+ TASK_DISCOVERY_DIRTY_SNAPSHOT_TTL_MS;[\s\S]*return value;\s*\}/);
   assert.doesNotMatch(discovery, /generation === taskDiscoveryCache\.generation\s*\?\s*TASK_DISCOVERY_CACHE_TTL_MS\s*:\s*TASK_DISCOVERY_DIRTY_SNAPSHOT_TTL_MS/);
+});
+
+test('task data churn cannot indefinitely extend a stale discovery snapshot', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  const start = server.indexOf('function invalidateTaskDiscoveryCache({ graceMs = 0 } = {})');
+  const end = server.indexOf('function invalidatePipelineJobsCache()', start);
+  const invalidation = server.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(invalidation, /Math\.min\(taskDiscoveryCache\.expiresAt, Date\.now\(\) \+ graceMs\)/);
+  assert.doesNotMatch(invalidation, /Math\.max\(taskDiscoveryCache\.expiresAt, Date\.now\(\) \+ graceMs\)/);
+});
+
+test('run status serves a cached task snapshot while refreshing it in the background', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  const routeStart = server.indexOf("if (request.url === '/api/run/status' && request.method === 'GET')");
+  const routeEnd = server.indexOf("if (request.url === '/api/run/events'", routeStart);
+  const route = server.slice(routeStart, routeEnd);
+  assert.ok(routeStart >= 0 && routeEnd > routeStart);
+  assert.match(route, /discoverTasks\(\{ allowStale: true \}\)/);
 });
 
 test('proof upload confirms a cached task miss against a fresh filesystem scan', async () => {
