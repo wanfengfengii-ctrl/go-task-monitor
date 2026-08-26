@@ -4076,6 +4076,16 @@ test('pipeline job listing attempts mirror recovery before skipping a missing jo
   assert.match(server, /const parsed = restoredJob \|\| await readPipelineJob\(entry\.name\)/);
 });
 
+test('Docker maintenance retries stale temp cleanup after making read-only files writable', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  const cleanupStart = server.indexOf('async function cleanupManagedPipelineTempDirectories');
+  const cleanupEnd = server.indexOf('async function consolidatePipelineBuildxPool', cleanupStart);
+  const cleanup = server.slice(cleanupStart, cleanupEnd);
+  assert.match(cleanup, /\['EACCES', 'EPERM'\]\.includes\(error\?\.code\)/);
+  assert.match(cleanup, /runCapturedCommand\('chmod', \['-R', 'u\+w', candidate\]/);
+  assert.match(cleanup, /await fsp\.rm\(candidate, \{ recursive: true, force: true \}\)/);
+});
+
 test('Gold test discovery includes newly created untracked Go test files', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'pipeline-gold-tests-'));
   const runGit = (...args) => {

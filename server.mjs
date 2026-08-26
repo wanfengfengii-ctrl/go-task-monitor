@@ -3850,7 +3850,17 @@ async function cleanupManagedPipelineTempDirectories({ maxAgeHours }) {
       skippedActiveCount += 1;
       continue;
     }
-    await fsp.rm(candidate, { recursive: true, force: true });
+    try {
+      await fsp.rm(candidate, { recursive: true, force: true });
+    } catch (error) {
+      if (!['EACCES', 'EPERM'].includes(error?.code)) throw error;
+      const writable = await runCapturedCommand('chmod', ['-R', 'u+w', candidate], {
+        cwd: import.meta.dirname,
+        timeoutMs: 30_000,
+      });
+      if (writable.exitCode !== 0) throw error;
+      await fsp.rm(candidate, { recursive: true, force: true });
+    }
     removed.push(entry.name);
   }
 
