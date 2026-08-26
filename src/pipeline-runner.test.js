@@ -3084,8 +3084,10 @@ test('current workflow uses four Bug partitions and incrementally fills injectio
   for (const partition of ['api-orchestration', 'state-persistence', 'concurrency-resources', 'protocol-recovery']) {
     assert.match(pipeline, new RegExp(`id: '${partition}'`));
   }
-  assert.match(pipeline, /4 个互补分区/);
-  assert.match(pipeline, /runBoundedSettled\(NATURAL_BUG_SEARCH_PARTITIONS, finderConcurrency/);
+  assert.match(pipeline, /reusablePreviousNaturalBugFinders\(jobFile, batchKey\)/);
+  assert.match(pipeline, /natural-bug-batch-v\$\{NATURAL_BUG_BATCH_VERSION - 1\}/);
+  assert.match(pipeline, /复用上一版候选池 \$\{previousFinderResults\.length\}\/4 个已完成搜索分区/);
+  assert.match(pipeline, /runBoundedSettled\(pendingPartitions, finderConcurrency/);
   assert.match(pipeline, /GO_PIPELINE_INJECTION_PLAN_BATCH_SIZE \|\| 4/);
   assert.match(pipeline, /GO_PIPELINE_INJECTION_PLAN_TIMEOUT_MS \|\| 15 \* 60_000/);
   assert.match(pipeline, /GO_PIPELINE_INJECTION_PLAN_IDLE_TIMEOUT_MS \|\| 6 \* 60_000/);

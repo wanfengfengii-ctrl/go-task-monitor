@@ -5524,6 +5524,26 @@ async function runNaturalBugFinder({ jobFile, stageId, projectDir, jobDir, job, 
   return { ...result, partition: partition.id, durationMs: Date.now() - startedAtMs };
 }
 
+async function reusablePreviousNaturalBugFinders(jobFile, batchKey) {
+  const currentMarker = `natural-bug-batch-v${NATURAL_BUG_BATCH_VERSION}-`;
+  if (NATURAL_BUG_BATCH_VERSION <= 1 || !batchKey.startsWith(currentMarker)) return [];
+  const previousKey = batchKey.replace(
+    currentMarker,
+    `natural-bug-batch-v${NATURAL_BUG_BATCH_VERSION - 1}-`,
+  );
+  const recovered = [];
+  for (const partition of NATURAL_BUG_SEARCH_PARTITIONS) {
+    const result = await reusableCodexJson(jobFile, `${previousKey}-${partition.id}`);
+    if (result) recovered.push({
+      ...result,
+      partition: partition.id,
+      durationMs: 0,
+      recoveredFromBatchVersion: NATURAL_BUG_BATCH_VERSION - 1,
+    });
+  }
+  return recovered;
+}
+
 async function reviewNaturalBugCandidateBatch({ jobFile, stageId, projectDir, jobDir, job, candidates, batchKey }) {
   const name = `${batchKey}-review`;
   const reusable = await reusableCodexJson(jobFile, name);
@@ -5617,12 +5637,23 @@ async function ensureNaturalBugBatch(jobFile, projectDir) {
   const batchStartedAtMs = Date.now();
   const finderConcurrency = await currentBugSourceWorkerLimit();
   const recoveredSeed = await naturalBugCandidateSeedResult(jobDir, job.naturalBugCandidateSeed);
+  const previousFinderResults = recoveredSeed
+    ? []
+    : await reusablePreviousNaturalBugFinders(jobFile, batchKey);
+  const recoveredPartitions = new Set(previousFinderResults.map((result) => result.partition));
+  const pendingPartitions = NATURAL_BUG_SEARCH_PARTITIONS
+    .filter((partition) => !recoveredPartitions.has(partition.id));
   let settled = [];
   if (recoveredSeed) {
     await appendLog(jobFile, 'info', `复用 ${recoveredSeed.output.candidates.length} 个历史技术候选，跳过四分区重搜并直接进入统一去重与难度复核`, stageId);
   } else {
-    await appendLog(jobFile, 'info', `启动项目级 Bug 候选池：4 个互补分区，当前 ${finderConcurrency} 路并行，覆盖剩余 ${remainingCount} 个槽位；每分区最多返回 ${partitionCandidateLimit} 个候选`, stageId);
-    settled = await runBoundedSettled(NATURAL_BUG_SEARCH_PARTITIONS, finderConcurrency, (partition) => runNaturalBugFinder({
+    if (previousFinderResults.length) {
+      await appendLog(jobFile, 'info', `复用上一版候选池 ${previousFinderResults.length}/4 个已完成搜索分区，只重新执行 V${NATURAL_BUG_BATCH_VERSION} 公开测试契约复核`, stageId);
+    }
+    if (pendingPartitions.length) {
+      await appendLog(jobFile, 'info', `启动项目级 Bug 候选池：${pendingPartitions.length} 个待搜索分区，当前 ${finderConcurrency} 路并行，覆盖剩余 ${remainingCount} 个槽位；每分区最多返回 ${partitionCandidateLimit} 个候选`, stageId);
+    }
+    settled = await runBoundedSettled(pendingPartitions, finderConcurrency, (partition) => runNaturalBugFinder({
       jobFile,
       stageId,
       projectDir,
@@ -5635,12 +5666,12 @@ async function ensureNaturalBugBatch(jobFile, projectDir) {
     }));
   }
   const searchDurationMs = Date.now() - batchStartedAtMs;
-  const finderResults = recoveredSeed ? [recoveredSeed] : [];
+  const finderResults = recoveredSeed ? [recoveredSeed] : [...previousFinderResults];
   const finderFailureCount = recoveredSeed ? 0 : naturalBugFinderFailureCount(settled);
   for (let index = 0; index < settled.length; index += 1) {
     const result = settled[index];
     if (result.status === 'fulfilled') finderResults.push(result.value);
-    else await appendLog(jobFile, 'warn', `Bug 候选分区 ${NATURAL_BUG_SEARCH_PARTITIONS[index].id} 未完成：${result.reason?.message || result.reason}`, stageId);
+    else await appendLog(jobFile, 'warn', `Bug 候选分区 ${pendingPartitions[index].id} 未完成：${result.reason?.message || result.reason}`, stageId);
   }
   // A failed finder is an infrastructure failure, not an empty candidate
   // pool. Keep discovery pending and return the runner to the central
