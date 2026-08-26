@@ -71,6 +71,7 @@ import { classifyPipelineFailure, isPipelineAutofillEligible, isRetryablePipelin
 import {
   allocateProjectDomainFamilies,
   allocatePipelineTaskTypes,
+  applyPipelineTaskTypePolicy,
   advancePipelineTaskTypeCounts,
   autoRefillProjectTiers,
   normalizePipelineRefillPlan,
@@ -79,7 +80,6 @@ import {
   PIPELINE_INCOMPLETE_PROJECT_LIMIT,
   PIPELINE_TASK_TYPE_POLICY_VERSION,
   normalizePipelineTaskTypeCounts,
-  pipelineCommittedTaskTypeCounts,
   countIncompletePipelineProjects,
   normalizeLargeProjectCanary,
   pipelineRefillCapacity,
@@ -2353,23 +2353,13 @@ async function ensurePipelineRefill() {
     let refill = await readPipelineRefillState();
   try {
     const jobs = await listPipelineJobs();
-    // Policy upgrades seed the counter from every non-abandoned project
-    // commitment. This keeps variable 10/30-question project sizes from
-    // drifting away from the target task ratio.
-    if (Number(refill.taskTypePolicyVersion || 0) !== PIPELINE_TASK_TYPE_POLICY_VERSION) {
-      refill = {
-        ...refill,
-        taskTypePolicyVersion: PIPELINE_TASK_TYPE_POLICY_VERSION,
-        taskTypeCounts: pipelineCommittedTaskTypeCounts(jobs),
-        largeProjectCanary: normalizeLargeProjectCanary(refill.largeProjectCanary),
-      };
+    const taskTypePolicyChanged = Number(refill.taskTypePolicyVersion || 0) !== PIPELINE_TASK_TYPE_POLICY_VERSION;
+    refill = {
+      ...applyPipelineTaskTypePolicy(refill),
+      largeProjectCanary: normalizeLargeProjectCanary(refill.largeProjectCanary),
+    };
+    if (taskTypePolicyChanged) {
       await writePipelineRefillState(refill);
-    } else {
-      refill = {
-        ...refill,
-        taskTypeCounts: normalizePipelineTaskTypeCounts(refill.taskTypeCounts),
-        largeProjectCanary: normalizeLargeProjectCanary(refill.largeProjectCanary),
-      };
     }
     const incompleteCount = countIncompletePipelineProjects(jobs);
     const refillCapacity = pipelineRefillCapacity(jobs);

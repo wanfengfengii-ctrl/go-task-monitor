@@ -172,6 +172,22 @@ export function normalizePipelineTaskTypeCounts(value = {}) {
   };
 }
 
+export function applyPipelineTaskTypePolicy(state = {}) {
+  if (Number(state.taskTypePolicyVersion || 0) === PIPELINE_TASK_TYPE_POLICY_VERSION) {
+    return {
+      ...state,
+      taskTypeCounts: normalizePipelineTaskTypeCounts(state.taskTypeCounts),
+    };
+  }
+  const counts = { bugfix: 0, diagnosis: 0 };
+  return {
+    ...state,
+    taskTypePolicyVersion: PIPELINE_TASK_TYPE_POLICY_VERSION,
+    taskTypeCounts: counts,
+    taskTypeCountsBeforeBatch: counts,
+  };
+}
+
 export function pipelineCommittedTaskTypeCounts(jobs = []) {
   const counts = { bugfix: 0, diagnosis: 0 };
   for (const job of Array.isArray(jobs) ? jobs : []) {

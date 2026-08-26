@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   advancePipelineTaskTypeCounts,
   allocatePipelineTaskTypes,
+  applyPipelineTaskTypePolicy,
   autoRefillProjectTiers,
   allocateProjectDomainFamilies,
   countIncompletePipelineProjects,
@@ -23,6 +24,25 @@ test('new task-type allocation starts from zero and keeps a cumulative 7/3 split
   assert.equal(firstTen.filter((taskType) => taskType === 'bugfix').length, 7);
   assert.equal(firstTen.filter((taskType) => taskType === 'diagnosis').length, 3);
   assert.deepEqual(advancePipelineTaskTypeCounts({}, firstTen), { bugfix: 7, diagnosis: 3 });
+});
+
+test('new task-type policy starts a future-only ratio epoch without rewriting a planned batch', () => {
+  const legacy = {
+    taskTypePolicyVersion: 2,
+    taskTypeCounts: { bugfix: 250, diagnosis: 170 },
+    taskTypeCountsBeforeBatch: { bugfix: 240, diagnosis: 170 },
+    taskTypes: ['diagnosis', 'bugfix'],
+  };
+  assert.deepEqual(applyPipelineTaskTypePolicy(legacy), {
+    ...legacy,
+    taskTypePolicyVersion: 3,
+    taskTypeCounts: { bugfix: 0, diagnosis: 0 },
+    taskTypeCountsBeforeBatch: { bugfix: 0, diagnosis: 0 },
+  });
+  assert.deepEqual(applyPipelineTaskTypePolicy({
+    taskTypePolicyVersion: 3,
+    taskTypeCounts: { bugfix: 7, diagnosis: 3 },
+  }).taskTypeCounts, { bugfix: 7, diagnosis: 3 });
 });
 
 test('small replacement batches continue the new ratio without reading history', () => {
