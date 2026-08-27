@@ -178,6 +178,95 @@ export function isLegacyDeliveredPlatformBackfill(job, bugIndex, currentPolicyVe
   return bug?.disposition === 'delivered' && delivery?.status === 'passed';
 }
 
+export function isSubmissionPlatformUnavailableError(value) {
+  const message = text(value?.message ?? value);
+  if (!message) return false;
+  return /质检提交平台维护中|等待统一补交|请在任务系统中连接一次提交平台|请重新连接|钥匙串中没有找到提交平台凭据|提交平台自动登录(?:已被取消|失败)|用户名或密码错误/i.test(message)
+    || /(?:提交平台|质检平台)[\s\S]{0,160}(?:HTTP\s*5\d\d|fetch failed|network|timeout|timed out|超时|断开|不可用|维护|ECONN|ENOTFOUND|EAI_AGAIN)/i.test(message)
+    || /(?:HTTP\s*5\d\d|fetch failed|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)[\s\S]{0,160}(?:提交平台|质检平台)/i.test(message);
+}
+
+export function isDeferredPlatformSubmissionStage(stage = {}) {
+  if (stage?.stage !== 'platform_submit' && !/_platform_submit$/.test(text(stage?.id))) return false;
+  if (stage.deferred === true || stage?.result?.deferred === true) return true;
+  if (stage.status === 'skipped' && /延期|维护|统一补交|等待平台/.test(text(stage.reason))) return true;
+  return stage.status === 'failed' && isSubmissionPlatformUnavailableError(stage.error);
+}
+
+export function deferredPlatformBugIndexes(job = {}) {
+  return [...new Set((job.stages || [])
+    .filter(isDeferredPlatformSubmissionStage)
+    .map((stage) => Number(stage.bugIndex || text(stage.id).match(/^bug(\d+)_/)?.[1]))
+    .filter((index) => Number.isInteger(index) && index > 0))]
+    .sort((left, right) => left - right);
+}
+
+export function reopenDeferredPlatformSubmissions(job = {}, reopenedAt = new Date().toISOString()) {
+  const updated = structuredClone(job || {});
+  const bugIndexes = deferredPlatformBugIndexes(updated);
+  if (!bugIndexes.length) return { changed: false, job: updated, bugIndexes };
+
+  const pendingRetries = new Set((updated.pendingBugRetries || [])
+    .map(Number)
+    .filter((index) => Number.isInteger(index) && index > 0));
+  for (const bugIndex of bugIndexes) {
+    pendingRetries.add(bugIndex);
+    const platformStage = (updated.stages || []).find((stage) => stage.id === `bug${bugIndex}_platform_submit`);
+    if (platformStage) {
+      platformStage.status = 'pending';
+      platformStage.startedAt = null;
+      platformStage.finishedAt = null;
+      platformStage.error = '';
+      platformStage.reason = '质检提交平台已恢复，等待统一补交';
+      delete platformStage.deferred;
+      delete platformStage.deferredAt;
+      delete platformStage.result;
+    }
+    const deliveryStage = (updated.stages || []).find((stage) => stage.id === `bug${bugIndex}_delivery_ready`);
+    if (deliveryStage) {
+      deliveryStage.status = 'pending';
+      deliveryStage.startedAt = null;
+      deliveryStage.finishedAt = null;
+      deliveryStage.error = '';
+      deliveryStage.reason = '等待质检平台统一补交完成';
+    }
+    const bug = (updated.bugs || []).find((item) => Number(item.bugIndex) === bugIndex);
+    if (bug) {
+      delete bug.disposition;
+      delete bug.failureDisposition;
+      delete bug.failureStage;
+      delete bug.failureReason;
+      delete bug.deliveredAt;
+      bug.workerExecution = {
+        ...(bug.workerExecution || {}),
+        status: 'fast_lane_queued',
+        currentStage: `bug${bugIndex}_platform_submit`,
+        currentAttempt: 0,
+        blockedReason: '等待质检平台统一补交',
+        lastAction: 'platform_backfill_queued',
+        updatedAt: reopenedAt,
+      };
+    }
+  }
+  updated.pendingBugRetries = [...pendingRetries].sort((left, right) => left - right);
+  updated.currentStage = `bug${bugIndexes[0]}_platform_submit`;
+  updated.error = '';
+  updated.finishedAt = null;
+  updated.updatedAt = reopenedAt;
+  updated.bugExecution = {
+    ...(updated.bugExecution || {}),
+    selectedBugIndex: bugIndexes[0],
+    status: 'fast_lane_queued',
+    startedAt: null,
+    currentStage: `bug${bugIndexes[0]}_platform_submit`,
+    currentAttempt: 0,
+    blockedReason: '等待质检平台统一补交',
+    lastAction: 'platform_backfill_queued',
+    updatedAt: reopenedAt,
+  };
+  return { changed: true, job: updated, bugIndexes };
+}
+
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (!value || typeof value !== 'object') return value;

@@ -52,12 +52,14 @@ import {
   buildPlatformReviewSnapshot,
   buildSubmissionActivityStats,
   DEFAULT_SUBMISSION_PLATFORM_URL,
+  deferredPlatformBugIndexes,
   extractPlatformSubmissionItems,
   extractPlatformSubmissionTotal,
   findPlatformSubmissionByBugId,
   findPlatformSubmissionForRecord,
   isLegacyDeliveredPlatformBackfill,
   isReadmeOnlyPlatformRepairReason,
+  isSubmissionPlatformUnavailableError,
   mergePlatformSubmissionReview,
   mergePlatformCookies,
   platformApiMessage,
@@ -66,6 +68,7 @@ import {
   platformSubmissionFingerprint,
   platformSubmissionId,
   preparePlatformSubmission,
+  reopenDeferredPlatformSubmissions,
 } from './src/submission-platform.js';
 import { enqueueBugRetry, normalizeBugExecution, nextIncompleteBugIndex } from './src/bug-workbench.js';
 import { classifyPipelineFailure, isPipelineAutofillEligible, isRetryablePipelineStartError, isStaleQueuedPipelineReservation, MAX_PIPELINE_AUTO_RETRIES, MAX_PIPELINE_CONCURRENCY, pipelineAbandonmentState, pipelineAutofillStartCapacity, pipelineOccupiedJobIds, pipelineResumeUsesExistingAdmission, pipelineRetryState, queuePipelineManualRetry, reconcilePipelineCloudUpload, reopenPipelineAbandonmentForManualRetry, selectPipelineAutofillCandidates } from './src/pipeline-concurrency.js';
@@ -249,6 +252,7 @@ const cloudHealthCheckIntervalMs = 2 * 60 * 1000;
 const submissionPlatformBaseUrl = String(process.env.GO_SUBMISSION_PLATFORM_URL || DEFAULT_SUBMISSION_PLATFORM_URL).replace(/\/$/, '');
 const submissionPlatformApiUrl = `${submissionPlatformBaseUrl}/api/v1`;
 const submissionPlatformSessionPath = path.join(managedLibraryRoot, 'validation/submission_platform_session.json');
+const submissionPlatformControlPath = path.join(managedLibraryRoot, 'validation/submission_platform_control.json');
 const submissionPlatformRecordsPath = path.join(managedLibraryRoot, 'validation/platform_submissions.json');
 const submissionPlatformRecordsLockPath = `${submissionPlatformRecordsPath}.lock`;
 const submissionPlatformReviewSnapshotPath = path.join(managedLibraryRoot, 'validation/platform_review_snapshot.json');
@@ -302,6 +306,9 @@ const submissionPlatformSubmitTails = new Map();
 let submissionPlatformReviewSyncPromise = null;
 let submissionPlatformReviewLastSyncedAt = null;
 let submissionPlatformReviewLastError = '';
+let submissionPlatformSyncPaused = false;
+let submissionPlatformSyncPausedAt = null;
+let submissionPlatformSyncPauseReason = '';
 let automaticUploadRunning = false;
 let pipelineCloudReconcileRunning = false;
 const automaticUploadRetryAt = new Map();
@@ -4629,6 +4636,38 @@ async function persistSubmissionPlatformSession() {
   await fsp.chmod(submissionPlatformSessionPath, 0o600);
 }
 
+async function persistSubmissionPlatformControl() {
+  await fsp.mkdir(path.dirname(submissionPlatformControlPath), { recursive: true });
+  const temporary = `${submissionPlatformControlPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const control = {
+    syncPaused: submissionPlatformSyncPaused,
+    pausedAt: submissionPlatformSyncPausedAt,
+    pauseReason: submissionPlatformSyncPauseReason,
+    updatedAt: new Date().toISOString(),
+  };
+  await fsp.writeFile(temporary, `${JSON.stringify(control, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await fsp.rename(temporary, submissionPlatformControlPath);
+  await fsp.chmod(submissionPlatformControlPath, 0o600);
+}
+
+async function restoreSubmissionPlatformControl() {
+  try {
+    const saved = JSON.parse(await fsp.readFile(submissionPlatformControlPath, 'utf8'));
+    submissionPlatformSyncPaused = saved?.syncPaused === true;
+    submissionPlatformSyncPausedAt = saved?.pausedAt || null;
+    submissionPlatformSyncPauseReason = String(saved?.pauseReason || '');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+}
+
+async function setSubmissionPlatformSyncPaused(paused, reason = '') {
+  submissionPlatformSyncPaused = paused === true;
+  submissionPlatformSyncPausedAt = submissionPlatformSyncPaused ? new Date().toISOString() : null;
+  submissionPlatformSyncPauseReason = submissionPlatformSyncPaused ? String(reason || '人工暂停质检平台同步') : '';
+  await persistSubmissionPlatformControl();
+}
+
 async function requestSubmissionPlatformLogin(username, password) {
   const response = await fetch(`${submissionPlatformApiUrl}/auth/login`, {
     method: 'POST',
@@ -4668,6 +4707,7 @@ async function connectSubmissionPlatform(username, password) {
   submissionPlatformLastRefreshedAt = submissionPlatformLastCheckedAt;
   submissionPlatformLastError = '';
   await persistSubmissionPlatformSession();
+  await setSubmissionPlatformSyncPaused(false);
 }
 
 async function clearSubmissionPlatformSession({ forgetCredentials = false } = {}) {
@@ -4728,6 +4768,7 @@ async function refreshSubmissionPlatformLogin(reason = '会话失效') {
 }
 
 async function ensureSubmissionPlatformSession(reason = '需要提交') {
+  if (submissionPlatformSyncPaused) throw new Error('质检提交平台维护中，等待统一补交');
   if (submissionPlatformCookie) return true;
   return refreshSubmissionPlatformLogin(reason);
 }
@@ -4955,6 +4996,7 @@ function platformReviewFields(record = {}) {
 
 async function reconcileSubmissionPlatformReviews() {
   if (submissionPlatformReviewSyncPromise) return submissionPlatformReviewSyncPromise;
+  if (submissionPlatformSyncPaused) return { updated: 0, remote: 0, paused: true };
   if (!submissionPlatformCookie && !(submissionPlatformAutoLoginConfigured && submissionPlatformAutoLoginAccount)) return { updated: 0, remote: 0 };
   const sync = (async () => {
     const observedAt = new Date().toISOString();
@@ -5214,9 +5256,10 @@ async function resubmitTaskToPlatform(taskId, submissionId, {
 }
 
 async function submissionPlatformPublicState() {
-  const [records, remoteSnapshot] = await Promise.all([
+  const [records, remoteSnapshot, pipelineJobs] = await Promise.all([
     readSubmissionPlatformRecords(),
     readSubmissionPlatformReviewSnapshot(),
+    listPipelineJobs(),
   ]);
   const localReviewCounts = records.reduce((counts, record) => {
     const status = String(record?.platformReviewStatus || '').trim();
@@ -5233,6 +5276,10 @@ async function submissionPlatformPublicState() {
     connected: Boolean(submissionPlatformCookie),
     connectedAs: submissionPlatformConnectedAs || submissionPlatformAutoLoginAccount,
     autoLoginConfigured: submissionPlatformAutoLoginConfigured,
+    syncPaused: submissionPlatformSyncPaused,
+    syncPausedAt: submissionPlatformSyncPausedAt,
+    syncPauseReason: submissionPlatformSyncPauseReason,
+    deferredSubmissionCount: pipelineJobs.reduce((total, job) => total + deferredPlatformBugIndexes(job).length, 0),
     lastCheckedAt: submissionPlatformLastCheckedAt,
     lastRefreshedAt: submissionPlatformLastRefreshedAt,
     lastError: submissionPlatformLastError,
@@ -5268,20 +5315,35 @@ async function remoteWorkerSubmissionStats() {
 }
 
 async function resumeSubmissionPlatformWaiters() {
-  let resumed = 0;
+  if (submissionPlatformSyncPaused || !submissionPlatformCookie) {
+    return { resumedProjects: 0, resumedBugs: 0 };
+  }
+  let resumedProjects = 0;
+  let resumedBugs = 0;
   for (const visible of await listPipelineJobs()) {
-    if (!pipelineRetryState(visible).waitingForPlatform || activePipelineProcesses.has(visible.id)) continue;
+    // Let a live Runner finish its current batch. The periodic recovery scan
+    // reopens its platform tail after it goes idle, avoiding cursor write races.
+    if (activePipelineProcesses.has(visible.id)) continue;
     const job = await readPipelineJob(visible.id);
-    if (!job || !pipelineRetryState(job).waitingForPlatform) continue;
+    if (!job) continue;
+    const reopened = reopenDeferredPlatformSubmissions(job);
+    if (reopened.changed) {
+      const queued = queuePipelineManualRetry(reopened.job, new Date().toISOString(), 'submission_platform_backfill');
+      await writePipelineJob(queued);
+      resumedProjects += 1;
+      resumedBugs += reopened.bugIndexes.length;
+      continue;
+    }
+    if (!pipelineRetryState(job).waitingForPlatform) continue;
     const queued = queuePipelineManualRetry(job, new Date().toISOString(), 'submission_platform_connected');
     await writePipelineJob(queued);
-    resumed += 1;
+    resumedProjects += 1;
   }
-  if (resumed) {
-    addLog('info', `提交平台连接恢复，已重新排队 ${resumed} 个等待提交的项目`);
+  if (resumedProjects) {
+    addLog('info', `提交平台连接恢复，已重新排队 ${resumedProjects} 个项目、${resumedBugs} 个延期 Bug`);
     void fillPipelineSlots();
   }
-  return resumed;
+  return { resumedProjects, resumedBugs };
 }
 
 async function pathExists(target) {
@@ -7991,18 +8053,33 @@ const server = http.createServer(async (request, response) => {
         await connectSubmissionPlatform(username, password);
         await reconcileSubmissionPlatformReviews();
         const resumed = await resumeSubmissionPlatformWaiters();
-        return json(response, 200, { message: `提交平台已连接，自动登录已启用${resumed ? `；已恢复 ${resumed} 个等待项目` : ''}`, ...(await submissionPlatformPublicState()) });
+        return json(response, 200, { message: `提交平台已连接，自动登录已启用${resumed.resumedProjects ? `；已恢复 ${resumed.resumedProjects} 个项目、${resumed.resumedBugs} 个延期 Bug` : ''}`, ...(await submissionPlatformPublicState()) });
       } catch (error) {
         return json(response, 409, { message: error.message, ...(await submissionPlatformPublicState().catch(() => ({}))) });
       }
     }
     if (request.url === '/api/submission-platform/disconnect' && request.method === 'POST') {
       try {
+        await setSubmissionPlatformSyncPaused(true, '人工断开质检提交平台');
         await clearSubmissionPlatformSession({ forgetCredentials: true });
         return json(response, 200, { message: '提交平台已断开，钥匙串凭据已删除', ...(await submissionPlatformPublicState()) });
       } catch (error) {
         return json(response, 409, { message: error.message, ...(await submissionPlatformPublicState().catch(() => ({}))) });
       }
+    }
+    if (request.url === '/api/submission-platform/control' && request.method === 'POST') {
+      const body = await readJson(request).catch(() => ({}));
+      const paused = body.paused !== false;
+      await setSubmissionPlatformSyncPaused(paused, body.reason || (paused ? '人工暂停质检平台同步' : ''));
+      const resumed = !paused && submissionPlatformCookie
+        ? await resumeSubmissionPlatformWaiters()
+        : { resumedProjects: 0, resumedBugs: 0 };
+      return json(response, 200, {
+        message: paused
+          ? '质检平台同步与自动提交已暂停'
+          : `质检平台同步与自动提交已恢复${resumed.resumedBugs ? `；已重新排队 ${resumed.resumedBugs} 个延期 Bug` : ''}`,
+        ...(await submissionPlatformPublicState()),
+      });
     }
     if (request.url === '/api/submission-platform/submit' && request.method === 'POST') {
       const body = await readJson(request);
@@ -8012,12 +8089,30 @@ const server = http.createServer(async (request, response) => {
       if (!pipelineJobId || !Number.isInteger(bugIndex) || bugIndex < 1 || !taskId) {
         return json(response, 400, { message: 'pipelineJobId、bugIndex 和 taskId 必填' });
       }
+      const deferred = (reason) => ({
+        deferred: true,
+        deferredAt: new Date().toISOString(),
+        reason: String(reason || '质检提交平台维护中，等待统一补交'),
+        pipelineJobId,
+        bugIndex,
+        taskId,
+      });
+      if (submissionPlatformSyncPaused) {
+        const submission = deferred(submissionPlatformSyncPauseReason);
+        return json(response, 202, { message: submission.reason, submission });
+      }
       try {
         const submission = await submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId, {
           allowLegacyDeliveredBackfill: body.legacyDeliveredBackfill === true,
         });
         return json(response, 200, { message: submission.skipped ? '提交平台记录已存在，已完成幂等确认' : '已提交质检平台', submission });
       } catch (error) {
+        if (isSubmissionPlatformUnavailableError(error)) {
+          await setSubmissionPlatformSyncPaused(true, error.message);
+          const submission = deferred(error.message);
+          addLog('warn', `质检平台暂不可用，Bug ${bugIndex} 已延期统一补交：${error.message}`);
+          return json(response, 202, { message: submission.reason, submission });
+        }
         return json(response, 409, { message: error.message });
       }
     }
@@ -8303,8 +8398,12 @@ async function restoreRuntimeAfterRestart() {
     if (error.code !== 'ENOENT') addLog('warn', error.message);
   }
   try {
+    await restoreSubmissionPlatformControl();
     await restoreSubmissionPlatformSession();
-    await reconcileSubmissionPlatformReviews();
+    if (!submissionPlatformSyncPaused) {
+      await reconcileSubmissionPlatformReviews();
+      await resumeSubmissionPlatformWaiters();
+    }
   } catch (error) {
     if (error.code !== 'ENOENT') addLog('warn', `提交平台会话恢复失败：${error.message}`);
   }
@@ -8456,6 +8555,10 @@ setInterval(() => {
   void maintainCloudSession().catch((error) => addLog('warn', `云盘自动恢复暂未成功：${error.message}`));
 }, 60_000).unref();
 setInterval(() => {
-  void reconcileSubmissionPlatformReviews()
+  if (submissionPlatformSyncPaused) return;
+  void (async () => {
+    await reconcileSubmissionPlatformReviews();
+    await resumeSubmissionPlatformWaiters();
+  })()
     .catch((error) => addLog('warn', `提交平台审核状态同步失败：${error.message}`));
 }, 60_000).unref();

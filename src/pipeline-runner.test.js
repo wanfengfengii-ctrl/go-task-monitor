@@ -4089,6 +4089,26 @@ test('new pipelines submit the strictly validated delivery to the normal review 
   assert.doesNotMatch(server, /admin\/import\/excel/);
 });
 
+test('submission platform maintenance defers only the platform tail and reconnects it later', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  const frontend = await readFile(path.resolve(import.meta.dirname, './main.jsx'), 'utf8');
+  assert.match(pipeline, /PIPELINE_SUBMISSION_PLATFORM_DEFERRED/);
+  assert.match(pipeline, /setStage\(jobFile, stageId, 'skipped',[\s\S]*deferred: true/);
+  assert.match(pipeline, /platformSubmissionDeferred = platformSubmission\?\.deferred === true/);
+  assert.match(pipeline, /质检平台等待统一补交/);
+  assert.match(server, /submission_platform_control\.json/);
+  assert.match(server, /if \(submissionPlatformSyncPaused\) return;/);
+  assert.match(server, /reopenDeferredPlatformSubmissions\(job\)/);
+  assert.match(server, /submission_platform_backfill/);
+  assert.match(server, /activePipelineProcesses\.has\(visible\.id\)\) continue;[\s\S]{0,300}reopenDeferredPlatformSubmissions\(job\)/);
+  assert.match(server, /reconcileSubmissionPlatformReviews\(\);[\s\S]{0,120}resumeSubmissionPlatformWaiters\(\)/);
+  assert.match(server, /isSubmissionPlatformUnavailableError\(error\)/);
+  assert.match(server, /return json\(response, 202, \{ message: submission\.reason, submission \}\)/);
+  assert.match(frontend, /const applySubmissionPlatformState = \(payload\) => \{[\s\S]{0,500}syncPaused: Boolean\(payload\.syncPaused\)/);
+  assert.match(frontend, /平台维护中 · 待补 \{submissionPlatformState\.deferredSubmissionCount\}/);
+});
+
 test('README-only repairs may reuse an exact qualified archived delivery certificate', async () => {
   const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
   const repair = await readFile(path.resolve(import.meta.dirname, '../scripts/repair-platform-readme-introductions.mjs'), 'utf8');

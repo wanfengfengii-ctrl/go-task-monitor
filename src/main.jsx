@@ -532,7 +532,7 @@ function App() {
   const [cloudPassword, setCloudPassword] = useState('');
   const [cloudBusy, setCloudBusy] = useState(false);
   const [cloudMessage, setCloudMessage] = useState('');
-  const [submissionPlatformState, setSubmissionPlatformState] = useState({ connected: false, connectedAs: '', autoLoginConfigured: false, lastCheckedAt: null, lastRefreshedAt: null, lastError: '', reviewLastSyncedAt: null, reviewLastError: '', pendingRepairCount: 0, reviewCounts: {}, submittedCount: 0, submissions: [] });
+  const [submissionPlatformState, setSubmissionPlatformState] = useState({ connected: false, connectedAs: '', autoLoginConfigured: false, syncPaused: false, syncPausedAt: null, syncPauseReason: '', deferredSubmissionCount: 0, lastCheckedAt: null, lastRefreshedAt: null, lastError: '', reviewLastSyncedAt: null, reviewLastError: '', pendingRepairCount: 0, reviewCounts: {}, submittedCount: 0, submissions: [] });
   const [showSubmissionPlatformLogin, setShowSubmissionPlatformLogin] = useState(false);
   const [submissionPlatformUsername, setSubmissionPlatformUsername] = useState('');
   const [submissionPlatformPassword, setSubmissionPlatformPassword] = useState('');
@@ -602,6 +602,10 @@ function App() {
       connected: Boolean(payload.connected),
       connectedAs: payload.connectedAs || '',
       autoLoginConfigured: Boolean(payload.autoLoginConfigured),
+      syncPaused: Boolean(payload.syncPaused),
+      syncPausedAt: payload.syncPausedAt || null,
+      syncPauseReason: payload.syncPauseReason || '',
+      deferredSubmissionCount: Number(payload.deferredSubmissionCount || 0),
       lastCheckedAt: payload.lastCheckedAt || null,
       lastRefreshedAt: payload.lastRefreshedAt || null,
       lastError: payload.lastError || '',
@@ -1067,6 +1071,27 @@ function App() {
       const response = await fetch('/api/submission-platform/disconnect', { method: 'POST' });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.message || '提交平台断开失败');
+      applySubmissionPlatformState(payload);
+      setSubmissionPlatformMessage(payload.message);
+    } catch (error) {
+      setSubmissionPlatformMessage(error.message);
+      await syncSubmissionPlatform();
+    } finally {
+      setSubmissionPlatformBusy(false);
+    }
+  };
+
+  const controlSubmissionPlatform = async (paused) => {
+    setSubmissionPlatformBusy(true);
+    setSubmissionPlatformMessage('');
+    try {
+      const response = await fetch('/api/submission-platform/control', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ paused }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.message || '提交平台控制失败');
       applySubmissionPlatformState(payload);
       setSubmissionPlatformMessage(payload.message);
     } catch (error) {
@@ -1845,8 +1870,10 @@ function App() {
             {cloudState.connected && !cloudState.autoLoginConfigured && <button className="secondary-button" onClick={openCloudLogin}><LogIn size={16} />启用自动登录</button>}
             {(cloudState.connected || cloudState.autoLoginConfigured) && <button className="icon-button" disabled={cloudBusy} onClick={disconnectCloud} title="断开云盘并删除钥匙串凭据" aria-label="断开云盘并删除钥匙串凭据"><LogOut size={16} /></button>}
             {submissionPlatformState.connected && <a className="cloud-connected" href="https://go.jzxhnh.com/u/submissions" target="_blank" rel="noreferrer"><CheckCircle2 size={14} />质检平台 · {submissionPlatformState.connectedAs}</a>}
+            {submissionPlatformState.syncPaused && <span className="rule-chip" title={submissionPlatformState.syncPauseReason || '等待质检平台恢复'}>平台维护中 · 待补 {submissionPlatformState.deferredSubmissionCount}</span>}
             {submissionPlatformState.pendingRepairCount > 0 && <span className="rule-chip" title={submissionPlatformState.reviewLastSyncedAt ? `最近同步：${formatCompletionTime(submissionPlatformState.reviewLastSyncedAt)}` : '等待同步平台审核状态'}>平台待返修 {submissionPlatformState.pendingRepairCount}</span>}
             {!submissionPlatformState.connected && <button className="secondary-button" onClick={openSubmissionPlatformLogin}><LogIn size={16} />{submissionPlatformState.autoLoginConfigured ? '重连提交平台' : '连接提交平台'}</button>}
+            {submissionPlatformState.connected && <button className="secondary-button" disabled={submissionPlatformBusy} onClick={() => controlSubmissionPlatform(!submissionPlatformState.syncPaused)}>{submissionPlatformState.syncPaused ? <Play size={16} /> : <Pause size={16} />}{submissionPlatformState.syncPaused ? '恢复平台提交' : '暂停平台提交'}</button>}
             {(submissionPlatformState.connected || submissionPlatformState.autoLoginConfigured) && <button className="icon-button" disabled={submissionPlatformBusy} onClick={disconnectSubmissionPlatform} title="断开提交平台并删除钥匙串凭据" aria-label="断开提交平台并删除钥匙串凭据"><LogOut size={16} /></button>}
             <button className="secondary-button" disabled={cloudBusy} onClick={openTrajectoryUpload}><CloudUpload size={16} />手动补传轨迹</button>
             <button className="secondary-button" disabled={!exportReady.length || excelExportProgress.busy} title={exportReady.length ? `导出 ${exportReady.length} 条已完成采集登记和云盘回填的任务` : '暂无已完成云盘回填的合格任务'} onClick={() => exportExcelWithTracking(exportReady)}><FileSpreadsheet size={16} />{excelExportProgress.busy ? `${excelExportProgress.phase === 'validating' ? '校验中' : excelExportProgress.phase === 'generating' ? '生成中' : '登记中'} ${excelExportProgress.completed}/${excelExportProgress.total}` : `Excel (${exportReady.length})`}</button>

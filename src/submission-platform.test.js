@@ -7,8 +7,11 @@ import {
   extractPlatformSubmissionTotal,
   findPlatformSubmissionByBugId,
   findPlatformSubmissionForRecord,
+  deferredPlatformBugIndexes,
   isLegacyDeliveredPlatformBackfill,
+  isSubmissionPlatformUnavailableError,
   isReadmeOnlyPlatformRepairReason,
+  reopenDeferredPlatformSubmissions,
   mergePlatformSubmissionReview,
   mergePlatformCookies,
   platformImportState,
@@ -106,6 +109,56 @@ test('legacy platform backfill accepts only an immutable delivered checkpoint', 
     bugs: [{ bugIndex: 4, disposition: 'failed' }],
   }, 4), false);
   assert.equal(isLegacyDeliveredPlatformBackfill({ ...legacyJob, stages: [] }, 4), false);
+});
+
+test('platform outage detection defers connectivity failures but not invalid task data', () => {
+  assert.equal(isSubmissionPlatformUnavailableError('质检提交平台维护中，等待统一补交'), true);
+  assert.equal(isSubmissionPlatformUnavailableError('提交平台返回 HTTP 503'), true);
+  assert.equal(isSubmissionPlatformUnavailableError('请在任务系统中连接一次提交平台以启用自动登录'), true);
+  assert.equal(isSubmissionPlatformUnavailableError('提交平台必填字段 user_query 缺失'), false);
+  assert.equal(isSubmissionPlatformUnavailableError('题目难度不达标'), false);
+});
+
+test('deferred platform submissions reopen only the platform delivery tail', () => {
+  const job = {
+    id: 'pipeline-test',
+    status: 'passed',
+    repositoryDisposition: 'delivered',
+    finishedAt: '2026-08-27T08:00:00.000Z',
+    bugExecution: { mode: 'workbench', status: 'fast_lane_completed' },
+    pendingBugRetries: [4],
+    bugs: [{
+      bugIndex: 2,
+      disposition: 'delivered',
+      deliveredAt: '2026-08-27T08:00:00.000Z',
+      workerExecution: { status: 'fast_lane_completed', currentStage: '' },
+    }],
+    stages: [
+      { id: 'bug2_verification_finalize', stage: 'verification_finalize', bugIndex: 2, status: 'passed' },
+      {
+        id: 'bug2_platform_submit',
+        stage: 'platform_submit',
+        bugIndex: 2,
+        status: 'skipped',
+        deferred: true,
+        deferredAt: '2026-08-27T08:00:00.000Z',
+        result: { deferred: true },
+      },
+      { id: 'bug2_delivery_ready', stage: 'delivery_ready', bugIndex: 2, status: 'passed', result: { taskId: 'task-2' } },
+    ],
+  };
+  assert.deepEqual(deferredPlatformBugIndexes(job), [2]);
+  const reopened = reopenDeferredPlatformSubmissions(job, '2026-08-27T09:00:00.000Z');
+  assert.equal(reopened.changed, true);
+  assert.deepEqual(reopened.bugIndexes, [2]);
+  assert.deepEqual(reopened.job.pendingBugRetries, [2, 4]);
+  assert.equal(reopened.job.currentStage, 'bug2_platform_submit');
+  assert.equal(reopened.job.stages[0].status, 'passed');
+  assert.equal(reopened.job.stages[1].status, 'pending');
+  assert.equal(reopened.job.stages[1].deferred, undefined);
+  assert.equal(reopened.job.stages[2].status, 'pending');
+  assert.equal(reopened.job.bugs[0].disposition, undefined);
+  assert.equal(reopened.job.bugs[0].workerExecution.lastAction, 'platform_backfill_queued');
 });
 
 test('platform payload stops when dynamic schema omits a system identity field', () => {

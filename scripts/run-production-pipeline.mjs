@@ -1913,6 +1913,15 @@ export class PipelineUserQueryReviewWaitError extends Error {
   }
 }
 
+export class PipelineSubmissionDeferredError extends Error {
+  constructor(result = {}) {
+    super(String(result.reason || '质检提交平台维护中，等待统一补交'));
+    this.name = 'PipelineSubmissionDeferredError';
+    this.code = 'PIPELINE_SUBMISSION_PLATFORM_DEFERRED';
+    this.result = { ...result, deferred: true };
+  }
+}
+
 async function waitForUserQueryReviews(jobFile) {
   const job = await readJson(jobFile);
   const pendingStages = (job.stages || [])
@@ -2363,6 +2372,17 @@ async function runStage(jobFile, stageId, action) {
       throw error;
     }
     await clearSchedulerAdmission(jobFile, stageId, { release: !bugScoped });
+    if (error?.code === 'PIPELINE_SUBMISSION_PLATFORM_DEFERRED') {
+      await setStage(jobFile, stageId, 'skipped', {
+        error: '',
+        reason: error.message,
+        deferred: true,
+        deferredAt: error.result?.deferredAt || now(),
+        result: error.result,
+      });
+      await appendLog(jobFile, 'warn', `${current?.label || stageId}已延期，等待质检平台恢复后统一补交`, stageId);
+      return error.result;
+    }
     if (error?.code === 'PIPELINE_NATURAL_BUG_FINDER_FAILURE') {
       await setStage(jobFile, stageId, 'pending', {
         startedAt: null,
@@ -9112,7 +9132,9 @@ async function submitQualifiedTaskToPlatform(taskName, { pipelineJobId, bugIndex
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.message || `提交质检平台失败（HTTP ${response.status}）`);
-  return payload.submission || {};
+  const submission = payload.submission || {};
+  if (submission.deferred === true) throw new PipelineSubmissionDeferredError(submission);
+  return submission;
 }
 
 async function runVerificationProof(jobFile, bugIndex, phase, sourceDir) {
@@ -11419,6 +11441,7 @@ async function runPipeline(jobFile) {
         await cleanupVerificationCache(deliveredTaskDir);
       }
       let platformSubmission = null;
+      let platformSubmissionDeferred = false;
       if (await pipelineHasStage(jobFile, `bug${bugIndex}_platform_submit`)) {
         platformSubmission = await runStage(jobFile, `bug${bugIndex}_platform_submit`, async () => {
           const latest = await readJson(jobFile);
@@ -11427,6 +11450,8 @@ async function runPipeline(jobFile) {
             bugIndex,
           });
         });
+        platformSubmissionDeferred = platformSubmission?.deferred === true;
+        if (platformSubmissionDeferred) platformSubmission = null;
       }
       await setStage(jobFile, `bug${bugIndex}_delivery_ready`, 'passed', {
         taskId: verifiedTask.taskId,
@@ -11434,6 +11459,7 @@ async function runPipeline(jobFile) {
         trajectoryUrl: mainCloudResult.signedUrl,
         verificationResult,
         platformSubmission,
+        platformSubmissionDeferred,
       });
       // A previous infrastructure failure may have marked this Bug as
       // auto-continued while its proofs were still being recovered. Once the
@@ -11448,7 +11474,7 @@ async function runPipeline(jobFile) {
         deliveredBug.lastAction = 'delivery_completed';
       });
       await appendLog(jobFile, 'success', usesVerificationEvidence
-        ? `Bug ${bugIndex} 已完成主轨迹、独立红绿证明、云盘上传、Excel 回填${platformSubmission ? '和质检平台提交' : ''}`
+        ? `Bug ${bugIndex} 已完成主轨迹、独立红绿证明、云盘上传、Excel 回填${platformSubmission ? '和质检平台提交' : platformSubmissionDeferred ? '；质检平台等待统一补交' : ''}`
         : `Bug ${bugIndex} 已完成轨迹采集登记、云盘上传和 Excel 链接回填`, `bug${bugIndex}_delivery_ready`);
       if (workflowVersion >= CURRENT_WORKFLOW_VERSION) {
         await updateJob(jobFile, (current) => {
