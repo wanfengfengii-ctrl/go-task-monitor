@@ -32,6 +32,7 @@ import {
   MIN_BUGFIX_PRODUCTION_CHANGED_LINES,
   PARALLEL_BUG_WORKFLOW_VERSION,
   isPipelineBugDeliveryComplete,
+  isInvalidRedVerificationTestFailure,
   isShallowBugfixRepairFailure,
   isSkippedPipelineBug,
   pipelineProjectDeliverySummary,
@@ -86,7 +87,7 @@ import {
 } from '../src/bug-policy.js';
 import { assessProjectDomain, prohibitedProjectDomainPolicyText } from '../src/project-domain-rules.js';
 import { buildVerificationResult, VERIFICATION_POLICY_VERSION } from '../src/verification-evidence.js';
-import { directPublicVerifyCommandIssues, goTargetTestRedIssues, isConcurrencyVerificationRecord, validateVerificationProofBundle, verificationCommandsSha256 } from '../src/verification-proof.js';
+import { directPublicVerifyCommandIssues, goTargetTestRedIssues, isConcurrencyVerificationRecord, isGoTestBuildFailureOutput, validateVerificationProofBundle, verificationCommandsSha256 } from '../src/verification-proof.js';
 import { verificationTestNamesFromCommand, buildModelVerificationPlan, goTestNames, isTableDrivenGoTest, modelVerificationPlanIssues, verificationTestPackage } from '../src/model-verification.js';
 import { normalizeDiagnosisPublicCommand, normalizeDiagnosisVerificationSource } from '../src/diagnosis-verification.js';
 import {
@@ -130,9 +131,9 @@ const PROJECT_BUG_MIN_WORKER_LIMIT = Math.max(1, Math.min(PROJECT_BUG_MAX_WORKER
 const configuredBugSourceWorkerLimit = Number(process.env.GO_PIPELINE_BUG_SOURCE_WORKER_LIMIT || 4);
 const PROJECT_BUG_SOURCE_MAX_WORKER_LIMIT = Math.max(2, Math.min(4,
   Number.isFinite(configuredBugSourceWorkerLimit) ? configuredBugSourceWorkerLimit : 4));
-const configuredDockerRunCpuLimit = Number(process.env.GO_PIPELINE_DOCKER_RUN_CPUS || 4);
+const configuredDockerRunCpuLimit = Number(process.env.GO_PIPELINE_DOCKER_RUN_CPUS || 2);
 export const DOCKER_RUN_CPU_LIMIT = Math.max(1, Math.min(4,
-  Number.isFinite(configuredDockerRunCpuLimit) ? configuredDockerRunCpuLimit : 4));
+  Number.isFinite(configuredDockerRunCpuLimit) ? configuredDockerRunCpuLimit : 2));
 const MAX_INJECTION_SLOT_ATTEMPTS = 3;
 const monitorApiUrl = process.env.GO_TASK_MONITOR_API_URL || `http://127.0.0.1:${process.env.GO_TASK_MONITOR_API_PORT || 4174}`;
 const configuredPipelineExecutionRole = String(process.env.GO_PIPELINE_EXECUTION_ROLE || '').trim().toLowerCase();
@@ -3596,6 +3597,123 @@ function verificationFixtureCommand(testPackage, testName, { concurrency = false
   return `go test ${concurrency ? '-race ' : ''}${testPackage} -run '^${testName}$' -count=${concurrency ? DETERMINISTIC_TEST_RUNS : 1} -v`;
 }
 
+function assertBehavioralVerificationRed({ bugIndex, label, command, run }) {
+  if (run.exitCode === 0) throw new Error(`Bug ${bugIndex} ${label}在 BUG_BASE 上未复现红测`);
+  const output = `${run.stdout || ''}\n${run.stderr || ''}`;
+  const issues = goTargetTestRedIssues(command, output);
+  if (issues.length) {
+    if (isGoTestBuildFailureOutput(output)) {
+      const error = new Error(`INVALID_RED_VERIFICATION_TEST=1: Bug ${bugIndex} ${label}在 Red 版本发生编译或初始化失败，未形成行为断言失败：${issues.join('；')}`);
+      error.code = 'INVALID_RED_VERIFICATION_TEST';
+      error.pipelineStageId = `bug${bugIndex}_test_author`;
+      throw error;
+    }
+    throw new Error(`Bug ${bugIndex} ${label}没有形成有效 Red：${issues.join('；')}`);
+  }
+  return { redExitCode: run.exitCode, redFailureKind: 'behavioral_test_failure' };
+}
+
+async function revalidateFrozenVerificationRed({
+  bugIndex,
+  label,
+  bugBaseDir,
+  sourceDir,
+  testFile,
+  testName,
+  command,
+  concurrency,
+}) {
+  const redDir = await fsp.mkdtemp(path.join(os.tmpdir(), `go-pipeline-red-preflight-bug${bugIndex}-`));
+  try {
+    await copyWithoutGit(bugBaseDir, redDir);
+    await fsp.mkdir(path.dirname(path.join(redDir, testFile)), { recursive: true });
+    await copyFileReplacing(path.join(sourceDir, testFile), path.join(redDir, testFile));
+    const run = await runCommand('go', [
+      'test',
+      ...(concurrency ? ['-race'] : []),
+      verificationTestPackage(testFile),
+      '-run',
+      `^${testName}$`,
+      `-count=${concurrency ? DETERMINISTIC_TEST_RUNS : 1}`,
+      '-v',
+    ], {
+      cwd: redDir,
+      env: await projectGoEnvironment(redDir),
+      timeoutMs: 20 * 60 * 1000,
+    });
+    return assertBehavioralVerificationRed({ bugIndex, label, command, run });
+  } finally {
+    await fsp.rm(redDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function revalidateFrozenVerificationGreen({
+  bugIndex,
+  fixedDir,
+  sourceDir,
+  testFile,
+  testName,
+  concurrency,
+}) {
+  const greenDir = await fsp.mkdtemp(path.join(os.tmpdir(), `go-pipeline-green-preflight-bug${bugIndex}-`));
+  try {
+    await copyWithoutGit(fixedDir, greenDir);
+    await fsp.mkdir(path.dirname(path.join(greenDir, testFile)), { recursive: true });
+    await copyFileReplacing(path.join(sourceDir, testFile), path.join(greenDir, testFile));
+    const run = await runCommand('go', [
+      'test',
+      ...(concurrency ? ['-race'] : []),
+      verificationTestPackage(testFile),
+      '-run',
+      `^${testName}$`,
+      `-count=${concurrency ? DETERMINISTIC_TEST_RUNS : 1}`,
+      '-v',
+    ], {
+      cwd: greenDir,
+      env: await projectGoEnvironment(greenDir),
+      timeoutMs: 20 * 60 * 1000,
+    });
+    if (run.exitCode !== 0) {
+      throw new Error(`Bug ${bugIndex} 历史 Codex 回归测试在当前修复代码上未通过：exit=${run.exitCode}`);
+    }
+    return { greenExitCode: run.exitCode };
+  } finally {
+    await fsp.rm(greenDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function ensureAuthoredVerificationBehavioralRed({
+  jobFile,
+  bugIndex,
+  label,
+  bugBaseDir,
+  authored,
+  bug,
+}) {
+  if (authored?.redFailureKind === 'behavioral_test_failure') return authored;
+  const testPackage = verificationTestPackage(authored.testFile);
+  const normalized = {
+    ...authored,
+    testPackage,
+    command: verificationFixtureCommand(testPackage, authored.testName, { concurrency: isConcurrencyBug(bug) }),
+  };
+  Object.assign(normalized, await revalidateFrozenVerificationRed({
+    bugIndex,
+    label,
+    bugBaseDir,
+    sourceDir: normalized.sourceDir,
+    testFile: normalized.testFile,
+    testName: normalized.testName,
+    command: normalized.command,
+    concurrency: isConcurrencyBug(bug),
+  }));
+  await updateJob(jobFile, (current) => {
+    const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+    if (currentBug) currentBug.verificationTestAuthor = normalized;
+  });
+  return normalized;
+}
+
 function concurrencyVerificationNarrative(value, command) {
   const text = String(value || '').trim().replace(/[。；\s]+$/u, '');
   const alreadyDocumented = /确定性(?:复现|验证)(?:策略|替代方案)|同步屏障|起跑屏障|受控交错|固定并发轮次|固定资源裁定顺序/u.test(text)
@@ -3615,11 +3733,28 @@ async function preparePrivateVerificationFixture(jobFile, bugIndex, bugBaseDir, 
     const existingSha = crypto.createHash('sha256').update(existingBytes).digest('hex');
     if (!existing.sha256 || existing.sha256 === existingSha) {
       const testPackage = verificationTestPackage(existing.testFile);
-      return {
+      const normalized = {
         ...existing,
         testPackage,
         command: verificationFixtureCommand(testPackage, existing.testName, { concurrency: isConcurrencyBug(bug) }),
       };
+      if (normalized.redFailureKind !== 'behavioral_test_failure') {
+        Object.assign(normalized, await revalidateFrozenVerificationRed({
+          bugIndex,
+          label: '私有验证夹具',
+          bugBaseDir,
+          sourceDir: normalized.directory,
+          testFile: normalized.testFile,
+          testName: normalized.testName,
+          command: normalized.command,
+          concurrency: isConcurrencyBug(bug),
+        }));
+        await updateJob(jobFile, (current) => {
+          const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+          if (currentBug) currentBug.verificationFixture = normalized;
+        });
+      }
+      return normalized;
     }
     throw new Error(`Bug ${bugIndex} 私有验证夹具已被修改，拒绝替换冻结证明`);
   }
@@ -3689,9 +3824,12 @@ async function preparePrivateVerificationFixture(jobFile, bugIndex, bugBaseDir, 
     env: goEnv,
     timeoutMs: 20 * 60 * 1000,
   });
-  if (red.exitCode === 0) throw new Error(`Bug ${bugIndex} 私有验证夹具在 BUG_BASE 上未复现红测`);
-  const redIssues = goTargetTestRedIssues(command, `${red.stdout || ''}\n${red.stderr || ''}`);
-  if (redIssues.length) throw new Error(`Bug ${bugIndex} 私有验证夹具没有形成有效 Red：${redIssues.join('；')}`);
+  const redAssessment = assertBehavioralVerificationRed({
+    bugIndex,
+    label: '私有验证夹具',
+    command,
+    run: red,
+  });
   const value = {
     directory,
     testFile: fixture.testFile,
@@ -3699,7 +3837,7 @@ async function preparePrivateVerificationFixture(jobFile, bugIndex, bugBaseDir, 
     testName: fixture.testName,
     command,
     sessionId: result.sessionId,
-    redExitCode: red.exitCode,
+    ...redAssessment,
     sha256: crypto.createHash('sha256').update(testSource).digest('hex'),
     frozenAt: now(),
   };
@@ -3736,7 +3874,22 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
         testPackage,
         command: verificationFixtureCommand(testPackage, existing.testName, { concurrency: isConcurrencyBug(bug) }),
       };
-      if (existing.testPackage !== testPackage || existing.command !== normalized.command) {
+      if (normalized.redFailureKind !== 'behavioral_test_failure') {
+        Object.assign(normalized, await revalidateFrozenVerificationRed({
+          bugIndex,
+          label: 'Codex 回归测试',
+          bugBaseDir,
+          sourceDir: normalized.sourceDir,
+          testFile: normalized.testFile,
+          testName: normalized.testName,
+          command: normalized.command,
+          concurrency: isConcurrencyBug(bug),
+        }));
+      }
+      if (existing.testPackage !== testPackage
+        || existing.command !== normalized.command
+        || existing.redFailureKind !== normalized.redFailureKind
+        || existing.redExitCode !== normalized.redExitCode) {
         await updateJob(jobFile, (current) => {
           const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
           if (currentBug) currentBug.verificationTestAuthor = normalized;
@@ -3745,6 +3898,14 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
       return normalized;
     }
   }
+  const recovered = await recoverPostClaudeVerificationTestAttempt(
+    jobFile,
+    bugIndex,
+    bugBaseDir,
+    fixedDir,
+    bug,
+  );
+  if (recovered) return recovered;
   const attemptId = crypto.randomUUID();
   const authorDir = path.join(taskDir, `codex-test-author-bug${bugIndex}-attempt-${attemptId}`);
   // Claude has completed. The author sees the repaired ordinary workspace;
@@ -3814,9 +3975,12 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
     '-v',
   ];
   const red = await runCommand('go', focusedArgs, { cwd: redDir, env: goEnv, timeoutMs: 20 * 60 * 1000 });
-  if (red.exitCode === 0) throw new Error(`Bug ${bugIndex} Codex 回归测试在 BUG_BASE 上未复现红测`);
-  const redIssues = goTargetTestRedIssues(plan.verify_cmds[0], `${red.stdout || ''}\n${red.stderr || ''}`);
-  if (redIssues.length) throw new Error(`Bug ${bugIndex} Codex 回归测试没有形成有效 Red：${redIssues.join('；')}`);
+  const redAssessment = assertBehavioralVerificationRed({
+    bugIndex,
+    label: 'Codex 回归测试',
+    command: plan.verify_cmds[0],
+    run: red,
+  });
   const green = await runCommand('go', focusedArgs, { cwd: authorDir, env: goEnv, timeoutMs: 20 * 60 * 1000 });
   if (green.exitCode !== 0) throw new Error(`Bug ${bugIndex} Codex 回归测试在修复代码上未通过：exit=${green.exitCode}`);
   const sourceDir = path.join(taskDir, `verification-test-bug${bugIndex}-attempt-${attemptId}`);
@@ -3831,7 +3995,7 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
     sessionId: result.sessionId,
     sourceDir,
     sha256: crypto.createHash('sha256').update(source).digest('hex'),
-    redExitCode: red.exitCode,
+    ...redAssessment,
     greenExitCode: green.exitCode,
     authoredBy: 'codex_after_claude',
     repairSessionId: String(await fsp.readFile(path.join(taskDir, 'trajectory/session_id.txt'), 'utf8').catch(() => '')).trim(),
@@ -3843,6 +4007,103 @@ export async function preparePostClaudeVerificationTest(jobFile, bugIndex, bugBa
     if (currentBug) currentBug.verificationTestAuthor = value;
   });
   return value;
+}
+
+export async function recoverPostClaudeVerificationTestAttempt(jobFile, bugIndex, bugBaseDir, fixedDir, bug) {
+  const job = await readJson(jobFile);
+  const taskDir = job.bugs?.find((item) => Number(item.bugIndex) === Number(bugIndex))?.task?.taskDir;
+  if (!taskDir) return null;
+  const prefix = `verification-test-bug${bugIndex}-attempt-`;
+  const candidates = await Promise.all((await fsp.readdir(taskDir, { withFileTypes: true }).catch(() => []))
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
+    .map(async (entry) => ({
+      path: path.join(taskDir, entry.name),
+      mtimeMs: (await fsp.stat(path.join(taskDir, entry.name))).mtimeMs,
+    })));
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+
+  for (const candidate of candidates) {
+    const manifest = await readJson(path.join(candidate.path, 'test-manifest.json'), null);
+    const testFile = String(manifest?.testFile || '');
+    const testName = String(manifest?.testName || '');
+    if (!safeVerificationTestPath(testFile) || !testName.startsWith('TestModel_')) continue;
+    const source = await fsp.readFile(path.join(candidate.path, testFile)).catch(() => null);
+    if (!source) continue;
+    const sha256 = crypto.createHash('sha256').update(source).digest('hex');
+    if (manifest.sha256 !== sha256) continue;
+    const sourceText = source.toString('utf8');
+    const names = goTestNames(sourceText, { prefix: 'TestModel_' });
+    if (names.length !== 1 || names[0] !== testName || !isTableDrivenGoTest(sourceText)) continue;
+
+    const concurrency = isConcurrencyBug(bug);
+    const testPackage = verificationTestPackage(testFile);
+    const command = verificationFixtureCommand(testPackage, testName, { concurrency });
+    try {
+      const redAssessment = await revalidateFrozenVerificationRed({
+        bugIndex,
+        label: '历史 Codex 回归测试',
+        bugBaseDir,
+        sourceDir: candidate.path,
+        testFile,
+        testName,
+        command,
+        concurrency,
+      });
+      const greenAssessment = await revalidateFrozenVerificationGreen({
+        bugIndex,
+        fixedDir,
+        sourceDir: candidate.path,
+        testFile,
+        testName,
+        concurrency,
+      });
+      const repairSessionId = String(await fsp.readFile(path.join(taskDir, 'trajectory/session_id.txt'), 'utf8').catch(() => '')).trim();
+      const recovered = {
+        ...manifest,
+        testFile,
+        testPackage,
+        testName,
+        command,
+        sourceDir: candidate.path,
+        sha256,
+        ...redAssessment,
+        ...greenAssessment,
+        repairSessionId: repairSessionId || manifest.repairSessionId || '',
+        authoredBy: 'codex_after_claude_recovered',
+        recoveredAt: now(),
+      };
+      await updateJob(jobFile, (current) => {
+        const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+        if (!currentBug) return;
+        currentBug.verificationTestAuthor = recovered;
+        currentBug.verificationTestRecoveryHistory = [...(currentBug.verificationTestRecoveryHistory || []), {
+          recoveredAt: recovered.recoveredAt,
+          sourceDir: recovered.sourceDir,
+          testFile: recovered.testFile,
+          sha256: recovered.sha256,
+        }].slice(-10);
+        const testAuthorStage = current.stages?.find((stage) => stage.id === `bug${bugIndex}_test_author`);
+        if (testAuthorStage && ['pending', 'skipped'].includes(testAuthorStage.status)) {
+          testAuthorStage.status = 'passed';
+          testAuthorStage.startedAt ||= recovered.recoveredAt;
+          testAuthorStage.finishedAt = recovered.recoveredAt;
+          testAuthorStage.error = '';
+          testAuthorStage.result = {
+            testFile: recovered.testFile,
+            testName: recovered.testName,
+            redExitCode: recovered.redExitCode,
+            greenExitCode: recovered.greenExitCode,
+            recovered: true,
+          };
+          delete testAuthorStage.reason;
+        }
+      });
+      return recovered;
+    } catch {
+      // A historical artifact is reusable only when it is still behavioral-red and green on this repair.
+    }
+  }
+  return null;
 }
 
 async function diagnosisTestAuthorSessionId(jobFile, bugIndex, authorDir) {
@@ -3906,10 +4167,12 @@ async function freezeDiagnosisVerificationTest({
     '-v',
   ];
   const red = await runCommand('go', focusedArgs, { cwd: redDir, env: goEnv, timeoutMs: 20 * 60 * 1000 });
-  if (red.exitCode === 0) throw new Error(`Bug ${bugIndex} Codex 诊断回归测试在 BUG_BASE 上未复现红测`);
-  const output = `${red.stdout || ''}\n${red.stderr || ''}`;
-  const redIssues = goTargetTestRedIssues(plan.verify_cmds[0], output);
-  if (redIssues.length) throw new Error(`Bug ${bugIndex} Codex 诊断回归测试没有形成有效 Red：${redIssues.join('；')}`);
+  const redAssessment = assertBehavioralVerificationRed({
+    bugIndex,
+    label: 'Codex 诊断回归测试',
+    command: plan.verify_cmds[0],
+    run: red,
+  });
   const verificationDir = path.join(taskDir, `verification-test-bug${bugIndex}-attempt-${attemptId}`);
   await fsp.mkdir(path.dirname(path.join(verificationDir, descriptor.test_file)), { recursive: true });
   await copyFileReplacing(path.join(authorDir, descriptor.test_file), path.join(verificationDir, descriptor.test_file));
@@ -3921,7 +4184,7 @@ async function freezeDiagnosisVerificationTest({
     sessionId,
     sourceDir: verificationDir,
     sha256: crypto.createHash('sha256').update(source).digest('hex'),
-    redExitCode: red.exitCode,
+    ...redAssessment,
     greenExitCode: null,
     authoredBy,
     diagnosisSessionId: String(await fsp.readFile(path.join(taskDir, 'trajectory/session_id.txt'), 'utf8').catch(() => '')).trim(),
@@ -4004,7 +4267,22 @@ export async function prepareDiagnosisVerificationTest(jobFile, bugIndex, bugBas
         testPackage,
         command: verificationFixtureCommand(testPackage, existing.testName, { concurrency: isConcurrencyBug(bug) }),
       };
-      if (existing.testPackage !== testPackage || existing.command !== normalized.command) {
+      if (normalized.redFailureKind !== 'behavioral_test_failure') {
+        Object.assign(normalized, await revalidateFrozenVerificationRed({
+          bugIndex,
+          label: 'Codex 诊断回归测试',
+          bugBaseDir,
+          sourceDir: normalized.sourceDir,
+          testFile: normalized.testFile,
+          testName: normalized.testName,
+          command: normalized.command,
+          concurrency: isConcurrencyBug(bug),
+        }));
+      }
+      if (existing.testPackage !== testPackage
+        || existing.command !== normalized.command
+        || existing.redFailureKind !== normalized.redFailureKind
+        || existing.redExitCode !== normalized.redExitCode) {
         await updateJob(jobFile, (current) => {
           const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
           if (currentBug) currentBug.verificationTestAuthor = normalized;
@@ -4103,9 +4381,15 @@ export async function syncAuthoredVerificationMetadata(taskDir, authored, {
   const plan = buildModelVerificationPlan([{ path: authored.testFile, content: source }], { concurrency });
   const diagnosis = taskType === 'diagnosis';
   await updatePublicMetadata(taskDir, (metadata) => {
+    const publishedDiagnosisTest = diagnosis
+      && metadata.verification_test_overlay === 'repository-tests'
+      && metadata.verification_test_published === true
+      && metadata.verification_fixture_published === true
+      && metadata.verification_test_storage === 'repository-red-branch'
+      && metadata.verification_test_sha256 === digest;
     Object.assign(metadata, {
       verify_cmds: plan.verify_cmds,
-      verification_test_overlay: diagnosis ? 'private-fixture' : 'repository-tests',
+      verification_test_overlay: diagnosis && !publishedDiagnosisTest ? 'private-fixture' : 'repository-tests',
       verification_test_files: plan.verification_test_files,
       verification_test_names: plan.verification_test_names,
       verification_test_manifest: plan.verification_test_manifest,
@@ -4125,16 +4409,100 @@ export async function syncAuthoredVerificationMetadata(taskDir, authored, {
         diagnosis_workspace_policy_version: 1,
         verification_fixture_dir: authored.sourceDir,
         verification_fixture_sha256: digest,
-        verification_fixture_published: false,
+        verification_fixture_published: publishedDiagnosisTest,
         verification_fixture_materialized: false,
-        verification_test_published: false,
-        verification_test_storage: 'system-fixture-only',
+        verification_test_published: publishedDiagnosisTest,
+        verification_test_storage: publishedDiagnosisTest ? 'repository-red-branch' : 'system-fixture-only',
       } : {
         verification_test_repair_session_id: repairSessionId || authored.repairSessionId || '',
       }),
     });
   });
   return plan;
+}
+
+export function invalidateStaleDiagnosisPublicationStages(job, bugIndex, at = now()) {
+  const normalizedIndex = Number(bugIndex);
+  if (job?.request?.taskType !== 'diagnosis' || !Number.isInteger(normalizedIndex)) return false;
+  const publication = (job.stages || []).find((stage) => stage.id === `bug${normalizedIndex}_git_publication`);
+  if (publication?.status !== 'passed') return false;
+  const dependentSuffixes = new Set([
+    'git_publication',
+    'pre_verify',
+    'cloud_upload',
+    'verification_finalize',
+    'platform_submit',
+    'delivery_ready',
+  ]);
+  for (const stage of job.stages || []) {
+    if (Number(stage.bugIndex) !== normalizedIndex) continue;
+    const suffix = String(stage.id || '').replace(`bug${normalizedIndex}_`, '');
+    if (!dependentSuffixes.has(suffix)) continue;
+    if (stage.status !== 'pending' || stage.result || stage.error) {
+      stage.resultHistory = [...(stage.resultHistory || []), {
+        invalidatedAt: at,
+        reason: 'diagnosis_system_test_not_published',
+        status: stage.status,
+        result: stage.result || null,
+      }].slice(-10);
+    }
+    stage.status = 'pending';
+    stage.startedAt = null;
+    stage.finishedAt = null;
+    stage.error = '';
+    stage.reason = '诊断系统测试尚未发布到 Red 分支，重新执行公开交付链';
+    delete stage.result;
+    delete stage.retryCount;
+    delete stage.maxRetries;
+  }
+  const bug = (job.bugs || []).find((item) => Number(item.bugIndex) === normalizedIndex);
+  if (bug?.verificationEvidence && Object.keys(bug.verificationEvidence).length) {
+    bug.verificationEvidenceHistory = [...(bug.verificationEvidenceHistory || []), {
+      invalidatedAt: at,
+      reason: 'diagnosis_system_test_not_published',
+      evidence: bug.verificationEvidence,
+    }].slice(-10);
+    delete bug.verificationEvidence;
+  }
+  if (bug) {
+    bug.diagnosisPublicationRecovery = {
+      invalidatedAt: at,
+      reason: 'private_fixture_was_never_published',
+    };
+  }
+  job.updatedAt = at;
+  return true;
+}
+
+export async function ensureDiagnosisRedCommitAvailable(repository, cloneUrl, redBranch, redCommit) {
+  const normalizedCommit = String(redCommit || '').trim();
+  if (!/^[a-f0-9]{40}$/i.test(normalizedCommit)) throw new Error('diagnosis Red 提交不合法');
+  const existing = await git(repository, ['cat-file', '-t', normalizedCommit])
+    .then((result) => result.stdout.trim())
+    .catch(() => '');
+  if (existing === 'commit') return { fetched: false, commit: normalizedCommit };
+  const recoveryRef = `refs/go-pipeline/recovery/${safeSlug(redBranch, 'diagnosis-red')}`;
+  await git(
+    repository,
+    ['fetch', '--quiet', '--force', cloneUrl, `refs/heads/${redBranch}:${recoveryRef}`],
+    `取回 ${redBranch} 历史 diagnosis Red 提交`,
+  );
+  const fetchedCommit = (await git(repository, ['rev-parse', recoveryRef])).stdout.trim();
+  if (fetchedCommit !== normalizedCommit) {
+    throw new Error(`远端 ${redBranch} 已漂移：${fetchedCommit || 'missing'} != ${normalizedCommit}`);
+  }
+  return { fetched: true, commit: fetchedCommit };
+}
+
+export function historicalDiagnosisRedContainsAuthoredTest(diffOutput, testFile, publishedTest, expectedSha256) {
+  const changes = String(diffOutput || '').trim().split(/\r?\n/).filter(Boolean);
+  if (changes.length !== 1 || changes[0] !== `A\t${testFile}`) return false;
+  return crypto.createHash('sha256').update(publishedTest).digest('hex') === expectedSha256;
+}
+
+export function diagnosisRemoteTailContainsOnlyReadme(diffOutput) {
+  const files = [...new Set(String(diffOutput || '').trim().split(/\r?\n/).filter(Boolean))];
+  return files.length > 0 && files.every((file) => file === 'BENZHI_README.md');
 }
 
 async function prepareV3BugfixGitLayout(jobFile, bugIndex, fixedDir, testFile) {
@@ -4277,6 +4645,7 @@ export async function finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, te
   if (!/^[a-f0-9]{40}$/i.test(redCommit)) throw new Error(`Bug ${bugIndex} 缺少 diagnosis 红分支提交`);
   const testBytes = await fsp.readFile(path.join(testSourceDir, testFile));
   const testSha = crypto.createHash('sha256').update(testBytes).digest('hex');
+  await ensureDiagnosisRedCommitAvailable(bugBaseDir, job.request.cloneUrl, redBranch, redCommit);
   const [sourceTree, initialRedTree, initialRemoteCommit] = await Promise.all([
     git(bugBaseDir, ['rev-parse', `${sourceCommit}^{tree}`]).then((result) => result.stdout.trim()),
     git(bugBaseDir, ['rev-parse', `${redCommit}^{tree}`]).then((result) => result.stdout.trim()),
@@ -4284,6 +4653,103 @@ export async function finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, te
   ]);
   let redTree = initialRedTree;
   let remoteCommit = initialRemoteCommit;
+  if (remoteCommit && remoteCommit !== redCommit) {
+    const recoveryRef = `refs/go-pipeline/recovery/${safeSlug(redBranch, 'diagnosis-red')}-remote-head`;
+    await git(
+      bugBaseDir,
+      ['fetch', '--quiet', '--force', job.request.cloneUrl, `refs/heads/${redBranch}:${recoveryRef}`],
+      `取回 ${redBranch} 远端后续提交`,
+    );
+    const fetchedRemoteCommit = (await git(bugBaseDir, ['rev-parse', recoveryRef])).stdout.trim();
+    const expectedIsAncestor = await git(bugBaseDir, ['merge-base', '--is-ancestor', redCommit, fetchedRemoteCommit])
+      .then(() => true)
+      .catch(() => false);
+    const trailingFiles = expectedIsAncestor
+      ? await git(bugBaseDir, ['diff', '--name-only', `${redCommit}..${fetchedRemoteCommit}`]).then((result) => result.stdout)
+      : '';
+    if (fetchedRemoteCommit === remoteCommit
+      && expectedIsAncestor
+      && diagnosisRemoteTailContainsOnlyReadme(trailingFiles)) {
+      await git(
+        bugBaseDir,
+        [
+          'push',
+          `--force-with-lease=refs/heads/${redBranch}:${remoteCommit}`,
+          job.request.cloneUrl,
+          `${redCommit}:refs/heads/${redBranch}`,
+        ],
+        `暂存 Bug ${bugIndex} diagnosis README 后续提交`,
+      );
+      await updateJob(jobFile, (current) => {
+        const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+        currentBug.diagnosisReadmeTailRecoveryHistory = [
+          ...(currentBug.diagnosisReadmeTailRecoveryHistory || []),
+          {
+            recoveredAt: now(),
+            redCommit,
+            previousRemoteCommit: remoteCommit,
+            reason: 'readme_only_tail_before_test_publication',
+          },
+        ].slice(-10);
+      });
+      remoteCommit = redCommit;
+    }
+  }
+  if (sourceTree !== redTree && remoteCommit === redCommit) {
+    const [diffOutput, publishedTest, parents] = await Promise.all([
+      git(bugBaseDir, ['diff', '--name-status', `${sourceCommit}^{tree}`, `${redCommit}^{tree}`])
+        .then((result) => result.stdout),
+      git(bugBaseDir, ['show', `${redCommit}:${testFile}`])
+        .then((result) => result.stdout)
+        .catch(() => ''),
+      git(bugBaseDir, ['rev-list', '--parents', '-n', '1', redCommit])
+        .then((result) => result.stdout.trim().split(/\s+/).filter(Boolean)),
+    ]);
+    if (parents.length === 1
+      && historicalDiagnosisRedContainsAuthoredTest(diffOutput, testFile, publishedTest, testSha)) {
+      await ensureDiagnosisWorkspaceUnchanged(taskDir, { testFile, sha256: testSha });
+      const diagnosisSessionId = String(await fsp.readFile(path.join(taskDir, 'trajectory/session_id.txt'), 'utf8').catch(() => '')).trim();
+      if (!diagnosisSessionId) throw new Error(`Bug ${bugIndex} 缺少 diagnosis 主轨迹 Session，不能对账历史 Red 发布`);
+      await updateJob(jobFile, (current) => {
+        const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+        Object.assign(currentBug, {
+          diagnosisSourceCommit: sourceCommit,
+          redBranch,
+          redCommit,
+          bugBaseCommit: redCommit,
+          diagnosisVerificationTestSha256: testSha,
+          diagnosisPublicationRecovery: {
+            recoveredAt: now(),
+            reason: 'historical_red_already_contains_authored_test',
+          },
+        });
+      });
+      await updatePublicMetadata(taskDir, (metadata) => Object.assign(metadata, {
+        git_commit_layout_policy_version: GIT_COMMIT_LAYOUT_POLICY_VERSION,
+        red_branch: redBranch,
+        red_commit: redCommit,
+        red_pushed: true,
+        red_test_files: [testFile],
+        bug_base_commit: redCommit,
+        bug_base_branch: '',
+        test_model_fix_branch: redBranch,
+        test_model_fix_base_commit: redCommit,
+        test_model_fix_commit: redCommit,
+        test_model_fix_pushed: true,
+        test_model_fix_session_id: diagnosisSessionId,
+        repo_url: `${String(metadata.repository || '').replace(/\/$/, '')}/tree/${redBranch}`,
+        verification_test_sha256: testSha,
+        verification_fixture_published: true,
+        verification_fixture_materialized: false,
+        verification_test_published: true,
+        verification_test_overlay: 'repository-tests',
+        verification_test_storage: 'repository-red-branch',
+        diagnosis_workspace_policy_version: 1,
+        diagnosis_workspace_unchanged: true,
+      }));
+      return { redCommit, redBranch, testSha, publishedTest: true, reused: true, reconciled: true };
+    }
+  }
   if (sourceTree !== redTree) {
     if (!Array.isArray(bug.qualityRejectionHistory) || !bug.qualityRejectionHistory.length) {
       throw new Error(`Bug ${bugIndex} diagnosis 红分支包含持久代码或测试改动，必须迁移后重新生成证明`);
@@ -10796,8 +11262,16 @@ async function runPipeline(jobFile) {
             return { ...author, verify_cmds: plan.verify_cmds };
           });
         }
-        const authored = (await readJson(jobFile)).bugs.find((item) => Number(item.bugIndex) === Number(bugIndex)).verificationTestAuthor;
+        let authored = (await readJson(jobFile)).bugs.find((item) => Number(item.bugIndex) === Number(bugIndex)).verificationTestAuthor;
         if (!authored?.sourceDir || !authored?.testFile) throw new Error(`Bug ${bugIndex} 缺少已生成的 Codex 回归测试`);
+        authored = await ensureAuthoredVerificationBehavioralRed({
+          jobFile,
+          bugIndex,
+          label: 'Codex 回归测试',
+          bugBaseDir: afterClaudeBug.bugBaseDir || projectDir,
+          authored,
+          bug: afterClaudeBug.discovery,
+        });
         await syncAuthoredVerificationMetadata(afterClaudeBug.task.taskDir, authored, {
           taskType: 'bugfix',
           repairSessionId: verifiedTask.sessionId || authored.repairSessionId,
@@ -10852,13 +11326,39 @@ async function runPipeline(jobFile) {
             reused: true,
           });
         }
-        const authored = (await readJson(jobFile)).bugs.find((item) => Number(item.bugIndex) === Number(bugIndex)).verificationTestAuthor;
+        let authored = (await readJson(jobFile)).bugs.find((item) => Number(item.bugIndex) === Number(bugIndex)).verificationTestAuthor;
         if (!authored?.sourceDir || !authored?.testFile) throw new Error(`Bug ${bugIndex} 缺少已生成的诊断回归测试`);
+        authored = await ensureAuthoredVerificationBehavioralRed({
+          jobFile,
+          bugIndex,
+          label: 'Codex 诊断回归测试',
+          bugBaseDir: afterClaudeBug.bugBaseDir || projectDir,
+          authored,
+          bug: afterClaudeBug.discovery,
+        });
         await ensureDiagnosisWorkspaceUnchanged(afterClaudeBug.task.taskDir, authored);
         await syncAuthoredVerificationMetadata(afterClaudeBug.task.taskDir, authored, {
           taskType: 'diagnosis',
           concurrency: isConcurrencyBug(afterClaudeBug.discovery),
         });
+        const diagnosisMetadata = await readJson(path.join(afterClaudeBug.task.taskDir, 'public.json'));
+        if (diagnosisMetadata.verification_test_overlay !== 'repository-tests'
+          || diagnosisMetadata.verification_test_published !== true
+          || diagnosisMetadata.verification_fixture_published !== true
+          || diagnosisMetadata.verification_test_storage !== 'repository-red-branch') {
+          let invalidated = false;
+          await updateJob(jobFile, (current) => {
+            invalidated = invalidateStaleDiagnosisPublicationStages(current, bugIndex);
+          });
+          if (invalidated) {
+            await appendLog(
+              jobFile,
+              'warn',
+              `Bug ${bugIndex} 检测到旧式 private-fixture 交付记录，重新发布系统测试并生成绑定新 Red 提交的证明`,
+              `bug${bugIndex}_git_publication`,
+            );
+          }
+        }
         await runStage(jobFile, `bug${bugIndex}_git_publication`, async () => finalizeV3DiagnosisImmutableDelivery(
           jobFile,
           bugIndex,
@@ -11019,8 +11519,10 @@ async function runPipeline(jobFile) {
       if (runnerStopping) return;
       const failedAt = now();
       const latest = await readJson(jobFile);
-      const failedStage = (latest.stages || []).findLast((stage) => Number(stage.bugIndex) === bugIndex
-        && ['running', 'failed'].includes(stage.status))?.id || `bug${bugIndex}_bug_discovery`;
+      const failedStage = String(error?.pipelineStageId || '')
+        || (latest.stages || []).findLast((stage) => Number(stage.bugIndex) === bugIndex
+          && ['running', 'failed'].includes(stage.status))?.id
+        || `bug${bugIndex}_bug_discovery`;
 
       if (/CANDIDATE_CONTRACT_CONFLICT=1/.test(error?.message || '')) {
         const conflictTask = latest.bugs?.find((item) => Number(item.bugIndex) === Number(bugIndex))?.task;
@@ -11051,6 +11553,36 @@ async function runPipeline(jobFile) {
           current.finishedAt = null;
         });
         await appendLog(jobFile, 'warn', `Bug ${bugIndex} 的修复轨迹确认候选题与公开契约冲突，已保留证据并跳过该候选`, conflictStage);
+        return;
+      }
+
+      if (isInvalidRedVerificationTestFailure(error)) {
+        const skipStage = `bug${bugIndex}_test_author`;
+        const reason = '独立验证测试在 Red 版本发生编译或初始化失败，未执行到目标 TestModel_ 断言；已跳过当前 Bug 并释放修复槽位';
+        await updateJob(jobFile, (current) => {
+          markPipelineBugSkipped(current, bugIndex, reason, failedAt);
+          const currentBug = current.bugs.find((item) => Number(item.bugIndex) === Number(bugIndex));
+          if (currentBug) {
+            currentBug.invalidRedVerificationHistory = [...(currentBug.invalidRedVerificationHistory || []), {
+              at: failedAt,
+              stage: failedStage,
+              error: error.message,
+            }].slice(-10);
+            currentBug.workerExecution = {
+              ...(currentBug.workerExecution || {}),
+              status: 'fast_lane_completed',
+              currentStage: skipStage,
+              currentAttempt: 0,
+              updatedAt: failedAt,
+              lastAction: 'invalid_red_verification_test_skipped',
+              blockedReason: '',
+            };
+          }
+          current.status = 'running';
+          current.error = '';
+          current.finishedAt = null;
+        });
+        await appendLog(jobFile, 'warn', `Bug ${bugIndex} 的 Red 测试未通过编译门禁，已直接跳过并释放修复槽位`, skipStage);
         return;
       }
 

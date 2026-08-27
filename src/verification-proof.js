@@ -101,16 +101,26 @@ export function goTargetTestRedIssues(command, output = '') {
   const failPattern = testName
     ? new RegExp(`(?:^|\\n)--- FAIL:\\s+${escapedName}(?:\\/|\\s|\\()`, 'm')
     : /(?:^|\n)--- FAIL:\s+Test[A-Za-z0-9_]+(?:\/|\s|\()/m;
-  if (/\[(?:build failed|setup failed)\]/i.test(value) || /(?:^|\n)FAIL\s+\S+\s+\[setup failed\]/im.test(value)) {
+  const truncatedAssertionDiagnostic = /\[\d+ characters truncated\]/i.test(value)
+    && /(?:^|\n)\s*[^\n:]+_test\.go:\d+:\s+\S/m.test(value);
+  if (isGoTestBuildFailureOutput(value)) {
     issues.push('目标测试在进入断言前发生构建或初始化失败');
   }
   if (!runPattern.test(value)) {
     issues.push(testName ? `没有执行到目标测试 ${testName}` : '没有执行到 -run 指定的目标测试');
   }
-  if (!failPattern.test(value)) {
+  if (!failPattern.test(value) && !truncatedAssertionDiagnostic) {
     issues.push(testName ? `目标测试 ${testName} 没有形成断言失败` : '目标测试没有形成断言失败');
   }
   return [...new Set(issues)];
+}
+
+export function isGoTestBuildFailureOutput(output = '') {
+  const value = String(output || '');
+  if (/\[(?:build failed|setup failed)\]/i.test(value)
+    || /(?:^|\n)FAIL\s+\S+\s+\[setup failed\]/im.test(value)) return true;
+  return /(?:^|\n)(?:#\s+\S+\s*\n)?[^\n:]+\.go:\d+(?::\d+)?:\s+(?:undefined:|syntax error:|cannot use\b|cannot refer to\b|not enough arguments\b|too many arguments\b|assignment mismatch\b|imported and not used\b|declared and not used\b|missing return\b)/im.test(value)
+    || /(?:^|\n)(?:no required module provides package|found packages\s+\S+\s+and\s+\S+|import cycle not allowed|build constraints exclude all Go files)/im.test(value);
 }
 
 function isLocalHttpCommand(command) {

@@ -13,16 +13,18 @@ export const PIPELINE_TASK_TYPE_POLICY_VERSION = 3;
 export const PIPELINE_TASK_TYPE_RATIO = Object.freeze({ bugfix: 7, diagnosis: 3 });
 export const PIPELINE_LARGE_PROJECT_CANARY_LIMIT = 10;
 
-// A project remains part of the work-in-progress budget until it reaches a
-// terminal delivery state. Failed projects are intentionally counted while
-// Codex triage/retry is pending so refill cannot outrun recovery.
+// A project remains part of the work-in-progress budget while it can still be
+// scheduled automatically. Retry-exhausted failures need an explicit manual
+// action, so counting them here would leave healthy Runner slots idle forever.
 export function isPipelineProjectIncomplete(job = {}) {
   // A user-held project is intentionally outside the runnable supply. Its
   // Runner can race with the stop request and persist `failed` after the API
   // has set manualHold, but that residue must not consume a refill slot.
-  return Boolean(job
-    && job.manualHold !== true
-    && !['passed', 'abandoned', 'stopped'].includes(String(job.status || '')));
+  if (!job || job.manualHold === true) return false;
+  const status = String(job.status || '');
+  if (['passed', 'abandoned', 'stopped'].includes(status)) return false;
+  if (status === 'failed' && pipelineRetryState(job).exhausted) return false;
+  return true;
 }
 
 export function countIncompletePipelineProjects(jobs = []) {

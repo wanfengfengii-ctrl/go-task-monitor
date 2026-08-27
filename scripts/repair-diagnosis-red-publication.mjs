@@ -48,6 +48,29 @@ async function taskByBugId(bugId) {
   throw new Error(`${bugId} 不存在于任务库`);
 }
 
+async function restoreDiagnosisReadmesFromSource(taskDir, repository, sourceCommit) {
+  if (!/^[a-f0-9]{40}$/i.test(String(sourceCommit || ''))) return [];
+  const sourceReadme = await execFileAsync(
+    'git',
+    ['-C', repository, 'show', `${sourceCommit}:BENZHI_README.md`],
+    { encoding: 'buffer', timeout: 2 * 60_000, maxBuffer: 2 * 1024 * 1024 },
+  ).then((result) => result.stdout).catch(() => null);
+  if (!sourceReadme) return [];
+  const restored = [];
+  for (const relative of ['pristine/BENZHI_README.md', 'workspace/BENZHI_README.md', '.git-layout/BENZHI_README.md']) {
+    const filename = path.join(taskDir, relative);
+    const stat = await fsp.stat(filename).catch(() => null);
+    if (!stat) continue;
+    const current = await fsp.readFile(filename);
+    if (current.equals(sourceReadme)) continue;
+    await fsp.chmod(filename, 0o644).catch(() => {});
+    await fsp.writeFile(filename, sourceReadme);
+    await fsp.chmod(filename, stat.mode & 0o777).catch(() => {});
+    restored.push(relative);
+  }
+  return restored;
+}
+
 function taskId(taskName) {
   return `task-${crypto.createHash('sha256').update(`go-task-library/${taskName}`).digest('hex').slice(0, 16)}`;
 }
@@ -112,10 +135,16 @@ async function repairOne(bugId, platformRecords, { resubmit }) {
   const jobFile = path.join(jobsRoot, String(before.pipeline_job_id || ''), 'job.json');
   const job = await readJson(jobFile);
   const bugIndex = Number(before.bug_index);
-  if (!job?.bugs?.some((bug) => Number(bug.bugIndex) === bugIndex)) {
+  const jobBug = job?.bugs?.find((bug) => Number(bug.bugIndex) === bugIndex);
+  if (!jobBug) {
     throw new Error(`${bugId} 在 ${before.pipeline_job_id} 中缺少 Bug ${bugIndex}`);
   }
 
+  const restoredReadmes = await restoreDiagnosisReadmesFromSource(
+    taskDir,
+    jobBug.bugBaseDir,
+    jobBug.diagnosisSourceCommit || jobBug.redCommit || jobBug.bugBaseCommit,
+  );
   const publication = await finalizeV3DiagnosisImmutableDelivery(jobFile, bugIndex, fixtureDir, testFile);
   const id = taskId(path.basename(taskDir));
   const afterPublication = await readJson(path.join(taskDir, 'public.json'));
@@ -162,6 +191,7 @@ async function repairOne(bugId, platformRecords, { resubmit }) {
     previousRedCommit: before.red_commit || before.bug_base_commit,
     redCommit: publication.redCommit,
     testFile,
+    restoredReadmes,
     proofSessionId: manifest.session_id,
     proofDirectory: path.relative(libraryRoot, proofDir),
     proofUrl: upload.uploaded?.url || upload.uploaded?.signedUrl || '',

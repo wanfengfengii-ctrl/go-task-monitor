@@ -61,6 +61,7 @@ image_stem="go-task-grader-go${go_version}-${module_fingerprint}"
 lock_root="${GO_PIPELINE_DOCKER_LOCK_ROOT:-$(cd "$task_dir/../../.." && pwd)/docker-cache/locks}"
 mkdir -p "$lock_root"
 refresh_images="${REFRESH_GRADER_IMAGES:-0}"
+docker_run_cpu_limit="${GO_PIPELINE_DOCKER_RUN_CPUS:-2}"
 
 # The task images are public and do not need a registry credential.  Docker
 # Desktop's credential helper can hang while resolving an otherwise public
@@ -152,6 +153,7 @@ run_grader() {
   local image_reference="$2"
   local grader_script="$3"
   docker run --rm --network none --platform "$platform" \
+    --cpus "$docker_run_cpu_limit" \
     -e GOTOOLCHAIN=local \
     -v "$workspace:/workspace:ro" \
     -v "$grader_dir:/grader:ro" \
@@ -162,6 +164,7 @@ check_toolchain() {
   local platform="$1"
   local image_reference="$2"
   docker run --rm --network none --platform "$platform" \
+    --cpus "$docker_run_cpu_limit" \
     "$image_reference" bash -c 'command -v go >/dev/null && go version >/dev/null'
 }
 
@@ -169,6 +172,7 @@ run_diagnosis_baseline() {
   local platform="$1"
   local image_reference="$2"
   docker run --rm --network none --platform "$platform" \
+    --cpus "$docker_run_cpu_limit" \
     -e GOTOOLCHAIN=local \
     -v "$workspace:/workspace:ro" \
     -v "$grader_dir:/grader:ro" \

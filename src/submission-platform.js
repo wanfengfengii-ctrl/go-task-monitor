@@ -285,6 +285,22 @@ export function mergePlatformSubmissionReview(record = {}, remote = {}, { observ
   };
 }
 
+export function isReadmeOnlyPlatformRepairReason(value) {
+  const reason = text(value);
+  if (!reason) return false;
+  const reasonSection = reason.includes('打回原因：')
+    ? reason.split('打回原因：').slice(1).join('打回原因：').split('关键证据：', 1)[0]
+    : reason;
+  const numberedItems = reasonSection.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^\d+[.、]\s*/.test(line))
+    .map((line) => line.replace(/^\d+[.、]\s*/, ''));
+  const substantiveItems = numberedItems.filter((item) => !/^问题归属[:：]/.test(item));
+  return substantiveItems.length === 1
+    && /BENZHI_README\.md/i.test(substantiveItems[0])
+    && /(?:项目简介|一句话简介)/.test(substantiveItems[0]);
+}
+
 export function buildPlatformReviewSnapshot(remoteItems = [], { observedAt = new Date().toISOString() } = {}) {
   const submissions = (Array.isArray(remoteItems) ? remoteItems : []).map((remote) => {
     const merged = mergePlatformSubmissionReview({}, remote, { observedAt });

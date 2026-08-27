@@ -57,6 +57,7 @@ import {
   findPlatformSubmissionByBugId,
   findPlatformSubmissionForRecord,
   isLegacyDeliveredPlatformBackfill,
+  isReadmeOnlyPlatformRepairReason,
   mergePlatformSubmissionReview,
   mergePlatformCookies,
   platformApiMessage,
@@ -5113,16 +5114,46 @@ async function submitPipelineTaskToPlatform(pipelineJobId, bugIndex, taskId, { a
   });
 }
 
-async function resubmitTaskToPlatform(taskId, submissionId) {
+async function resubmitTaskToPlatform(taskId, submissionId, {
+  allowLegacyReadmeOnlyDifficultyOverride = false,
+} = {}) {
   const task = (await discoverTasksFresh()).find((item) => item.id === taskId);
   if (!task) throw new Error('没有找到待返修任务');
-  if (task.status !== 'passed') throw new Error(`${task.bug_id} 尚未完成，不能返修提交`);
+  let difficultyOverride = false;
+  if (allowLegacyReadmeOnlyDifficultyOverride) {
+    const reviewSnapshot = await readSubmissionPlatformReviewSnapshot();
+    const pendingRepair = (reviewSnapshot?.submissions || []).find((record) => {
+      return String(record?.submissionId || '') === String(submissionId)
+        && String(record?.bugId || '') === String(task.bug_id || '');
+    });
+    if (pendingRepair?.reviewStatus !== 'PENDING_FIX'
+      || !isReadmeOnlyPlatformRepairReason(pendingRepair?.reviewReason)) {
+      throw new Error(`${task.bug_id} 不符合 README 单项打回的人工难度豁免条件`);
+    }
+    difficultyOverride = true;
+  }
+  const archivedRepairEligibility = difficultyOverride
+    ? (await readArchivedTasks()).find((record) => {
+      return String(record?.id || '') === String(task.id || '')
+        && String(record?.name || '') === String(task.name || '')
+        && String(record?.bug_id || '') === String(task.bug_id || '')
+        && record?.status === 'passed'
+        && record?.reviewStatus === 'qualified'
+        && hasCurrentArchivedExportPolicy(record, CURRENT_VERIFICATION_POLICY_VERSION);
+    })
+    : null;
+  if (task.status !== 'passed' && !archivedRepairEligibility) {
+    throw new Error(`${task.bug_id} 尚未完成，不能返修提交`);
+  }
   const qualified = (await readReviewStatuses()).some((record) => record.taskId === task.id && record.status === 'qualified')
-    || (task.archived === true && task.archiveExportReady === true && task.reviewStatus === 'qualified');
+    || (task.archived === true && task.archiveExportReady === true && task.reviewStatus === 'qualified')
+    || Boolean(archivedRepairEligibility);
   if (!qualified) throw new Error(`${task.bug_id} 尚未通过本地交付审核`);
-  await validatePlatformBugDifficulty(task);
-  await validateTaskExcelVerification(task);
-  if (task.ruleIssues?.length) throw new Error(`${task.bug_id} 尚未满足交付规则：${task.ruleIssues.join('；')}`);
+  if (!difficultyOverride) await validatePlatformBugDifficulty(task);
+  if (!archivedRepairEligibility) await validateTaskExcelVerification(task);
+  if (task.ruleIssues?.length && !archivedRepairEligibility) {
+    throw new Error(`${task.bug_id} 尚未满足交付规则：${task.ruleIssues.join('；')}`);
+  }
   if (usesFixedGitCommitLayout(task)) await assertRemoteGitDeliveryLayout(task);
   await readTrajectoryMetadata(task, { requireV4: await requiresV4Trajectory(task) });
 
@@ -5154,6 +5185,7 @@ async function resubmitTaskToPlatform(taskId, submissionId) {
         platformUrl: `${submissionPlatformBaseUrl}/u/detail/${submissionId}`,
         repairAttemptedAt: startedAt,
         repairError: message,
+        repairDifficultyOverride: difficultyOverride ? 'legacy_readme_only_manual_repair' : '',
       });
       throw new Error(message);
     }
@@ -5168,6 +5200,7 @@ async function resubmitTaskToPlatform(taskId, submissionId) {
       submittedAt: editable?.submitted_at || startedAt,
       resubmittedAt: startedAt,
       repairError: '',
+      repairDifficultyOverride: difficultyOverride ? 'legacy_readme_only_manual_repair' : '',
     }, { status: remote?.status || 'PENDING_FIRST_REVIEW', ...remote });
     await upsertSubmissionPlatformRecord(resubmitted);
     invalidateTaskDiscoveryCache();
@@ -7994,7 +8027,9 @@ const server = http.createServer(async (request, response) => {
       const submissionId = String(body.submissionId || '').trim();
       if (!taskId || !submissionId) return json(response, 400, { message: 'taskId 和 submissionId 必填' });
       try {
-        const submission = await resubmitTaskToPlatform(taskId, submissionId);
+        const submission = await resubmitTaskToPlatform(taskId, submissionId, {
+          allowLegacyReadmeOnlyDifficultyOverride: body.allowLegacyReadmeOnlyDifficultyOverride === true,
+        });
         return json(response, 200, { message: '已返修并重新提交质检平台', submission });
       } catch (error) {
         return json(response, 409, { message: error.message });

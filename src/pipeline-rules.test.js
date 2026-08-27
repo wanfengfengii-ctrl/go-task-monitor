@@ -9,6 +9,7 @@ import {
   CURRENT_WORKFLOW_VERSION,
   DEFAULT_BUG_COUNT,
   isPipelineBugDeliveryComplete,
+  isInvalidRedVerificationTestFailure,
   isShallowBugfixRepairFailure,
   isSkippedPipelineBug,
   markPipelineBugFailed,
@@ -48,6 +49,13 @@ test('sub-three-line Bugfix repair failures are recognized as deterministic skip
     'INVALID_REPAIR_OUTPUT=1: bugfix Claude Session completed without a non-test workspace patch',
   ), false);
   assert.equal(isShallowBugfixRepairFailure('Claude API timeout'), false);
+});
+
+test('Red verification compile failures are recognized as deterministic skips', () => {
+  const error = new Error('INVALID_RED_VERIFICATION_TEST=1: Red 测试引用了 Green-only 标识符');
+  error.code = 'INVALID_RED_VERIFICATION_TEST';
+  assert.equal(isInvalidRedVerificationTestFailure(error), true);
+  assert.equal(isInvalidRedVerificationTestFailure('Codex test author timeout'), false);
 });
 
 test('user-query readiness does not treat a partial parallel Bug batch as complete', () => {

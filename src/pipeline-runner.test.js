@@ -6,7 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { adaptiveBugSourceWorkerLimit, applyInjectionInfrastructureFailures, applyInjectionPreparationFailures, approvedInjectionCandidateMismatch, assertGoldTestsUsePublicBehavior, bugCandidatePoolSchema, bugCandidateReviewSchema, bugNarrativeLanguageInstruction, bugSchema, bugSchemaForPolicy, buildPreparedVerifyResult, bugfixEffort, bugfixModel, bugWorkerOrder, canonicalizeGoldDescriptor, changedTestFiles, claudeProjectArgs, codexFailureMessage, codexSandboxArgs, codexStreamRecoveryConfigArgs, createCodexStreamRecoveryMonitor, createCurrentQualityReviewBundle, createDockerGraderScript, createOrphanDiagnosisRedSnapshot, createProjectDockerEnvironment, criticalDatastoreFiles, discoveryRootCauseDescriptor, elasticProjectBugWorkerLimit, ensureDiagnosisWorkspaceUnchanged, existingDiagnosisVerificationPlan, explicitDockerVerifyCmds, extractFailedGoTestNames, finalizeVerificationResult, goModVersion, hasDurableTrajectoryReuseCheckpoint, injectionPlanningBatch, inspectBugfixRepairWorkspace, inspectClaudeSessionMetadata, inspectDiagnosisWorkspace, isGoldCheckpointSemanticFailure, isRecoverableInjectionCandidateFailure, isRetryableInjectionInfrastructureFailure, materializeVerificationTest, modelFacingDiagnosisQuery, NATURAL_BUG_MIN_REVIEW_SCORE, naturalBugCandidateSeedResult, naturalBugFinderFailureCount, NaturalBugFinderInfrastructureError, normalizeBugCandidateFinders, normalizedPipelineCloneUrl, normalizeDiagnosisVerificationTests, numberedBugId, numberedGreenBranch, numberedRedBranch, numberedModelFixBranch, packagedDockerVerifyCmds, persistVerificationManifest, pipelineHealthPathForJob, pipelineTasksRootForJob, prepareTrajectoryRetry, prepareVerificationProofInputs, projectBugWorkerCeiling, projectGenerationPrompt, projectGeneratorConfig, projectGeneratorGatewayEnvironment, projectGeneratorSessionMismatch, projectGoEnvironment, promotePublishedVerificationFixture, publicTargetCommandForTask, readJson, recoverBugfixRepairCheckpointFromLayout, recoverGoldCheckpoint, rejectGoldCheckpoint, remainingProjectGenerationTimeout, removeGeneratedBuildArtifacts, removeGeneratedCompilerArtifacts, resolveGoldTestPackage, restoreArchivedTrajectoryArtifacts, restorePublishedBugfixWorkspace, restoreVerificationEvidenceFromManifests, retainValidInjectionPlanCandidates, runAdaptiveBoundedWorkers, runCommand, safeDiagnosisPublicReproductionCommand, safeSlug, sanitizeModelFacingDiagnosisTask, selectReviewedBugCandidates, shellSingleQuote, snapshotRunnerScript, syncAuthoredVerificationMetadata, terminateProcessTree, validateDiscoveredBug, validateGoldTestDescriptor, validateInjectedBugWorktree, verificationCoverageSchema, writeGrader, migrateWorkflowPolicyVersion } from '../scripts/run-production-pipeline.mjs';
+import { adaptiveBugSourceWorkerLimit, applyInjectionInfrastructureFailures, applyInjectionPreparationFailures, approvedInjectionCandidateMismatch, assertGoldTestsUsePublicBehavior, bugCandidatePoolSchema, bugCandidateReviewSchema, bugNarrativeLanguageInstruction, bugSchema, bugSchemaForPolicy, buildPreparedVerifyResult, bugfixEffort, bugfixModel, bugWorkerOrder, canonicalizeGoldDescriptor, changedTestFiles, claudeProjectArgs, codexFailureMessage, codexSandboxArgs, codexStreamRecoveryConfigArgs, createCodexStreamRecoveryMonitor, createCurrentQualityReviewBundle, createDockerGraderScript, createOrphanDiagnosisRedSnapshot, createProjectDockerEnvironment, criticalDatastoreFiles, diagnosisRemoteTailContainsOnlyReadme, discoveryRootCauseDescriptor, elasticProjectBugWorkerLimit, ensureDiagnosisRedCommitAvailable, ensureDiagnosisWorkspaceUnchanged, existingDiagnosisVerificationPlan, explicitDockerVerifyCmds, extractFailedGoTestNames, finalizeVerificationResult, goModVersion, hasDurableTrajectoryReuseCheckpoint, historicalDiagnosisRedContainsAuthoredTest, injectionPlanningBatch, inspectBugfixRepairWorkspace, inspectClaudeSessionMetadata, inspectDiagnosisWorkspace, invalidateStaleDiagnosisPublicationStages, isGoldCheckpointSemanticFailure, isRecoverableInjectionCandidateFailure, isRetryableInjectionInfrastructureFailure, materializeVerificationTest, modelFacingDiagnosisQuery, NATURAL_BUG_MIN_REVIEW_SCORE, naturalBugCandidateSeedResult, naturalBugFinderFailureCount, NaturalBugFinderInfrastructureError, normalizeBugCandidateFinders, normalizedPipelineCloneUrl, normalizeDiagnosisVerificationTests, numberedBugId, numberedGreenBranch, numberedRedBranch, numberedModelFixBranch, packagedDockerVerifyCmds, persistVerificationManifest, pipelineHealthPathForJob, pipelineTasksRootForJob, prepareTrajectoryRetry, prepareVerificationProofInputs, projectBugWorkerCeiling, projectGenerationPrompt, projectGeneratorConfig, projectGeneratorGatewayEnvironment, projectGeneratorSessionMismatch, projectGoEnvironment, promotePublishedVerificationFixture, publicTargetCommandForTask, readJson, recoverBugfixRepairCheckpointFromLayout, recoverGoldCheckpoint, recoverPostClaudeVerificationTestAttempt, rejectGoldCheckpoint, remainingProjectGenerationTimeout, removeGeneratedBuildArtifacts, removeGeneratedCompilerArtifacts, resolveGoldTestPackage, restoreArchivedTrajectoryArtifacts, restorePublishedBugfixWorkspace, restoreVerificationEvidenceFromManifests, retainValidInjectionPlanCandidates, runAdaptiveBoundedWorkers, runCommand, safeDiagnosisPublicReproductionCommand, safeSlug, sanitizeModelFacingDiagnosisTask, selectReviewedBugCandidates, shellSingleQuote, snapshotRunnerScript, syncAuthoredVerificationMetadata, terminateProcessTree, validateDiscoveredBug, validateGoldTestDescriptor, validateInjectedBugWorktree, verificationCoverageSchema, writeGrader, migrateWorkflowPolicyVersion } from '../scripts/run-production-pipeline.mjs';
 import { reopenBug } from '../scripts/reopen-skipped-bug.mjs';
 import { reopenQualityRejectedBug } from '../scripts/reopen-quality-rejected-diagnosis.mjs';
 import { orderStageResourceWaiters, stageResourceWaiterId } from '../scripts/run-production-pipeline.mjs';
@@ -812,6 +812,84 @@ test('retry preserves concurrency verification policy in public metadata', async
   }
 });
 
+test('bugfix test-author recovery reuses a historical artifact only when it is red on baseline and green on the current repair', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'bugfix-test-author-recovery-'));
+  const taskDir = path.join(root, 'task');
+  const bugBaseDir = path.join(root, 'bug-base');
+  const fixedDir = path.join(root, 'fixed');
+  const sourceDir = path.join(taskDir, 'verification-test-bug1-attempt-valid');
+  const testFile = 'model_recovery_test.go';
+  const testName = 'TestModel_Recovery';
+  const source = `package sample
+
+import "testing"
+
+func TestModel_Recovery(t *testing.T) {
+	tests := []struct { name string; want bool }{{name: "fixed", want: true}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Ready(); got != tt.want { t.Fatalf("Ready() = %v, want %v", got, tt.want) }
+		})
+	}
+}
+`;
+  const sha256 = createHash('sha256').update(source).digest('hex');
+  const jobFile = path.join(root, 'job.json');
+  try {
+    await Promise.all([
+      mkdir(path.join(taskDir, 'trajectory'), { recursive: true }),
+      mkdir(bugBaseDir, { recursive: true }),
+      mkdir(fixedDir, { recursive: true }),
+      mkdir(sourceDir, { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(path.join(bugBaseDir, 'go.mod'), 'module example.test/sample\n\ngo 1.23\n'),
+      writeFile(path.join(fixedDir, 'go.mod'), 'module example.test/sample\n\ngo 1.23\n'),
+      writeFile(path.join(bugBaseDir, 'sample.go'), 'package sample\n\nfunc Ready() bool { return false }\n'),
+      writeFile(path.join(fixedDir, 'sample.go'), 'package sample\n\nfunc Ready() bool { return true }\n'),
+      writeFile(path.join(sourceDir, testFile), source),
+      writeFile(path.join(sourceDir, 'test-manifest.json'), `${JSON.stringify({
+        testFile,
+        testPackage: '.',
+        testName,
+        command: `go test . -run '^${testName}$' -count=1 -v`,
+        sessionId: 'historical-test-author',
+        sourceDir,
+        sha256,
+        redExitCode: 1,
+        greenExitCode: 0,
+        authoredBy: 'codex_after_claude',
+      })}\n`),
+      writeFile(path.join(taskDir, 'trajectory/session_id.txt'), 'current-repair-session\n'),
+      writeFile(jobFile, `${JSON.stringify({
+        bugs: [{ bugIndex: 1, task: { taskDir } }],
+        stages: [{ id: 'bug1_test_author', bugIndex: 1, status: 'skipped', reason: 'old invalid test' }],
+      })}\n`),
+    ]);
+
+    const recovered = await recoverPostClaudeVerificationTestAttempt(
+      jobFile,
+      1,
+      bugBaseDir,
+      fixedDir,
+      { bug_category: 'other', runtime_mechanisms: ['cross_layer_data_flow'] },
+    );
+
+    assert.equal(recovered?.sourceDir, sourceDir);
+    assert.equal(recovered?.redFailureKind, 'behavioral_test_failure');
+    assert.equal(recovered?.greenExitCode, 0);
+    assert.equal(recovered?.repairSessionId, 'current-repair-session');
+    assert.equal(recovered?.authoredBy, 'codex_after_claude_recovered');
+    const persisted = JSON.parse(await readFile(jobFile, 'utf8'));
+    assert.equal(persisted.bugs[0].verificationTestAuthor.sha256, sha256);
+    assert.equal(persisted.bugs[0].verificationTestRecoveryHistory.length, 1);
+    assert.equal(persisted.stages[0].status, 'passed');
+    assert.equal(persisted.stages[0].result.recovered, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('diagnosis verification metadata keeps the authored test outside workspace and Git', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'diagnosis-verification-metadata-'));
   try {
@@ -841,6 +919,134 @@ test('diagnosis verification metadata keeps the authored test outside workspace 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('diagnosis metadata recovery preserves an already published repository test', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'diagnosis-published-metadata-'));
+  try {
+    const taskDir = path.join(root, 'task');
+    const sourceDir = path.join(taskDir, 'verification-test-bug1');
+    const testFile = 'internal/service/model_diagnosis_test.go';
+    const source = `package service\n\nimport "testing"\n\nfunc TestModel_Diagnosis(t *testing.T) {}\n`;
+    const digest = createHash('sha256').update(source).digest('hex');
+    await mkdir(path.join(sourceDir, 'internal/service'), { recursive: true });
+    await writeFile(path.join(taskDir, 'public.json'), `${JSON.stringify({
+      task_type: 'diagnosis',
+      verification_test_overlay: 'repository-tests',
+      verification_test_published: true,
+      verification_fixture_published: true,
+      verification_test_storage: 'repository-red-branch',
+      verification_test_sha256: digest,
+    })}\n`);
+    await writeFile(path.join(sourceDir, testFile), source);
+
+    await syncAuthoredVerificationMetadata(taskDir, {
+      sourceDir,
+      testFile,
+      sessionId: 'test-author-session',
+      sha256: digest,
+    }, { taskType: 'diagnosis' });
+
+    const metadata = JSON.parse(await readFile(path.join(taskDir, 'public.json'), 'utf8'));
+    assert.equal(metadata.verification_test_overlay, 'repository-tests');
+    assert.equal(metadata.verification_test_published, true);
+    assert.equal(metadata.verification_fixture_published, true);
+    assert.equal(metadata.verification_test_storage, 'repository-red-branch');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('stale diagnosis publication recovery reopens only publication-dependent stages', () => {
+  const stage = (suffix, status = 'passed') => ({
+    id: `bug4_${suffix}`,
+    bugIndex: 4,
+    status,
+    result: { old: true },
+  });
+  const job = {
+    request: { taskType: 'diagnosis' },
+    stages: [
+      stage('claude_fix'),
+      stage('trajectory_validate'),
+      stage('test_author'),
+      stage('git_publication'),
+      stage('pre_verify'),
+      stage('cloud_upload'),
+      stage('verification_finalize'),
+      stage('platform_submit', 'skipped'),
+      stage('delivery_ready', 'skipped'),
+    ],
+    bugs: [{
+      bugIndex: 4,
+      verificationEvidence: { pre_fix: { result: 'red' } },
+    }],
+  };
+
+  assert.equal(invalidateStaleDiagnosisPublicationStages(job, 4, '2026-08-26T00:00:00.000Z'), true);
+  assert.equal(job.stages.find((item) => item.id === 'bug4_claude_fix').status, 'passed');
+  assert.equal(job.stages.find((item) => item.id === 'bug4_test_author').status, 'passed');
+  for (const suffix of ['git_publication', 'pre_verify', 'cloud_upload', 'verification_finalize', 'platform_submit', 'delivery_ready']) {
+    const recovered = job.stages.find((item) => item.id === `bug4_${suffix}`);
+    assert.equal(recovered.status, 'pending');
+    assert.equal(Object.hasOwn(recovered, 'result'), false);
+  }
+  assert.equal(Object.hasOwn(job.bugs[0], 'verificationEvidence'), false);
+  assert.equal(job.bugs[0].diagnosisPublicationRecovery.reason, 'private_fixture_was_never_published');
+});
+
+test('diagnosis publication fetches a missing orphan Red commit from its exact remote branch', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'diagnosis-red-fetch-'));
+  const remote = path.join(root, 'remote.git');
+  const source = path.join(root, 'source');
+  const consumer = path.join(root, 'consumer');
+  const runGit = (cwd, ...args) => {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  try {
+    await mkdir(source, { recursive: true });
+    runGit(root, 'init', '--bare', '-q', remote);
+    runGit(source, 'init', '-q', '-b', 'main');
+    runGit(source, 'config', 'user.name', 'Fixture');
+    runGit(source, 'config', 'user.email', 'fixture@example.invalid');
+    await writeFile(path.join(source, 'service.go'), 'package service\n');
+    runGit(source, 'add', '.');
+    runGit(source, 'commit', '-q', '-m', 'main');
+    runGit(source, 'switch', '--orphan', 'bug4_red');
+    await writeFile(path.join(source, 'model_test.go'), 'package service\n');
+    runGit(source, 'add', '.');
+    runGit(source, 'commit', '-q', '-m', 'red');
+    const redCommit = runGit(source, 'rev-parse', 'HEAD');
+    runGit(source, 'push', '-q', remote, 'bug4_red');
+    await mkdir(consumer, { recursive: true });
+    runGit(consumer, 'init', '-q', '-b', 'main');
+    assert.notEqual(spawnSync('git', ['cat-file', '-e', redCommit], { cwd: consumer }).status, 0);
+
+    const recovered = await ensureDiagnosisRedCommitAvailable(consumer, remote, 'bug4_red', redCommit);
+
+    assert.deepEqual(recovered, { fetched: true, commit: redCommit });
+    assert.equal(runGit(consumer, 'cat-file', '-t', redCommit), 'commit');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('historical diagnosis Red reconciliation accepts only the exact authored test addition', () => {
+  const testFile = 'internal/service/model_diagnosis_test.go';
+  const contents = 'package service\n';
+  const digest = createHash('sha256').update(contents).digest('hex');
+  assert.equal(historicalDiagnosisRedContainsAuthoredTest(`A\t${testFile}\n`, testFile, contents, digest), true);
+  assert.equal(historicalDiagnosisRedContainsAuthoredTest(`M\tservice.go\nA\t${testFile}\n`, testFile, contents, digest), false);
+  assert.equal(historicalDiagnosisRedContainsAuthoredTest(`A\t${testFile}\n`, testFile, `${contents}// changed\n`, digest), false);
+});
+
+test('diagnosis publication accepts only README-only commits after the recorded Red commit', () => {
+  assert.equal(diagnosisRemoteTailContainsOnlyReadme('BENZHI_README.md\n'), true);
+  assert.equal(diagnosisRemoteTailContainsOnlyReadme('BENZHI_README.md\nBENZHI_README.md\n'), true);
+  assert.equal(diagnosisRemoteTailContainsOnlyReadme(''), false);
+  assert.equal(diagnosisRemoteTailContainsOnlyReadme('BENZHI_README.md\nservice.go\n'), false);
 });
 
 test('proof input preflight rejects a declared test that is not materialized', async () => {
@@ -2696,7 +2902,7 @@ test('pipeline runner creates a real dual-platform Docker target grader', () => 
   assert.match(script, /GO_PIPELINE_DOCKER_LOCK_ROOT/);
   assert.doesNotMatch(script, /docker image rm -f/);
   assert.match(script, /docker run --rm --network none --platform/);
-  assert.match(script, /--cpus 4/);
+  assert.match(script, /--cpus 2/);
   assert.match(script, /run_target\.sh/);
   assert.match(script, /run_compile\.sh/);
   assert.match(script, /run_full\.sh/);
@@ -2708,7 +2914,7 @@ test('pipeline runner exports explicit Docker commands instead of a wrapper comm
   const commands = explicitDockerVerifyCmds('sample-task', 'bugfix', "go test -count=1 -run '^TestRegression$' ./...");
   assert.equal(commands.length, 8);
   assert.doesNotMatch(commands.join('\n'), /run_docker\.sh|docker image rm/);
-  assert.equal(commands.filter((command) => command.startsWith('docker run ')).every((command) => command.includes('--cpus 4')), true);
+  assert.equal(commands.filter((command) => command.startsWith('docker run ')).every((command) => command.includes('--cpus 2')), true);
   for (const platform of ['linux/arm64', 'linux/amd64']) {
     assert.ok(commands.some((command) => command.startsWith(`docker build --platform ${platform}`)));
     assert.ok(commands.some((command) => command.includes(`--platform ${platform}`) && /go test[^\n]*-run/.test(command)));
@@ -2761,7 +2967,7 @@ test('bugfix uses the Gold regression while diagnosis preserves a real public re
 test('historical diagnosis export can use the isolated external grader commands', () => {
   const commands = packagedDockerVerifyCmds('sample-task', 'diagnosis');
   assert.equal(commands.length, 6);
-  assert.equal(commands.filter((command) => command.startsWith('docker run ')).every((command) => command.includes('--cpus 4')), true);
+  assert.equal(commands.filter((command) => command.startsWith('docker run ')).every((command) => command.includes('--cpus 2')), true);
   for (const platform of ['linux/arm64', 'linux/amd64']) {
     assert.ok(commands.some((command) => command.startsWith(`docker build --platform ${platform}`)));
     assert.ok(commands.some((command) => command.includes(`--platform ${platform}`) && command.includes('/grader/run_target.sh /app')));
@@ -3025,6 +3231,21 @@ test('candidate contract conflicts bypass trajectory retries', async () => {
   assert.match(cycle.slice(conflict, infrastructure), /throw error/);
   assert.match(cycle, /savedContractConflict\?\.status === 'candidate_contract_conflict'[\s\S]+CANDIDATE_CONTRACT_CONFLICT=1/);
   assert.match(pipeline, /const conflictStage = `bug\$\{bugIndex\}_claude_fix`/);
+});
+
+test('invalid Red verification tests are rechecked and skip only the current Bug', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  assert.match(pipeline, /revalidateFrozenVerificationRed/);
+  assert.ok((pipeline.match(/ensureAuthoredVerificationBehavioralRed\(/g) || []).length >= 3);
+  assert.match(pipeline, /redFailureKind:\s*'behavioral_test_failure'/);
+  assert.match(pipeline, /error\.pipelineStageId = `bug\$\{bugIndex\}_test_author`/);
+  const guard = pipeline.indexOf('if (isInvalidRedVerificationTestFailure(error))');
+  const shallow = pipeline.indexOf('if (isShallowBugfixRepairFailure(error))', guard);
+  assert.ok(guard >= 0 && shallow > guard);
+  const branch = pipeline.slice(guard, shallow);
+  assert.match(branch, /markPipelineBugSkipped\(current, bugIndex/);
+  assert.match(branch, /invalid_red_verification_test_skipped/);
+  assert.match(branch, /释放修复槽位/);
 });
 
 test('independent test author streams liveness without contaminating its JSON result', async () => {
@@ -3866,6 +4087,23 @@ test('new pipelines submit the strictly validated delivery to the normal review 
   assert.match(server, /\/submissions\/mine\/\$\{encodeURIComponent\(submissionId\)\}\/resubmit/);
   assert.match(server, /remoteBugId !== task\.bug_id/);
   assert.doesNotMatch(server, /admin\/import\/excel/);
+});
+
+test('README-only repairs may reuse an exact qualified archived delivery certificate', async () => {
+  const server = await readFile(path.resolve(import.meta.dirname, '../server.mjs'), 'utf8');
+  const repair = await readFile(path.resolve(import.meta.dirname, '../scripts/repair-platform-readme-introductions.mjs'), 'utf8');
+  const start = server.indexOf('async function resubmitTaskToPlatform');
+  const end = server.indexOf('\nasync function submissionPlatformPublicState', start);
+  const resubmit = server.slice(start, end);
+  assert.match(resubmit, /isReadmeOnlyPlatformRepairReason\(pendingRepair\?\.reviewReason\)/);
+  assert.match(resubmit, /String\(record\?\.id \|\| ''\) === String\(task\.id \|\| ''\)/);
+  assert.match(resubmit, /record\?\.status === 'passed'/);
+  assert.match(resubmit, /record\?\.reviewStatus === 'qualified'/);
+  assert.match(resubmit, /hasCurrentArchivedExportPolicy\(record, CURRENT_VERIFICATION_POLICY_VERSION\)/);
+  assert.match(resubmit, /task\.status !== 'passed' && !archivedRepairEligibility/);
+  assert.match(resubmit, /if \(!archivedRepairEligibility\) await validateTaskExcelVerification\(task\)/);
+  assert.match(resubmit, /task\.ruleIssues\?\.length && !archivedRepairEligibility/);
+  assert.match(repair, /allowLegacyReadmeOnlyDifficultyOverride: true/);
 });
 
 test('new Git delivery proofs bind pre-fix to Red and keep branch commit counts fixed', async () => {

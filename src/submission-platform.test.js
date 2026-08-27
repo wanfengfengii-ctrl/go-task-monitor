@@ -8,6 +8,7 @@ import {
   findPlatformSubmissionByBugId,
   findPlatformSubmissionForRecord,
   isLegacyDeliveredPlatformBackfill,
+  isReadmeOnlyPlatformRepairReason,
   mergePlatformSubmissionReview,
   mergePlatformCookies,
   platformImportState,
@@ -215,6 +216,22 @@ test('platform review reconciliation preserves import state and records repair f
   assert.equal(imported.submissionPlatformImportStatus, 'imported');
   assert.equal(imported.submissionPlatformReviewStatus, 'PENDING_FIX');
   assert.equal(imported.submissionPlatformError, '测试断言被削弱');
+});
+
+test('README-only repair override excludes mixed or unrelated rejections', () => {
+  const readmeOnly = `[云质检]
+结论：打回
+打回原因：
+1. BENZHI_README.md 顶部项目简介不合格：未明确说明项目类型。
+2. 问题归属：项目说明文件；对应规则：必须提供一句话项目简介。
+关键证据：
+1. BENZHI_README.md 项目简介原文：本 Git 项目来自 workspace。`;
+  assert.equal(isReadmeOnlyPlatformRepairReason(readmeOnly), true);
+  assert.equal(isReadmeOnlyPlatformRepairReason(
+    readmeOnly.replace('\n关键证据：', '\n3. 最终版本编译失败。\n关键证据：'),
+  ), false);
+  assert.equal(isReadmeOnlyPlatformRepairReason('1.【题目过于简单】修改内容过小'), false);
+  assert.equal(isReadmeOnlyPlatformRepairReason('1. BENZHI_README.md 不合格\n2. 修复后测试仍然失败'), false);
 });
 
 test('platform submission totals accept nested list envelopes', () => {

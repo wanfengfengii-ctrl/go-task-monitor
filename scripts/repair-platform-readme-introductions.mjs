@@ -156,6 +156,7 @@ export async function main(args = process.argv.slice(2)) {
     await postJson('/api/submission-platform/resubmit', {
       taskId: `task-${crypto.createHash('sha256').update(`go-task-library/${path.basename(taskDir)}`).digest('hex').slice(0, 16)}`,
       submissionId: spec.submissionId,
+      allowLegacyReadmeOnlyDifficultyOverride: true,
     });
     audit.results.push({ ...spec, publications, localReadmes, status: 'resubmitted' });
     await writeJsonAtomic(auditPath, { ...audit, updatedAt: new Date().toISOString() });

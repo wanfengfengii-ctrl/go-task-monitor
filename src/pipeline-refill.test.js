@@ -18,6 +18,7 @@ import {
   reconcilePipelineRefillCreatedJobs,
   shouldStartPipelineRefill,
 } from './pipeline-refill.js';
+import { MAX_PIPELINE_AUTO_RETRIES } from './pipeline-concurrency.js';
 
 test('new task-type allocation starts from zero and keeps a cumulative 7/3 split', () => {
   const firstTen = allocatePipelineTaskTypes(10);
@@ -252,13 +253,14 @@ test('pipeline refill resumes a stopped project plan instead of creating a new p
   assert.equal(result.supply.runnableCount, 1);
 });
 
-test('incomplete project budget counts failed work until it is abandoned', () => {
+test('incomplete project budget excludes retry-exhausted failures that require manual action', () => {
   const jobs = [
     { status: 'passed' },
     { status: 'abandoned' },
     { status: 'stopped' },
     { status: 'draft' },
     { status: 'failed' },
+    { status: 'failed', autoRetryCount: MAX_PIPELINE_AUTO_RETRIES },
     { status: 'failed', manualHold: true },
   ];
   assert.equal(countIncompletePipelineProjects(jobs), 2);

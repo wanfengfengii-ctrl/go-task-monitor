@@ -36,6 +36,13 @@ export function isShallowBugfixRepairFailure(value) {
     || /模型生产代码改动\s*\d+\s*行，?少于\s*3\s*行/u.test(text);
 }
 
+export function isInvalidRedVerificationTestFailure(value) {
+  const text = value instanceof Error
+    ? `${value.code || ''}\n${value.message || ''}`
+    : String(value || '');
+  return /INVALID_RED_VERIFICATION_TEST(?:=1)?/i.test(text);
+}
+
 export const PIPELINE_PROJECT_STAGES = [
   ['project_plan', 'Sol 规划并扩写项目文档'],
   ['project_generate', 'Claude 生成项目'],

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { platformCompatibleVerificationProofIssues, validateVerificationProofBundle, verificationCommandsSha256, verificationProofPrompt } from './verification-proof.js';
+import { isGoTestBuildFailureOutput, platformCompatibleVerificationProofIssues, validateVerificationProofBundle, verificationCommandsSha256, verificationProofPrompt } from './verification-proof.js';
 
 const runner = path.resolve(import.meta.dirname, '../run_verify_claude.sh');
 
@@ -30,6 +30,18 @@ test('platform proof compatibility requires a paired non-zero Go failure with re
     verifyCmds: [command],
     trajectoryContent: trajectory('Exit code 1\n=== RUN   TestRegression\n--- FAIL: TestRegression (0.01s)\nFAIL\n'),
   }), []);
+  assert.deepEqual(platformCompatibleVerificationProofIssues({
+    phase: 'pre_fix',
+    taskType: 'bugfix',
+    verifyCmds: [command],
+    trajectoryContent: trajectory('Exit code 1\n=== RUN   TestRegression\n    regression_test.go:42: got pending, want completed\n... [20012 characters truncated] ...\n'),
+  }), []);
+  assert.match(platformCompatibleVerificationProofIssues({
+    phase: 'pre_fix',
+    taskType: 'bugfix',
+    verifyCmds: [command],
+    trajectoryContent: trajectory('Exit code 1\n=== RUN   TestRegression\n    regression_test.go:42: diagnostic log only\n'),
+  }).join('；'), /没有形成断言失败/);
   assert.match(platformCompatibleVerificationProofIssues({
     phase: 'pre_fix',
     taskType: 'bugfix',
@@ -48,6 +60,12 @@ test('platform proof compatibility requires a paired non-zero Go failure with re
     verifyCmds: [command],
     trajectoryContent: trajectory('Exit code 1\ncommand stopped\n'),
   }).join('；'), /没有执行到目标测试/);
+});
+
+test('Go Red build failure detection survives truncated compiler output', () => {
+  assert.equal(isGoTestBuildFailureOutput('api/model_test.go:42:18: undefined: store.GreenOnlyCode\n'), true);
+  assert.equal(isGoTestBuildFailureOutput('service/model_test.go:17: cannot use got (variable of type int) as string value\n'), true);
+  assert.equal(isGoTestBuildFailureOutput('=== RUN   TestModel_State\n    model_test.go:42: got pending, want ready\n--- FAIL: TestModel_State (0.00s)\n'), false);
 });
 
 test('proof validator accepts the exact direct-command timeout prompt template', () => {
