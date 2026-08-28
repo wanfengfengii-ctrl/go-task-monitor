@@ -6,7 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { adaptiveBugSourceWorkerLimit, applyInjectionInfrastructureFailures, applyInjectionPreparationFailures, approvedInjectionCandidateMismatch, assertGoldTestsUsePublicBehavior, bugCandidatePoolSchema, bugCandidateReviewSchema, bugNarrativeLanguageInstruction, bugSchema, bugSchemaForPolicy, buildPreparedVerifyResult, bugfixEffort, bugfixModel, bugWorkerOrder, canonicalizeGoldDescriptor, changedTestFiles, claudeProjectArgs, codexFailureMessage, codexSandboxArgs, codexStreamRecoveryConfigArgs, createCodexStreamRecoveryMonitor, createCurrentQualityReviewBundle, createDockerGraderScript, createOrphanDiagnosisRedSnapshot, createProjectDockerEnvironment, criticalDatastoreFiles, diagnosisRemoteTailContainsOnlyReadme, discoveryRootCauseDescriptor, elasticProjectBugWorkerLimit, ensureDiagnosisRedCommitAvailable, ensureDiagnosisWorkspaceUnchanged, existingDiagnosisVerificationPlan, explicitDockerVerifyCmds, extractFailedGoTestNames, finalizeVerificationResult, goModVersion, hasDurableTrajectoryReuseCheckpoint, historicalDiagnosisRedContainsAuthoredTest, injectionPlanningBatch, inspectBugfixRepairWorkspace, inspectClaudeSessionMetadata, inspectDiagnosisWorkspace, invalidateStaleDiagnosisPublicationStages, isGoldCheckpointSemanticFailure, isRecoverableInjectionCandidateFailure, isRetryableInjectionInfrastructureFailure, materializeVerificationTest, modelFacingDiagnosisQuery, NATURAL_BUG_MIN_REVIEW_SCORE, naturalBugCandidateSeedResult, naturalBugFinderFailureCount, NaturalBugFinderInfrastructureError, normalizeBugCandidateFinders, normalizedPipelineCloneUrl, normalizeDiagnosisVerificationTests, numberedBugId, numberedGreenBranch, numberedRedBranch, numberedModelFixBranch, packagedDockerVerifyCmds, persistVerificationManifest, pipelineHealthPathForJob, pipelineTasksRootForJob, prepareTrajectoryRetry, prepareVerificationProofInputs, projectBugWorkerCeiling, projectGenerationPrompt, projectGeneratorConfig, projectGeneratorGatewayEnvironment, projectGeneratorSessionMismatch, projectGoEnvironment, promotePublishedVerificationFixture, publicTargetCommandForTask, readJson, recoverBugfixRepairCheckpointFromLayout, recoverGoldCheckpoint, recoverPostClaudeVerificationTestAttempt, rejectGoldCheckpoint, remainingProjectGenerationTimeout, removeGeneratedBuildArtifacts, removeGeneratedCompilerArtifacts, resolveGoldTestPackage, restoreArchivedTrajectoryArtifacts, restorePublishedBugfixWorkspace, restoreVerificationEvidenceFromManifests, retainValidInjectionPlanCandidates, runAdaptiveBoundedWorkers, runCommand, safeDiagnosisPublicReproductionCommand, safeSlug, sanitizeModelFacingDiagnosisTask, selectReviewedBugCandidates, shellSingleQuote, snapshotRunnerScript, syncAuthoredVerificationMetadata, terminateProcessTree, validateDiscoveredBug, validateGoldTestDescriptor, validateInjectedBugWorktree, verificationCoverageSchema, writeGrader, migrateWorkflowPolicyVersion } from '../scripts/run-production-pipeline.mjs';
+import { adaptiveBugSourceWorkerLimit, applyInjectionInfrastructureFailures, applyInjectionPreparationFailures, approvedInjectionCandidateMismatch, assertGoldTestsUsePublicBehavior, bugCandidatePoolSchema, bugCandidateReviewSchema, bugNarrativeLanguageInstruction, bugSchema, bugSchemaForPolicy, buildPreparedVerifyResult, bugfixEffort, bugfixModel, bugWorkerOrder, canonicalizeGoldDescriptor, changedTestFiles, codexFailureMessage, codexSandboxArgs, codexStreamRecoveryConfigArgs, createCodexStreamRecoveryMonitor, createCurrentQualityReviewBundle, createDockerGraderScript, createOrphanDiagnosisRedSnapshot, createProjectDockerEnvironment, criticalDatastoreFiles, diagnosisRemoteTailContainsOnlyReadme, discoveryRootCauseDescriptor, elasticProjectBugWorkerLimit, ensureDiagnosisRedCommitAvailable, ensureDiagnosisWorkspaceUnchanged, existingDiagnosisVerificationPlan, explicitDockerVerifyCmds, extractFailedGoTestNames, finalizeVerificationResult, goModVersion, hasDurableTrajectoryReuseCheckpoint, historicalDiagnosisRedContainsAuthoredTest, injectionPlanningBatch, inspectBugfixRepairWorkspace, inspectClaudeSessionMetadata, inspectDiagnosisWorkspace, invalidateStaleDiagnosisPublicationStages, isGoldCheckpointSemanticFailure, isRecoverableInjectionCandidateFailure, isRetryableInjectionInfrastructureFailure, materializeVerificationTest, modelFacingDiagnosisQuery, NATURAL_BUG_MIN_REVIEW_SCORE, naturalBugCandidateSeedResult, naturalBugFinderFailureCount, NaturalBugFinderInfrastructureError, normalizeBugCandidateFinders, normalizedPipelineCloneUrl, normalizeDiagnosisVerificationTests, numberedBugId, numberedGreenBranch, numberedRedBranch, numberedModelFixBranch, packagedDockerVerifyCmds, persistVerificationManifest, pipelineHealthPathForJob, pipelineTasksRootForJob, prepareTrajectoryRetry, prepareVerificationProofInputs, projectBugWorkerCeiling, projectGenerationPrompt, projectGeneratorConfig, projectGoEnvironment, promotePublishedVerificationFixture, publicTargetCommandForTask, readJson, recoverBugfixRepairCheckpointFromLayout, recoverGoldCheckpoint, recoverPostClaudeVerificationTestAttempt, rejectGoldCheckpoint, remainingProjectGenerationTimeout, removeGeneratedBuildArtifacts, removeGeneratedCompilerArtifacts, resolveGoldTestPackage, restoreArchivedTrajectoryArtifacts, restorePublishedBugfixWorkspace, restoreVerificationEvidenceFromManifests, retainValidInjectionPlanCandidates, runAdaptiveBoundedWorkers, runCommand, safeDiagnosisPublicReproductionCommand, safeSlug, sanitizeModelFacingDiagnosisTask, selectReviewedBugCandidates, shellSingleQuote, snapshotRunnerScript, syncAuthoredVerificationMetadata, terminateProcessTree, validateDiscoveredBug, validateGoldTestDescriptor, validateInjectedBugWorktree, verificationCoverageSchema, writeGrader, migrateWorkflowPolicyVersion } from '../scripts/run-production-pipeline.mjs';
 import { reopenBug } from '../scripts/reopen-skipped-bug.mjs';
 import { reopenQualityRejectedBug } from '../scripts/reopen-quality-rejected-diagnosis.mjs';
 import { orderStageResourceWaiters, stageResourceWaiterId } from '../scripts/run-production-pipeline.mjs';
@@ -1143,37 +1143,24 @@ test('coverage review issue schema requires its discriminator', () => {
   assert.ok(verificationCoverageSchema.properties.requirements.items.required.includes('contract_level'));
 });
 
-test('project generation can use DeepSeek through Claude Code without changing other Claude stages', () => {
+test('0-1 project generation is pinned to Codex CLI independently of Claude bug fixing', () => {
   const config = projectGeneratorConfig({
-    GO_PIPELINE_PROJECT_GENERATOR_PROVIDER: 'deepseek',
-    GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN: 'test-token',
+    GO_PIPELINE_PROJECT_GENERATOR_PROVIDER: 'codex',
+    GO_PIPELINE_CODEX_PROJECT_MODEL: 'gpt-project',
+    GO_PIPELINE_PROJECT_GENERATOR_EFFORT: 'xhigh',
   });
   assert.deepEqual(config, {
-    provider: 'deepseek',
-    baseUrl: 'https://api.deepseek.com/anthropic',
-    authToken: 'test-token',
-    model: 'deepseek-v4-pro[1m]',
-    subagentModel: 'deepseek-v4-flash',
-    effort: 'low',
+    provider: 'codex',
+    model: 'gpt-project',
+    effort: 'xhigh',
   });
-  const args = claudeProjectArgs('generate project', config);
-  assert.equal(args.includes('--bare'), true);
-  assert.deepEqual(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2), ['--model', 'deepseek-v4-pro[1m]']);
-  assert.deepEqual(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2), ['--effort', 'low']);
-  assert.equal(args.at(-1), 'generate project');
-
-  const original = projectGeneratorConfig({ CLAUDE_EFFORT: 'medium' });
-  assert.equal(original.provider, 'claude');
-  assert.equal(original.model, '');
-  assert.equal(claudeProjectArgs('original', original).includes('--bare'), false);
-  assert.equal(claudeProjectArgs('original', original).includes('--model'), false);
+  assert.deepEqual(projectGeneratorConfig({}), { provider: 'codex', model: '', effort: 'high' });
 });
 
-test('DeepSeek project generation refuses to start without its isolated API key', () => {
-  assert.throws(
-    () => projectGeneratorConfig({ GO_PIPELINE_PROJECT_GENERATOR_PROVIDER: 'deepseek' }),
-    /GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN/,
-  );
+test('0-1 project generation rejects legacy Claude and DeepSeek provider overrides', () => {
+  assert.throws(() => projectGeneratorConfig({ GO_PIPELINE_PROJECT_GENERATOR_PROVIDER: 'deepseek' }), /必须使用 Codex CLI/);
+  assert.throws(() => projectGeneratorConfig({ GO_PIPELINE_PROJECT_GENERATOR_PROVIDER: 'claude' }), /必须使用 Codex CLI/);
+  assert.throws(() => projectGeneratorConfig({ GO_PIPELINE_PROJECT_GENERATOR_EFFORT: 'invalid' }), /非法 Codex 项目生成推理强度/);
 });
 
 test('project generation uses an anonymous Docker config without desktop credential helpers', async () => {
@@ -1191,53 +1178,16 @@ test('project generation uses an anonymous Docker config without desktop credent
   await assert.rejects(stat(runtime.configPath), /ENOENT/);
 });
 
-test('Claude project generation selects the fastest healthy gateway for its current model', async () => {
-  const config = projectGeneratorConfig({});
-  const delays = new Map([
-    ['https://slow.example', [25, 200]],
-    ['https://fast.example', [0, 200]],
-    ['https://broken.example', [0, 504]],
-  ]);
-  const routing = await projectGeneratorGatewayEnvironment(config, {
-    environment: {
-      ANTHROPIC_MODEL: 'model_hub/glm-52-coding',
-      GO_PIPELINE_CLAUDE_GATEWAYS_JSON: JSON.stringify({
-        'model_hub/glm-52-coding': [...delays.keys()],
-      }),
-    },
-    fetchImpl: async (url) => {
-      const [delay, status] = delays.get(url);
-      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-      return new Response('', { status });
-    },
-  });
-  assert.equal(routing.selected, 'https://fast.example');
-  assert.deepEqual(routing.env, { ANTHROPIC_BASE_URL: 'https://fast.example' });
-  assert.equal(routing.probes.length, 3);
-});
-
-test('DeepSeek project generation keeps its isolated fixed endpoint', async () => {
-  const config = projectGeneratorConfig({
-    GO_PIPELINE_PROJECT_GENERATOR_PROVIDER: 'deepseek',
-    GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN: 'test-token',
-  });
-  const routing = await projectGeneratorGatewayEnvironment(config, {
-    environment: { GO_PIPELINE_CLAUDE_GATEWAYS_JSON: JSON.stringify(['https://other.example']) },
-    fetchImpl: async () => { throw new Error('must not probe'); },
-  });
-  assert.deepEqual(routing, { env: {}, selected: '', probes: [], model: '' });
-});
-
-test('DeepSeek generation rejects a Session that reports another model', () => {
-  const config = projectGeneratorConfig({
-    GO_PIPELINE_PROJECT_GENERATOR_PROVIDER: 'deepseek',
-    GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN: 'test-token',
-  });
-  const raw = `${JSON.stringify({ type: 'system', subtype: 'init', model: 'model_hub/glm-52-coding', session_id: 's1' })}\n`;
-  const metadata = inspectClaudeSessionMetadata(raw);
-  assert.equal(metadata.model, 'model_hub/glm-52-coding');
-  assert.match(projectGeneratorSessionMismatch(config, metadata), /期望 deepseek-v4-pro\[1m\].*实际 model_hub\/glm-52-coding/);
-  assert.equal(projectGeneratorSessionMismatch(config, { model: 'deepseek-v4-pro[1m]' }), '');
+test('Codex project generation keeps checkpoints, structured output, and workspace progress guards', async () => {
+  const pipeline = await readFile(path.resolve(import.meta.dirname, '../scripts/run-production-pipeline.mjs'), 'utf8');
+  assert.match(pipeline, /async function runCodexProjectSession/);
+  assert.match(pipeline, /schema: projectGenerationSessionSchema/);
+  assert.match(pipeline, /ignoreUserConfig: true/);
+  assert.match(pipeline, /ephemeral: true/);
+  assert.match(pipeline, /progressTreePaths: \[cwd\]/);
+  assert.match(pipeline, /PROJECT_GENERATION_STREAM_RECOVERY_WINDOW_MS/);
+  assert.match(pipeline, /project-generation-checkpoint/);
+  assert.doesNotMatch(pipeline, /runClaudeProjectSession|runClaudeProjectGeneration/);
 });
 
 test('Bug fixing uses the dedicated GLM model independently of project generation', () => {
@@ -1317,6 +1267,8 @@ test('project generation prompts create an early checkpoint and repair in place'
   assert.match(repair, /missing package/);
   assert.match(repair, /rewrite only the smoke probe to use an explicit loopback host/);
   assert.match(repair, /Do not add vendor, -mod=vendor, or COPY vendor/);
+  assert.match(repair, /Docker default CMD must start safely with no required flags/);
+  assert.match(repair, /zero-argument startup must never exit non-zero/);
   assert.match(repair, /initialize Git|create ZIP files/);
 });
 
@@ -1334,6 +1286,7 @@ test('generated project validation persists five checkpoints and resets only Doc
   assert.match(pipeline, /Promise\.all\(\[\s*runGoCheckpoint\(\),\s*runFrontendCheckpoint\(\)/);
   assert.match(pipeline, /acquireStageResourceSlot\(jobFile, 'project_validate', \{ optional: true \}\)/);
   assert.match(pipeline, /docker-infrastructure-reset\.lock/);
+  assert.match(pipeline, /result\?\.startup\?\.exitCode === 0/);
 });
 
 test('automatic Docker maintenance waits only for a live compute-docker lease', async () => {
@@ -2057,7 +2010,7 @@ test('Claude infrastructure retries retain production-file context and skip repe
   assert.doesNotMatch(runner, /if \[\[ "\$exit_code" -ne 0 && "\$workspace_committed" -ne 1 \]\]; then/);
   assert.match(runner, /retry_guidance_state="\$task_dir\/\.claude-retry-guidance\.txt"/);
   assert.match(runner, /This retry follows a deterministic public full-test regression/);
-  assert.match(runner, /The prior repair passed its issue-specific red\/green test but failed ordinary public full tests/);
+  assert.match(runner, /The prior repair passed its issue-specific red\/green test but failed public acceptance or the image native Docker CMD startup check/);
 });
 
 test('pipeline stop signals retain their origin instead of impersonating a user stop', async () => {
@@ -2896,6 +2849,11 @@ test('pipeline runner creates a real dual-platform Docker target grader', () => 
   assert.doesNotMatch(script, /sed -nE/);
   assert.match(script, /check_toolchain\(\)/);
   assert.match(script, /command -v go/);
+  assert.match(script, /check_default_command\(\)/);
+  assert.match(script, /docker create --name "\$container_name" --network none --platform "\$platform"/);
+  assert.match(script, /native CMD startup failed/);
+  assert.match(script, /FAILURE_CLASS=container_startup/);
+  assert.match(script, /workspace_fingerprint/);
   assert.doesNotMatch(script, /bash -lc[^\n]*command -v go/);
   assert.match(script, /acquire_cache_lock/);
   assert.doesNotMatch(script, /cache-from|cache-to/);
@@ -3098,6 +3056,9 @@ test('diagnosis system grader excludes the intentionally red repository proof fr
   assert.match(runner, /GOTOOLCHAIN=local go test \.\/\.\.\. -count=1/);
   assert.doesNotMatch(runner, /bash -lc[^\n]*command -v go/);
   assert.match(runner, /acquire_cache_lock/);
+  assert.match(runner, /check_default_command\(\)/);
+  assert.match(runner, /FAILURE_CLASS=container_startup/);
+  assert.match(runner, /workspace_fingerprint/);
 });
 
 test('diagnosis model workspace retains repository-owned reproduction tests', async () => {
@@ -3188,13 +3149,14 @@ test('Claude runner quotes the publisher path for workspaces containing spaces',
   assert.match(runner, /remove_writable_tree "\$test_author_checkpoint"/);
   assert.match(runner, /remove_writable_tree "\$red_green_checkpoint"/);
   const infrastructureGuard = runner.indexOf('error waiting for container:[[:space:]]*unexpected EOF');
-  const invalidRepair = runner.indexOf("FAILURE_CLASS=(public_compile|hidden_target|public_target|public_full|public_static)");
+  const invalidRepair = runner.indexOf("FAILURE_CLASS=(public_compile|hidden_target|public_target|public_full|public_static|container_startup)");
   const infrastructureReuse = runner.indexOf('elif [[ "$new_private_fixture_flow" -eq 1 ]]', invalidRepair);
   assert.ok(infrastructureGuard >= 0 && invalidRepair > infrastructureGuard && infrastructureReuse > invalidRepair);
   const infrastructureFailure = runner.slice(infrastructureGuard, invalidRepair);
   assert.doesNotMatch(infrastructureFailure, /remove_writable_tree "\$repair_checkpoint"|remove_writable_tree "\$test_author_checkpoint"|INVALID_REPAIR_CHECKPOINT=1/);
   assert.match(infrastructureFailure, /REUSABLE_REPAIR_CHECKPOINT=1/);
   assert.match(runner, /remove_writable_tree "\$repair_checkpoint"[\s\S]+remove_writable_tree "\$test_author_checkpoint"[\s\S]+INVALID_REPAIR_CHECKPOINT=1/);
+  assert.match(runner, /native Docker CMD startup check/);
   assert.match(runner, /remove_generated_compiler_artifacts\(\)[\s\S]+description="\$\(file -b "\$candidate"/);
   assert.match(runner, /save_repair_checkpoint\(\)[\s\S]+remove_generated_compiler_artifacts "\$sandbox_workspace" "\$sandbox_pristine"/);
   assert.match(runner, /bugfix_workspace_has_non_test_change/);

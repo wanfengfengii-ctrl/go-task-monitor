@@ -10,7 +10,7 @@ export function pipelineStageRequiredServices(stageId = '') {
   if (stage.endsWith('_user_query_review')) return [];
   if (stage === 'project_plan' || stage.endsWith('_bug_discovery') || stage.endsWith('_bug_source_prepare')
     || stage.endsWith('_gold_fix') || stage.endsWith('_sol_quality')) return ['codex'];
-  if (stage === 'project_generate') return ['claude'];
+  if (stage === 'project_generate') return ['codex'];
   if (stage === 'project_validate' || stage.endsWith('_trajectory_validate')) return ['docker'];
   if (stage === 'main_publish') return ['git'];
   if (stage.endsWith('_claude_fix')) return ['claude'];

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "api": "node server.mjs",
+    "api:codex": "bash scripts/start-api-codex.sh",
     "api:deepseek": "bash scripts/start-api-deepseek.sh",
     "build": "vite build",
     "test": "node --test src/*.test.js",

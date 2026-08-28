@@ -122,6 +122,74 @@ export async function createPublicDockerEnvironment() {
   };
 }
 
+export async function probeContainerDefaultCommand({
+  imageReference,
+  platform,
+  cwd,
+  env = process.env,
+  onProgress = null,
+}, {
+  commandRunner = runValidationCommand,
+  probeDelayMs = Number(process.env.GO_PIPELINE_CONTAINER_STARTUP_PROBE_MS || 3_000),
+  sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+} = {}) {
+  const containerName = `go-task-cmd-probe-${crypto.randomBytes(8).toString('hex')}`;
+  const execute = (args) => commandRunner('docker', args, cwd, onProgress, { env });
+  const create = await execute([
+    'create', '--name', containerName, '--network', 'none', '--platform', platform, imageReference,
+  ]);
+  let start = { exitCode: null, output: '跳过启动：容器创建失败' };
+  let inspect = { exitCode: null, output: '跳过状态检查：容器未启动' };
+  let logs = { exitCode: null, output: '' };
+  let cleanup = { exitCode: null, output: '' };
+  let status = '';
+  let containerExitCode = null;
+  try {
+    if (create.exitCode === 0) {
+      start = await execute(['start', containerName]);
+      if (start.exitCode === 0) {
+        const boundedDelay = Number.isFinite(Number(probeDelayMs)) ? Math.max(0, Number(probeDelayMs)) : 3_000;
+        if (boundedDelay) await sleep(boundedDelay);
+        inspect = await execute(['inspect', '--format', 'BENZHI_STATE={{.State.Status}}|{{.State.ExitCode}}', containerName]);
+        const state = String(inspect.output || '').match(/BENZHI_STATE=([^|\s]+)\|(-?\d+)/);
+        status = state?.[1] || '';
+        containerExitCode = state ? Number(state[2]) : null;
+        logs = await execute(['logs', containerName]);
+      }
+    }
+  } finally {
+    cleanup = await execute(['rm', '-f', containerName]);
+  }
+  const accepted = create.exitCode === 0
+    && start.exitCode === 0
+    && inspect.exitCode === 0
+    && (status === 'running' || (status === 'exited' && containerExitCode === 0));
+  const exitCode = accepted
+    ? 0
+    : containerExitCode ?? inspect.exitCode ?? start.exitCode ?? create.exitCode ?? 1;
+  const output = [
+    create.output,
+    start.output,
+    inspect.output,
+    logs.output,
+    accepted
+      ? `原生 CMD 启动通过：status=${status} exit_code=${containerExitCode ?? 0}`
+      : `原生 CMD 启动失败：status=${status || 'unknown'} exit_code=${containerExitCode ?? exitCode}`,
+  ].filter(Boolean).join('\n');
+  return {
+    exitCode,
+    accepted,
+    status: status || 'unknown',
+    containerExitCode,
+    create,
+    start,
+    inspect,
+    logs,
+    cleanup,
+    output,
+  };
+}
+
 async function validateTarget(target, options = {}) {
   const progress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
   progress({ phase: 'static', message: '开始静态交付校验' });
@@ -167,14 +235,27 @@ async function validateTarget(target, options = {}) {
         const imageName = `go-task-validator-${runId}-${platform.replace('/', '-')}`;
         const imageReference = `${imageName}:latest`;
         const build = await runValidationCommand(script, [imageName, platform], target, progress, { env: dockerRuntime.env });
+        progress({ phase: 'docker_startup', platform, message: `开始 ${platform} 原生 CMD 启动校验` });
+        const startup = build.exitCode === 0
+          ? await probeContainerDefaultCommand({ imageReference, platform, cwd: target, env: dockerRuntime.env, onProgress: progress })
+          : { exitCode: null, accepted: false, status: 'skipped', containerExitCode: null, output: '跳过原生 CMD 启动校验：镜像构建失败' };
         progress({ phase: 'docker_verify', platform, message: `开始 ${platform} 容器验证` });
-        const verify = build.exitCode === 0
+        const verify = build.exitCode === 0 && startup.exitCode === 0
           ? await runValidationCommand('docker', ['run', '--rm', '--network', 'none', '--platform', platform, imageReference, ...CONTAINER_SHELL_ARGS, verificationPlan.script], target, progress, { env: dockerRuntime.env })
-          : { exitCode: null, output: '跳过容器验证：镜像构建失败' };
+          : { exitCode: null, output: `跳过容器验证：${build.exitCode !== 0 ? '镜像构建失败' : '原生 CMD 启动失败'}` };
         const cleanup = await runValidationCommand('docker', ['image', 'rm', '-f', imageReference], target, progress, { env: dockerRuntime.env });
-        docker.results.push({ platform, imageReference, build, verify, cleanup, exitCode: verify.exitCode ?? build.exitCode, output: [build.output, verify.output].filter(Boolean).join('\n') });
-        if (build.exitCode !== 0 || verify.exitCode !== 0) docker.ok = false;
-        progress({ phase: 'docker_complete', platform, message: `${platform} 校验${build.exitCode === 0 && verify.exitCode === 0 ? '通过' : '失败'}` });
+        docker.results.push({
+          platform,
+          imageReference,
+          build,
+          startup,
+          verify,
+          cleanup,
+          exitCode: verify.exitCode ?? startup.exitCode ?? build.exitCode,
+          output: [build.output, startup.output, verify.output].filter(Boolean).join('\n'),
+        });
+        if (build.exitCode !== 0 || startup.exitCode !== 0 || verify.exitCode !== 0) docker.ok = false;
+        progress({ phase: 'docker_complete', platform, message: `${platform} 校验${build.exitCode === 0 && startup.exitCode === 0 && verify.exitCode === 0 ? '通过' : '失败'}` });
       }
     } finally {
       await dockerRuntime.cleanup();

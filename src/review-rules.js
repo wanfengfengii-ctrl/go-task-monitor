@@ -152,8 +152,9 @@ export function getProductionFlowRuleIssues(record) {
   if (record.production_flow !== expectedFlow) issues.push(`production_flow 必须为 ${expectedFlow}`);
   if (record.project_origin !== 'generated_0to1') issues.push('project_origin 必须为 generated_0to1，后续题目不能以外部仓库检索作为项目来源');
   if (record.project_prompt_author !== 'codex') issues.push('project_prompt_author 必须为 codex，由 Codex 设计 0-1 项目题目');
-  if (record.project_generator !== 'claude_code_cli') issues.push('project_generator 必须为 claude_code_cli，0-1 项目由 Claude Code CLI 按 Codex 题目生成');
-  if (!String(record.project_generation_session_id || '').trim()) issues.push('必须记录 Claude 生成 0-1 项目的 project_generation_session_id');
+  if (!['codex_cli', 'claude_code_cli'].includes(record.project_generator)) issues.push('project_generator 必须记录为 codex_cli 或历史 claude_code_cli');
+  if (record.project_generation_provider === 'codex' && record.project_generator !== 'codex_cli') issues.push('Codex 生成项目的 project_generator 必须为 codex_cli');
+  if (!String(record.project_generation_session_id || '').trim()) issues.push('必须记录生成 0-1 项目的 project_generation_session_id');
   if (isV2 || isV3) {
     const expectedVersion = isV3 ? CURRENT_WORKFLOW_VERSION : PARALLEL_BUG_WORKFLOW_VERSION;
     if (Number(record.workflow_version) !== expectedVersion) issues.push(`workflow_version 必须为 ${expectedVersion}`);

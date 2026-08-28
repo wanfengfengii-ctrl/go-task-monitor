@@ -58,7 +58,7 @@ import {
   pipelineStageExecutionRole,
   prepareRemoteRepairHandoff,
 } from '../src/distributed-workers.js';
-import { assertProtectedSnapshotPath, claudeGenerationSandbox, criticalSnapshotTarOptions } from '../src/data-protection.js';
+import { assertProtectedSnapshotPath, criticalSnapshotTarOptions } from '../src/data-protection.js';
 import { GIT_COMMIT_LAYOUT_POLICY_VERSION } from '../src/git-delivery-layout.js';
 import { assessProjectComplexity, PROJECT_COMPLEXITY_LIMITS } from '../src/project-complexity.js';
 import {
@@ -103,7 +103,6 @@ import {
 import { withFileLock } from '../src/file-lock.js';
 import { parseMutationAudit } from '../src/trajectory-audit.js';
 import { validateDiagnosisReadOnlyEvents, validateTrajectoryIntegrityEvents } from '../src/trajectory-file-validator.js';
-import { selectClaudeGateway } from './select-claude-gateway.mjs';
 
 const monitorRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectValidatorPath = path.join(monitorRoot, 'scripts/validate-go-package.mjs');
@@ -164,6 +163,13 @@ const configuredProjectGenerationActiveWorkGraceMs = Number(process.env.GO_PIPEL
 const PROJECT_GENERATION_ACTIVE_WORK_GRACE_MS = Number.isFinite(configuredProjectGenerationActiveWorkGraceMs)
   && configuredProjectGenerationActiveWorkGraceMs > 0
   ? configuredProjectGenerationActiveWorkGraceMs
+  : 5 * 60_000;
+const configuredProjectGenerationStreamRecoveryWindowMs = Number(
+  process.env.GO_PIPELINE_PROJECT_GENERATION_STREAM_RECOVERY_WINDOW_MS || 5 * 60_000,
+);
+const PROJECT_GENERATION_STREAM_RECOVERY_WINDOW_MS = Number.isFinite(configuredProjectGenerationStreamRecoveryWindowMs)
+  && configuredProjectGenerationStreamRecoveryWindowMs > 0
+  ? Math.max(30_000, configuredProjectGenerationStreamRecoveryWindowMs)
   : 5 * 60_000;
 const PROJECT_VALIDATION_PLATFORMS = ['linux/arm64', 'linux/amd64'];
 const PROJECT_VALIDATION_INFRA_RETRIES = 2;
@@ -610,9 +616,7 @@ async function currentProjectBugWorkerLimit(jobId = '') {
   });
 }
 
-const DEFAULT_PROJECT_GENERATOR_PROVIDER = 'claude';
-const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic';
-const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-pro[1m]';
+const DEFAULT_PROJECT_GENERATOR_PROVIDER = 'codex';
 const DEFAULT_BUGFIX_MODEL = 'model_hub/glm-52-coding';
 const CHILD_SECRET_ENV_NAMES = [
   'GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN',
@@ -626,26 +630,17 @@ const CHILD_SECRET_ENV_NAMES = [
 export function projectGeneratorConfig(environment = process.env) {
   const provider = String(environment.GO_PIPELINE_PROJECT_GENERATOR_PROVIDER || DEFAULT_PROJECT_GENERATOR_PROVIDER)
     .trim().toLowerCase();
-  const effort = String(environment.GO_PIPELINE_PROJECT_GENERATOR_EFFORT || environment.CLAUDE_EFFORT || 'low').trim() || 'low';
-  if (provider === DEFAULT_PROJECT_GENERATOR_PROVIDER) {
-    return { provider, model: '', effort, baseUrl: '', authToken: '', subagentModel: '' };
+  if (provider !== DEFAULT_PROJECT_GENERATOR_PROVIDER) {
+    throw new Error(`0-1 项目生成器必须使用 Codex CLI，当前配置为：${provider || '(empty)'}`);
   }
-  if (provider !== 'deepseek') throw new Error(`不支持的项目生成器：${provider}；可选 claude 或 deepseek`);
-  const authToken = String(environment.GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN
-    || environment.GO_PIPELINE_PROJECT_GENERATOR_API_KEY || '').trim();
-  if (!authToken) throw new Error('项目生成器已配置为 deepseek，但缺少 GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN');
-  const baseUrl = String(environment.GO_PIPELINE_PROJECT_GENERATOR_BASE_URL || DEFAULT_DEEPSEEK_BASE_URL).trim();
-  const model = String(environment.GO_PIPELINE_PROJECT_GENERATOR_MODEL || DEFAULT_DEEPSEEK_MODEL).trim();
-  const subagentModel = String(environment.GO_PIPELINE_PROJECT_GENERATOR_SUBAGENT_MODEL || 'deepseek-v4-flash').trim();
-  if (!baseUrl) throw new Error('项目生成器已配置为 deepseek，但缺少 GO_PIPELINE_PROJECT_GENERATOR_BASE_URL');
-  if (!model) throw new Error('项目生成器已配置为 deepseek，但缺少 GO_PIPELINE_PROJECT_GENERATOR_MODEL');
-  if (!subagentModel) throw new Error('项目生成器已配置为 deepseek，但缺少 GO_PIPELINE_PROJECT_GENERATOR_SUBAGENT_MODEL');
+  const effort = String(environment.GO_PIPELINE_PROJECT_GENERATOR_EFFORT
+    || environment.GO_PIPELINE_CODEX_PROJECT_EFFORT || 'high').trim().toLowerCase();
+  if (!['low', 'medium', 'high', 'xhigh'].includes(effort)) {
+    throw new Error(`非法 Codex 项目生成推理强度：${effort}`);
+  }
   return {
     provider,
-    baseUrl,
-    authToken,
-    model,
-    subagentModel,
+    model: String(environment.GO_PIPELINE_CODEX_PROJECT_MODEL || '').trim(),
     effort,
   };
 }
@@ -664,25 +659,6 @@ export function bugfixEffort(attempt = 1, environment = process.env) {
   return ['low', 'medium', 'high'].includes(configured) ? configured : fallback;
 }
 
-function projectGeneratorEnvironment(config, isolatedConfigDir = '') {
-  if (config.provider !== 'deepseek') return { env: {}, unsetEnv: [] };
-  return {
-    env: {
-      CLAUDE_CONFIG_DIR: isolatedConfigDir,
-      ANTHROPIC_BASE_URL: config.baseUrl,
-      ANTHROPIC_AUTH_TOKEN: config.authToken,
-      ANTHROPIC_API_KEY: config.authToken,
-      ANTHROPIC_MODEL: config.model,
-      ANTHROPIC_DEFAULT_OPUS_MODEL: config.model,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: config.model,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: config.subagentModel,
-      CLAUDE_CODE_SUBAGENT_MODEL: config.subagentModel,
-      CLAUDE_CODE_EFFORT_LEVEL: config.effort,
-    },
-    unsetEnv: [],
-  };
-}
-
 export async function createProjectDockerEnvironment(environment = process.env) {
   const dockerConfigRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'go-pipeline-public-docker-config-'));
   const desktopPluginDir = '/Applications/Docker.app/Contents/Resources/cli-plugins';
@@ -697,46 +673,6 @@ export async function createProjectDockerEnvironment(environment = process.env) 
     },
     configPath,
     cleanup: () => fsp.rm(dockerConfigRoot, { recursive: true, force: true }),
-  };
-}
-
-export async function projectGeneratorGatewayEnvironment(
-  config,
-  { environment = process.env, settings = {}, fetchImpl = fetch } = {},
-) {
-  if (config.provider !== DEFAULT_PROJECT_GENERATOR_PROVIDER) {
-    return { env: {}, selected: '', probes: [], model: '' };
-  }
-  const settingsEnv = settings?.env && typeof settings.env === 'object' ? settings.env : {};
-  const configuredGateways = environment.GO_PIPELINE_CLAUDE_GATEWAYS_JSON
-    || settingsEnv.GO_PIPELINE_CLAUDE_GATEWAYS_JSON
-    || settings?.goPipelineClaudeGateways
-    || '';
-  const raw = typeof configuredGateways === 'string'
-    ? configuredGateways
-    : JSON.stringify(configuredGateways);
-  const fallback = String(environment.ANTHROPIC_BASE_URL || settingsEnv.ANTHROPIC_BASE_URL || '').trim();
-  const model = String(
-    environment.GO_PIPELINE_PROJECT_GENERATOR_MODEL
-      || environment.ANTHROPIC_MODEL
-      || settingsEnv.ANTHROPIC_MODEL
-      || config.model
-      || '',
-  ).trim();
-  const result = await selectClaudeGateway({
-    raw,
-    model,
-    fallback,
-    timeoutMs: environment.GO_PIPELINE_CLAUDE_GATEWAY_PROBE_TIMEOUT_MS,
-    apiKey: environment.ANTHROPIC_API_KEY || settingsEnv.ANTHROPIC_API_KEY || '',
-    authToken: environment.ANTHROPIC_AUTH_TOKEN || settingsEnv.ANTHROPIC_AUTH_TOKEN || '',
-    fetchImpl,
-  });
-  return {
-    env: result.selected ? { ANTHROPIC_BASE_URL: result.selected } : {},
-    selected: result.selected,
-    probes: result.probes,
-    model,
   };
 }
 
@@ -1399,6 +1335,7 @@ export function projectGenerationPrompt(plan, { phase = 'complete', failure = ''
     ...(plan.frontend_required ? [
       'This project is assigned to the frontend quota. It must include a real web or frontend directory with package.json, a lockfile, source files, a build script, and a page that calls the Go backend or displays live backend state. Frontend code does not count toward the Go code target.',
     ] : []),
+    'The primary executable selected for the Docker default CMD must start safely with no required flags, environment variables, or external services. A server should keep running with self-contained local defaults; a CLI may print help and exit successfully. A zero-argument startup must never exit non-zero.',
   ];
   const instructions = phase === 'foundation'
     ? [
@@ -2982,8 +2919,16 @@ async function runCodexJson({
   env = {},
   streamRecoveryWindowMs = 0,
   reasoningEffort = '',
+  model = '',
   ignoreUserConfig = false,
   ephemeral = false,
+  allowFailure = false,
+  progressTreePaths = [],
+  progressTimeoutMs = 0,
+  activeWorkGraceMs = 0,
+  progressTerminationPath = '',
+  requiredPath = '',
+  requiredPathDeadlineMs = 0,
 }) {
   const artifactDir = path.join(path.dirname(jobFile), 'artifacts');
   await fsp.mkdir(artifactDir, { recursive: true });
@@ -3006,10 +2951,15 @@ async function runCodexJson({
     }
     args.push('-c', `model_reasoning_effort="${normalizedReasoningEffort}"`);
   }
+  const normalizedModel = String(model || '').trim();
+  if (normalizedModel) args.push('--model', normalizedModel);
   const recoveryWindowMs = Number(streamRecoveryWindowMs || 0);
   // Custom providers may opt into a larger internal retry count. The built-in
   // OpenAI provider is reserved, so the external monitor alone owns its window.
-  args.push(...codexStreamRecoveryConfigArgs(recoveryWindowMs));
+  args.push(...codexStreamRecoveryConfigArgs(
+    recoveryWindowMs,
+    ignoreUserConfig ? '' : process.env.GO_PIPELINE_CODEX_MODEL_PROVIDER,
+  ));
   args.push('--skip-git-repo-check', '-C', cwd, ...codexSandboxArgs(sandbox), '--json', '--output-schema', schemaPath, '-o', outputPath);
   args.push(prompt);
   await appendLog(jobFile, 'info', `调用新的 Codex session：${name}`, stageId);
@@ -3035,7 +2985,14 @@ async function runCodexJson({
     idleTimeoutMs,
     env: codexEnvironment,
     outputObserver,
+    progressTreePaths,
+    progressTimeoutMs,
+    activeWorkGraceMs,
+    progressTerminationPath,
+    requiredPath,
+    requiredPathDeadlineMs,
   });
+  const events = await fsp.readFile(eventsPath, 'utf8').catch(() => '');
   if (result.exitCode !== 0) {
     const structuredFailure = codexFailureMessage(result.stdout);
     if (structuredFailure) {
@@ -3045,11 +3002,23 @@ async function runCodexJson({
       // compact error shown in job state and the workbench.
       result.stdout = '';
     }
+    if (allowFailure) {
+      return { output: null, sessionId: extractSessionId(events), outputPath, eventsPath, events, execution: result };
+    }
     throw commandFailure('Codex CLI', result);
   }
-  const output = await readJson(outputPath);
-  const events = await fsp.readFile(eventsPath, 'utf8');
-  return { output, sessionId: extractSessionId(events), outputPath, eventsPath };
+  let output;
+  try {
+    output = await readJson(outputPath);
+  } catch (error) {
+    result.exitCode = 65;
+    result.error = `Codex 结构化结果读取失败：${error.message}`;
+    if (allowFailure) {
+      return { output: null, sessionId: extractSessionId(events), outputPath, eventsPath, events, execution: result };
+    }
+    throw commandFailure('Codex CLI', result);
+  }
+  return { output, sessionId: extractSessionId(events), outputPath, eventsPath, events, execution: result };
 }
 
 async function runInjectionCodexJson(options) {
@@ -4992,10 +4961,10 @@ async function normalizeProjectSupportFiles(projectDir, plan) {
   await removeGeneratedBuildArtifacts(projectDir);
   const goMod = await fsp.readFile(path.join(projectDir, 'go.mod'), 'utf8');
   const languageVersion = goModVersion(goMod);
-  if (!languageVersion) throw new Error('Claude 生成的 go.mod 缺少 go 语言版本');
+  if (!languageVersion) throw new Error('Codex CLI 生成的 go.mod 缺少 go 语言版本');
   const toolchainVersion = process.env.GO_PIPELINE_GO_TOOLCHAIN_VERSION || '1.25.6';
   const goEnvironment = await projectGoEnvironment(projectDir);
-  await runRequired('Claude 项目依赖整理', 'go', ['mod', 'tidy'], {
+  await runRequired('Codex CLI 项目依赖整理', 'go', ['mod', 'tidy'], {
     cwd: projectDir,
     env: goEnvironment,
     timeoutMs: 20 * 60 * 1000,
@@ -5042,6 +5011,7 @@ function projectValidationReportPassed(report, platform = '') {
   const result = (report.docker?.results || []).find((item) => item?.platform === platform);
   return report.docker?.ok === true
     && result?.build?.exitCode === 0
+    && result?.startup?.exitCode === 0
     && result?.verify?.exitCode === 0;
 }
 
@@ -5500,7 +5470,7 @@ export async function createCriticalDatastoreSnapshot(jobFile) {
       await fsp.rm(lockPath, { recursive: true, force: true });
       continue;
     }
-    if (Date.now() >= waitDeadline) throw new Error('等待数据快照超时，拒绝启动 Claude 项目生成');
+    if (Date.now() >= waitDeadline) throw new Error('等待数据快照超时，拒绝启动 Codex CLI 项目生成');
     await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
 
@@ -5552,16 +5522,6 @@ export async function createCriticalDatastoreSnapshot(jobFile) {
   }
 }
 
-export function claudeProjectArgs(prompt, config = projectGeneratorConfig()) {
-  return [
-    ...(config.provider === 'deepseek' ? ['--bare'] : []),
-    '--print', '--verbose', '--effort', config.effort,
-    ...(config.model ? ['--model', config.model] : []),
-    '--output-format', 'stream-json', '--permission-mode', 'bypassPermissions',
-    '--dangerously-skip-permissions', '-p', prompt,
-  ];
-}
-
 export function inspectClaudeSessionMetadata(rawJsonl) {
   const events = String(rawJsonl || '').split(/\r?\n/).filter(Boolean).flatMap((line) => {
     try { return [JSON.parse(line)]; } catch { return []; }
@@ -5576,59 +5536,52 @@ export function inspectClaudeSessionMetadata(rawJsonl) {
   };
 }
 
-export function projectGeneratorSessionMismatch(config, metadata) {
-  if (config?.provider !== 'deepseek') return '';
-  const expected = String(config.model || '').trim();
-  const actual = String(metadata?.model || '').trim();
-  if (!expected) return 'DeepSeek 项目生成未配置主模型';
-  if (!actual) return `DeepSeek 项目生成 Session 未报告模型，期望 ${expected}`;
-  if (actual !== expected) return `DeepSeek 项目生成模型不匹配：期望 ${expected}，实际 ${actual}`;
-  return '';
+const projectGenerationSessionSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['status', 'summary'],
+  properties: {
+    status: { type: 'string', enum: ['completed'] },
+    summary: { type: 'string' },
+  },
+};
+
+function inspectCodexProjectSession(rawJsonl) {
+  const events = String(rawJsonl || '').split(/\r?\n/).filter(Boolean).flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
+  return {
+    sessionId: extractSessionId(rawJsonl),
+    threadCount: events.filter((event) => event.type === 'thread.started').length,
+    completedTurns: events.filter((event) => event.type === 'turn.completed').length,
+    apiRetries: events.filter((event) => /\bReconnecting\.\.\./i.test(codexEventMessage(event))).length,
+  };
 }
 
-async function archiveGenerationArtifact(filename, phase) {
-  const exists = await fsp.stat(filename).catch(() => null);
-  if (!exists?.isFile()) return '';
-  const stamp = now().replace(/[-:.TZ]/g, '').slice(0, 17);
-  const archived = path.join(path.dirname(filename), `project-generation-${phase}-${stamp}-${crypto.randomUUID().slice(0, 8)}${path.extname(filename)}`);
-  await fsp.copyFile(filename, archived);
-  return archived;
-}
-
-async function runClaudeProjectSession({ jobFile, cwd, plan, phase, failure = '', timeoutMs, requireGoMod = false, artifactStem = 'project-generation' }) {
+async function runCodexProjectSession({ jobFile, cwd, plan, phase, failure = '', timeoutMs, requireGoMod = false, artifactStem = 'project-generation' }) {
   const artifactDir = path.join(path.dirname(jobFile), 'artifacts');
-  const rawPath = path.join(artifactDir, `${artifactStem}.claude.jsonl`);
-  const stderrPath = path.join(artifactDir, `${artifactStem}.claude.stderr.log`);
-  const prompt = projectGenerationPrompt(plan, { phase, failure });
+  const prompt = `${projectGenerationPrompt(plan, { phase, failure })}\n\nAfter completing the workspace work, return the required JSON status and a concise summary. Do not put source code in the JSON result.`;
   const generatorConfig = projectGeneratorConfig();
-  const isolatedConfigDir = generatorConfig.provider === 'deepseek'
-    ? await fsp.mkdtemp(path.join(os.tmpdir(), 'go-pipeline-deepseek-claude-config-'))
-    : '';
   const dockerRuntime = await createProjectDockerEnvironment();
-  const generatorEnvironment = projectGeneratorEnvironment(generatorConfig, isolatedConfigDir);
-  Object.assign(generatorEnvironment.env, dockerRuntime.env);
-  if (generatorConfig.provider === DEFAULT_PROJECT_GENERATOR_PROVIDER) {
-    const claudeSettings = await readJson(path.join(os.homedir(), '.claude/settings.json'), {});
-    const routing = await projectGeneratorGatewayEnvironment(generatorConfig, { settings: claudeSettings });
-    Object.assign(generatorEnvironment.env, routing.env);
-    if (routing.probes.length) {
-      const summary = routing.probes
-        .map((entry) => `${entry.baseUrl}=${entry.available ? `${entry.latencyMs}ms` : 'unavailable'}`)
-        .join(', ');
-      await appendLog(jobFile, 'info', `Claude 项目生成网关探测：${summary}；使用 ${routing.selected || '默认端点'}`, 'project_generate');
-    }
-  }
-  const protectedRoot = path.resolve(monitorRoot, '..');
-  const sandboxed = claudeGenerationSandbox({ protectedRoot, claudeBin, claudeArgs: claudeProjectArgs(prompt, generatorConfig) });
+  const name = `${artifactStem}-${phase}`;
   try {
-    const executionResult = await runCommand(sandboxed.command, sandboxed.args, {
+    const result = await runCodexJson({
+      jobFile,
+      stageId: 'project_generate',
       cwd,
-      env: generatorEnvironment.env,
-      unsetEnv: generatorEnvironment.unsetEnv,
-      stdoutPath: rawPath,
-      stderrPath,
+      prompt,
+      schema: projectGenerationSessionSchema,
+      name,
+      sandbox: 'workspace-write',
       timeoutMs,
       idleTimeoutMs: PROJECT_GENERATION_IDLE_TIMEOUT_MS,
+      env: dockerRuntime.env,
+      streamRecoveryWindowMs: PROJECT_GENERATION_STREAM_RECOVERY_WINDOW_MS,
+      reasoningEffort: generatorConfig.effort,
+      model: generatorConfig.model,
+      ignoreUserConfig: true,
+      ephemeral: true,
+      allowFailure: true,
       progressTreePaths: [cwd],
       progressTimeoutMs: PROJECT_GENERATION_PROGRESS_TIMEOUT_MS,
       activeWorkGraceMs: PROJECT_GENERATION_ACTIVE_WORK_GRACE_MS,
@@ -5636,39 +5589,34 @@ async function runClaudeProjectSession({ jobFile, cwd, plan, phase, failure = ''
       requiredPath: requireGoMod ? path.join(cwd, 'go.mod') : '',
       requiredPathDeadlineMs: requireGoMod ? PROJECT_FIRST_FILE_TIMEOUT_MS : 0,
     });
-    const rawJsonl = await fsp.readFile(rawPath, 'utf8').catch(() => '');
-    const archivedRawPath = await archiveGenerationArtifact(rawPath, phase);
-    const archivedStderrPath = await archiveGenerationArtifact(stderrPath, `${phase}-stderr`);
-    const metadata = inspectClaudeSessionMetadata(rawJsonl);
-    const modelMismatch = projectGeneratorSessionMismatch(generatorConfig, metadata);
-    const execution = modelMismatch
-      ? {
-        ...executionResult,
-        exitCode: executionResult.exitCode === 0 ? 78 : executionResult.exitCode,
-        error: [executionResult.error, modelMismatch].filter(Boolean).join('; '),
-      }
-      : executionResult;
+    const metadata = inspectCodexProjectSession(result.events);
     return {
       phase,
-      provider: generatorConfig.provider,
-      execution,
-      rawJsonl,
-      rawPath,
-      archivedRawPath,
-      archivedStderrPath,
+      provider: DEFAULT_PROJECT_GENERATOR_PROVIDER,
+      execution: result.execution,
+      output: result.output,
+      rawJsonl: result.events,
+      rawPath: result.eventsPath,
+      outputPath: result.outputPath,
+      model: generatorConfig.model,
       ...metadata,
-      modelMismatch,
     };
   } finally {
     await dockerRuntime.cleanup().catch(() => {});
-    if (isolatedConfigDir) await fsp.rm(isolatedConfigDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-function completedClaudeProjectSession(session, label) {
-  if (session.modelMismatch) throw new Error(session.modelMismatch);
+function completedCodexProjectSession(session, label) {
   if (session.execution.exitCode !== 0) throw commandFailure(label, session.execution);
-  return { ...inspectClaudeGeneration(session.rawJsonl), provider: session.provider || projectGeneratorConfig().provider };
+  if (session.threadCount !== 1 || session.completedTurns < 1 || session.output?.status !== 'completed' || !session.sessionId) {
+    throw new Error(`Codex CLI 项目生成轨迹不完整：thread=${session.threadCount} completed=${session.completedTurns} status=${session.output?.status || 'missing'}`);
+  }
+  return {
+    sessionId: session.sessionId,
+    model: session.model || '',
+    provider: DEFAULT_PROJECT_GENERATOR_PROVIDER,
+    rawPath: session.rawPath,
+  };
 }
 
 async function directoryHasFiles(directory) {
@@ -5692,7 +5640,7 @@ async function writeApprovedProjectSpec(directory, plan) {
 }
 
 async function validateGeneratedProjectLocally(projectDir, plan, deadlineMs = 0, qualityPolicyVersion = PROJECT_QUALITY_POLICY_VERSION) {
-  if (!await fsp.stat(path.join(projectDir, 'go.mod')).catch(() => null)) throw new Error('Claude 项目生成未产出 go.mod');
+  if (!await fsp.stat(path.join(projectDir, 'go.mod')).catch(() => null)) throw new Error('Codex CLI 项目生成未产出 go.mod');
   await normalizeProjectSupportFiles(projectDir, plan);
   const qualityLimits = Number(qualityPolicyVersion || 0) >= PROJECT_QUALITY_POLICY_VERSION
     ? GENERATED_PROJECT_QUALITY_LIMITS
@@ -5719,30 +5667,55 @@ function generationSessionRecord(session) {
     timedOut: session.execution.timedOut,
     durationMs: session.execution.durationMs,
     apiRetries: session.apiRetries,
-    modelMismatch: session.modelMismatch || '',
-    rawPath: session.archivedRawPath || session.rawPath,
-    stderrPath: session.archivedStderrPath || null,
+    rawPath: session.rawPath,
+    outputPath: session.outputPath || null,
   };
 }
 
-async function runClaudeProjectGeneration(jobFile, projectDir, plan, { forceRegenerate = false } = {}) {
+async function reusableCodexProjectGeneration(jobFile) {
+  for (const name of ['project-generation-repair', 'project-generation-complete', 'project-generation-foundation']) {
+    const reusable = await reusableCodexJson(jobFile, name);
+    if (reusable?.output?.status === 'completed') return reusable;
+  }
+  return null;
+}
+
+async function runCodexProjectGeneration(jobFile, projectDir, plan, { forceRegenerate = false } = {}) {
   const jobDir = path.dirname(jobFile);
   const generationJob = await readJson(jobFile);
   const qualityPolicyVersion = Number(generationJob.projectQualityPolicyVersion || 0);
-  const rawPath = path.join(jobDir, 'artifacts/project-generation.claude.jsonl');
+  const legacyRawPath = path.join(jobDir, 'artifacts/project-generation.claude.jsonl');
   const checkpointDir = path.join(jobDir, 'project-generation-checkpoint');
   const existingProject = await fsp.stat(path.join(projectDir, 'go.mod')).catch(() => null);
   if (existingProject && !forceRegenerate) {
-    const existingRaw = await fsp.readFile(rawPath, 'utf8').catch(() => '');
     try {
-      const existing = inspectClaudeGeneration(existingRaw);
-      const existingMetadata = inspectClaudeSessionMetadata(existingRaw);
-      const existingModelMismatch = projectGeneratorSessionMismatch(projectGeneratorConfig(), existingMetadata);
-      if (existingModelMismatch) throw new Error(existingModelMismatch);
       await normalizeProjectSupportFiles(projectDir, plan);
       const quality = await validateGeneratedProjectLocally(projectDir, plan, 0, qualityPolicyVersion);
-      await appendLog(jobFile, 'info', '复用已完整保存的 Claude 项目生成结果', 'project_generate');
-      return { ...existing, provider: projectGeneratorConfig().provider, rawPath, isolatedGeneration: true, sessions: [], quality };
+      const codexGeneration = await reusableCodexProjectGeneration(jobFile);
+      if (codexGeneration) {
+        await appendLog(jobFile, 'info', '复用已完整保存的 Codex CLI 项目生成结果', 'project_generate');
+        return {
+          sessionId: codexGeneration.sessionId,
+          model: projectGeneratorConfig().model,
+          provider: DEFAULT_PROJECT_GENERATOR_PROVIDER,
+          rawPath: codexGeneration.eventsPath,
+          isolatedGeneration: true,
+          sessions: [],
+          quality,
+        };
+      }
+      const existingRaw = await fsp.readFile(legacyRawPath, 'utf8').catch(() => '');
+      const legacyGeneration = inspectClaudeGeneration(existingRaw);
+      await appendLog(jobFile, 'info', '复用切换前已完整保存的 Claude/DeepSeek 项目生成结果', 'project_generate');
+      return {
+        ...legacyGeneration,
+        provider: generationJob.generation?.provider || 'claude',
+        model: generationJob.generation?.model || legacyGeneration.model || '',
+        rawPath: legacyRawPath,
+        isolatedGeneration: true,
+        sessions: [],
+        quality,
+      };
     } catch {}
   }
   const snapshotPath = await createCriticalDatastoreSnapshot(jobFile);
@@ -5757,10 +5730,10 @@ async function runClaudeProjectGeneration(jobFile, projectDir, plan, { forceRege
       if (!await fsp.stat(path.join(generationDir, GENERATED_PROJECT_SPEC_FILE)).catch(() => null)) {
         await writeApprovedProjectSpec(generationDir, plan);
       }
-      await appendLog(jobFile, 'info', '已加载项目生成检查点，新 Claude Session 将从现有代码继续', 'project_generate');
+      await appendLog(jobFile, 'info', '已加载项目生成检查点，新 Codex CLI Session 将从现有代码继续', 'project_generate');
     } else {
       await writeApprovedProjectSpec(generationDir, plan);
-      const foundation = await runClaudeProjectSession({
+      const foundation = await runCodexProjectSession({
         jobFile,
         cwd: generationDir,
         plan,
@@ -5770,15 +5743,14 @@ async function runClaudeProjectGeneration(jobFile, projectDir, plan, { forceRege
       });
       sessions.push(generationSessionRecord(foundation));
       if (await directoryHasFiles(generationDir)) await replaceCheckpoint(jobDir, generationDir, checkpointDir);
-      if (foundation.modelMismatch) throw new Error(foundation.modelMismatch);
       if (foundation.execution.exitCode === 0 && await fsp.stat(path.join(generationDir, 'go.mod')).catch(() => null)) {
-        await appendLog(jobFile, 'success', 'Claude 已完成可续作的项目基础骨架', 'project_generate');
+        await appendLog(jobFile, 'success', 'Codex CLI 已完成可续作的项目基础骨架', 'project_generate');
       } else {
         await appendLog(jobFile, 'warn', `项目基础骨架 Session 未完整结束，将由新 Session 继续：${foundation.execution.error || `exit=${foundation.execution.exitCode}`}`, 'project_generate');
       }
     }
 
-    const completion = await runClaudeProjectSession({
+    const completion = await runCodexProjectSession({
       jobFile,
       cwd: generationDir,
       plan,
@@ -5788,21 +5760,20 @@ async function runClaudeProjectGeneration(jobFile, projectDir, plan, { forceRege
     });
     sessions.push(generationSessionRecord(completion));
     if (await directoryHasFiles(generationDir)) await replaceCheckpoint(jobDir, generationDir, checkpointDir);
-    if (completion.modelMismatch) throw new Error(completion.modelMismatch);
 
     let finalGeneration;
     let quality;
     let repairReason = '';
     try {
-      finalGeneration = completedClaudeProjectSession(completion, 'Claude 项目完成');
+      finalGeneration = completedCodexProjectSession(completion, 'Codex CLI 项目完成');
       quality = await validateGeneratedProjectLocally(generationDir, plan, generationDeadlineMs, qualityPolicyVersion);
     } catch (error) {
       repairReason = error.message;
-      await appendLog(jobFile, 'warn', `项目生成需要定向修复，保留检查点并启动新 Claude Session：${error.message.slice(0, 1200)}`, 'project_generate');
+      await appendLog(jobFile, 'warn', `项目生成需要定向修复，保留检查点并启动新 Codex CLI Session：${error.message.slice(0, 1200)}`, 'project_generate');
     }
 
     if (repairReason) {
-      const repair = await runClaudeProjectSession({
+      const repair = await runCodexProjectSession({
         jobFile,
         cwd: generationDir,
         plan,
@@ -5813,13 +5784,13 @@ async function runClaudeProjectGeneration(jobFile, projectDir, plan, { forceRege
       });
       sessions.push(generationSessionRecord(repair));
       if (await directoryHasFiles(generationDir)) await replaceCheckpoint(jobDir, generationDir, checkpointDir);
-      finalGeneration = completedClaudeProjectSession(repair, 'Claude 项目定向修复');
+      finalGeneration = completedCodexProjectSession(repair, 'Codex CLI 项目定向修复');
       quality = await validateGeneratedProjectLocally(generationDir, plan, generationDeadlineMs, qualityPolicyVersion);
     }
 
     await copyWithoutGit(generationDir, projectDir);
     await fsp.rm(checkpointDir, { recursive: true, force: true });
-    return { ...finalGeneration, rawPath, isolatedGeneration: true, sessions, quality };
+    return { ...finalGeneration, isolatedGeneration: true, sessions, quality };
   } catch (error) {
     if (await directoryHasFiles(generationDir)) await replaceCheckpoint(jobDir, generationDir, checkpointDir).catch(() => {});
     throw error;
@@ -5838,7 +5809,7 @@ async function repairGeneratedProjectAfterValidation(jobFile, projectDir, plan, 
     if (!await fsp.stat(path.join(repairDir, GENERATED_PROJECT_SPEC_FILE)).catch(() => null)) {
       await writeApprovedProjectSpec(repairDir, plan);
     }
-    const repair = await runClaudeProjectSession({
+    const repair = await runCodexProjectSession({
       jobFile,
       cwd: repairDir,
       plan,
@@ -5848,7 +5819,7 @@ async function repairGeneratedProjectAfterValidation(jobFile, projectDir, plan, 
       requireGoMod: false,
       artifactStem: 'project-validation-repair',
     });
-    const repaired = completedClaudeProjectSession(repair, 'Claude 项目外层校验修复');
+    const repaired = completedCodexProjectSession(repair, 'Codex CLI 项目外层校验修复');
     await validateGeneratedProjectLocally(repairDir, plan, 0, qualityPolicyVersion);
     await archiveDirectory(jobDir, projectDir, 'project-validation-failed');
     await copyWithoutGit(repairDir, projectDir);
@@ -7394,13 +7365,26 @@ module_fingerprint="$( {
   [[ -f "$workspace/benzhi.Dockerfile" ]] && cat "$workspace/benzhi.Dockerfile"
 } | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
 module_fingerprint="\${module_fingerprint:-no-modules}"
+workspace_fingerprint="$(
+  cd "$workspace"
+  find . -type f ! -path './.git/*' ! -path '*/node_modules/*' -exec shasum -a 256 {} \\; \\
+    | LC_ALL=C sort \\
+    | shasum -a 256 \\
+    | awk '{print substr($1, 1, 16)}'
+)"
+module_fingerprint="$(printf '%s|%s\\n' "$module_fingerprint" "\${workspace_fingerprint:-no-source}" \\
+  | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
 image_stem="go-task-grader-go\${go_version}-\${module_fingerprint}"
 lock_root="\${GO_PIPELINE_DOCKER_LOCK_ROOT:-$(cd "$task_dir/../../.." && pwd)/docker-cache/locks}"
 mkdir -p "$lock_root"
 refresh_images="\${REFRESH_GRADER_IMAGES:-0}"
+startup_probe_seconds="\${GO_PIPELINE_CONTAINER_STARTUP_PROBE_SECONDS:-3}"
+active_probe_container=""
 
 cleanup() {
-  :
+  if [[ -n "$active_probe_container" ]]; then
+    docker rm -f "$active_probe_container" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -7484,6 +7468,42 @@ check_toolchain() {
     "$image_reference" bash -c 'command -v go >/dev/null && go version >/dev/null'
 }
 
+check_default_command() {
+  local platform="$1"
+  local image_reference="$2"
+  local platform_tag="\${platform#linux/}"
+  local container_name="go-task-cmd-\${module_fingerprint}-\${platform_tag}-$$-$RANDOM"
+  local state status exit_code output
+  active_probe_container="$container_name"
+  if ! docker create --name "$container_name" --network none --platform "$platform" \\
+    --cpus ${DOCKER_RUN_CPU_LIMIT} "$image_reference" >/dev/null; then
+    echo "cannot create image with its native CMD: $image_reference ($platform)" >&2
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+    active_probe_container=""
+    return 1
+  fi
+  if ! docker start "$container_name" >/dev/null; then
+    docker logs "$container_name" >&2 || true
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+    active_probe_container=""
+    return 1
+  fi
+  sleep "$startup_probe_seconds"
+  state="$(docker inspect --format '{{.State.Status}}|{{.State.ExitCode}}' "$container_name" 2>/dev/null || true)"
+  status="\${state%%|*}"
+  exit_code="\${state#*|}"
+  output="$(docker logs "$container_name" 2>&1 || true)"
+  docker rm -f "$container_name" >/dev/null 2>&1 || true
+  active_probe_container=""
+  if [[ "$status" == "running" || ( "$status" == "exited" && "$exit_code" == "0" ) ]]; then
+    echo "native CMD startup passed: status=$status exit_code=$exit_code"
+    return 0
+  fi
+  echo "native CMD startup failed: status=\${status:-unknown} exit_code=\${exit_code:-unknown}" >&2
+  [[ -z "$output" ]] || printf '%s\\n' "$output" >&2
+  return 1
+}
+
 for platform in "\${platforms[@]}"; do
   platform_tag="\${platform#linux/}"
   image_reference="\${image_stem}-\${platform_tag}:latest"
@@ -7495,6 +7515,11 @@ for platform in "\${platforms[@]}"; do
   if ! check_toolchain "$platform" "$image_reference"; then
     echo "FAILURE_CLASS=docker_toolchain" >&2
     exit 90
+  fi
+  echo "--- native CMD startup ($platform) ---"
+  if ! check_default_command "$platform" "$image_reference"; then
+    echo "FAILURE_CLASS=container_startup" >&2
+    exit 96
   fi
 
   echo "--- run_compile.sh ($platform) ---"
@@ -8079,7 +8104,7 @@ async function createTask({ job, jobFile, bugIndex, bug, bugRecord, gold, goldDi
         : 'codex_design_claude_generate_then_discover_one_bug_then_dual_fix',
     project_origin: 'generated_0to1',
     project_prompt_author: 'codex',
-    project_generator: 'claude_code_cli',
+    project_generator: generation.provider === 'codex' ? 'codex_cli' : 'claude_code_cli',
     project_generation_provider: generation.provider || projectGeneratorConfig().provider,
     project_generation_session_id: generation.sessionId,
     project_generation_model: generation.model || '',
@@ -10819,11 +10844,11 @@ async function runPipeline(jobFile) {
       current.bugs = [];
       current.currentStage = 'project_generate';
     });
-    await appendLog(jobFile, 'info', `检测到可恢复的 ${failureCategory} 失败，归档旧项目并使用新 Claude Session 重新生成`, 'project_generate');
+    await appendLog(jobFile, 'info', `检测到可恢复的 ${failureCategory} 失败，归档旧项目并使用新 Codex CLI Session 重新生成`, 'project_generate');
     job = await readJson(jobFile);
   }
   await runStage(jobFile, 'project_generate', async () => {
-    const generation = await runClaudeProjectGeneration(jobFile, projectDir, job.project, { forceRegenerate: forceProjectRegeneration });
+    const generation = await runCodexProjectGeneration(jobFile, projectDir, job.project, { forceRegenerate: forceProjectRegeneration });
     const quality = generation.quality || {};
     if (Number(job.projectQualityPolicyVersion || 0) >= PROJECT_QUALITY_POLICY_VERSION) {
       if (job.request.projectTier === 'large' && quality.projectTier !== 'large') {

@@ -2,7 +2,7 @@
 
 ## V3 流程（仅后续新建作业）
 
-1. Claude 在本地生成 0-1 Go 项目，完成项目、`go.mod`、`linux/arm64` 和 `linux/amd64` Docker 验证。
+1. Codex CLI 在隔离的本地工作区生成 0-1 Go 项目，按基础骨架、完整实现和定向修复保存独立 Session 与检查点，并完成 `go.mod`、`linux/arm64` 和 `linux/amd64` Docker 验证。切换前已完成的 Claude/DeepSeek 项目仅用于历史恢复，新生成与校验后修复不再调用 Claude 项目生成器。
 2. 脚本在本地冻结唯一的初始 `main_commit`，但暂不向远程 Git 上传项目代码。
 3. 项目级 Bug 定位按四个互补分区并行完成：公开入口与编排、状态与持久化、并发与资源、协议与恢复。每个分区从自己的主要包族开始，标准项目通常最多返回 3 个候选，超大型项目每分区最多返回 4 个；候选不足时允许返回零，不为数量追逐弱候选。网关、进程、沙箱或超时失败属于基础设施失败，不会被当成“无自然 Bug”并转入注入，已完成分区会保留并在恢复时复用。
 4. 四个分区的候选先经过确定性字段校验，并按 Bug ID、文件、符号、标准运行机制做跨分区语义去重，再由一个新的只读 Codex session 批量完成难度、可达性和证据复核。只有明确批准且难度评分至少为 3/5 的候选才进入排序；超过项目 Bug 槽位时按评分从高到低选取，同分按 `bug_id` 稳定排序。自然候选不足或为零时不逐槽重新搜索：系统使用一个新的只读 Session 一次规划全部剩余注入槽位。Diagnosis 只需保留合法的定向命令形状，真正的 `pre_fix=red` 在 Claude 轨迹完成后由隔离验证层生成。持久化计划后最多同时写入和复核 4 个独立 BUG_BASE。候选完成注入和范围复核后只执行一次项目级 `go test ./...` 与 `go vet ./...` 确认；候选确认失败时只替换当前槽位。
@@ -102,7 +102,7 @@ V5 Claude-only bugfix 不再由系统额外重复执行一遍红绿目标测试�
 
 项目规模由系统明确分配。标准项目要求生产 Go 代码至少 2000 行且低于 5000 行、至少 20 个生产 Go 文件、最多 10 个 Bug；超大型项目要求生产 Go 代码至少 5000 行、至少 50 个生产 Go 文件、固定 30 个 Bug。前端仍按项目需求单独分配，不计入 Go 行数。手工入口可选择超大型；自动补题默认创建标准项目，仅在设置了持久化超大型试跑额度时，按额度把接下来实际创建成功的项目提升为超大型，额度用完后自动恢复标准规格。模型必须遵守系统逐题分配的规模，不能自行升级或降级。
 
-超大型试跑会按作业记录自动统计排队时间、实际运行时间、项目生成耗时、双架构校验耗时、已交付 Bug 数和两题总墙钟时间；服务重启不会清空试跑额度或计时来源。项目外层校验在进入 Docker 前会移除生成目录中的 `node_modules` 与 `dist`，支持文件只在内容变化时重写。静态校验、`linux/arm64` 和 `linux/amd64` 分别保存源码指纹检查点；重试只执行未通过的平台。Docker daemon、镜像租约、Registry 网络与超时故障只重试当前平台，不触发 Claude 代码返修。Docker 缓存维护只等待正在使用 Docker 的阶段，纯分析、题面复核和云盘上传不再阻塞维护。
+超大型试跑会按作业记录自动统计排队时间、实际运行时间、项目生成耗时、双架构校验耗时、已交付 Bug 数和两题总墙钟时间；服务重启不会清空试跑额度或计时来源。项目外层校验在进入 Docker 前会移除生成目录中的 `node_modules` 与 `dist`，支持文件只在内容变化时重写。静态校验、`linux/arm64` 和 `linux/amd64` 分别保存源码指纹检查点；重试只执行未通过的平台。Docker daemon、镜像租约、Registry 网络与超时故障只重试当前平台，不触发 Codex CLI 代码返修。Docker 缓存维护只等待正在使用 Docker 的阶段，纯分析、题面复核和云盘上传不再阻塞维护。
 
 已经创建的历史大型项目不会被删除、缩小或重生成，仍按其持久化配额继续恢复，以免破坏已有主线、BUG_BASE 和交付记录。只有端到端流程稳定、Gold 契约复核和云盘交付连续通过后，才重新开放大型项目入口。
 
@@ -114,9 +114,9 @@ V5 Claude-only bugfix 不再由系统额外重复执行一遍红绿目标测试�
 
 自动建仓不添加 README、`.gitignore` 或 License，并在写入作业前验证仓库为 Public、Empty 且 SSH 地址匹配。GitHub 凭据保存在本机 GitHub CLI 的系统凭据存储中，不进入前端、作业 JSON 或导出文件。可通过 `GO_PIPELINE_GH_BIN` 指定 CLI 路径，通过 `GO_PIPELINE_GITHUB_OWNER` 固定仓库所属账号。
 
-每次 Codex 调用和 Claude 调用都创建新 session。项目生成阶段可以通过 `GO_PIPELINE_PROJECT_GENERATOR_PROVIDER=deepseek` 单独使用 Claude Code CLI 的 DeepSeek Anthropic 兼容后端；Base URL、Token、模型和 effort 只注入项目生成子进程，不进入 Claude 修复、主轨迹或 V5 红绿验证阶段。默认未配置时仍使用机器当前 Claude 配置。DeepSeek 模式需要配置 `GO_PIPELINE_PROJECT_GENERATOR_AUTH_TOKEN`，可选配置 `GO_PIPELINE_PROJECT_GENERATOR_BASE_URL`、`GO_PIPELINE_PROJECT_GENERATOR_MODEL`、`GO_PIPELINE_PROJECT_GENERATOR_SUBAGENT_MODEL` 和 `GO_PIPELINE_PROJECT_GENERATOR_EFFORT`。一个生产作业在项目级阶段通过后，由四个互补分区并行建立自然 Bug 候选池，再通过一次批量复核统一完成去重、难度和证据确认；自然候选不足时由一次批量计划填满剩余注入槽位，最多同时准备 4 个独立 BUG_BASE。人工指定自然搜索恢复时可临时使用 `naturalBugOnly`：保留已通过的 BUG_BASE，并用新的 retry nonce 避免复用旧 Codex 输出；候选池为空或基础设施失败时不创建注入计划，阶段回到可重试的自然发现状态，候选不足由人工决定是否结束。全部 BUG_BASE 准备完成后，流程一次性进入 `waiting_review`，由人工在 Bug 工作台批量编辑并确认全部 `user_query`。未确认完之前不发布 main/BUG_BASE、不创建 Claude 修复任务，也不占用 Runner；最后一个题面确认后才发布基线。发布后同一项目最多同时运行 2 个独立 Bug worker，每个 worker 使用自己的 workspace、分支、Session、阶段状态和红绿证明；Git 发布与项目级最终状态仍串行合并。资源池已满时当前 worker 原地等待，不把项目退回中央调度，也不打断另一个 worker。轨迹失败时系统保留可用 checkpoint，并按失败类型只重试 Claude、Docker、Git 发布或云盘上传所需阶段。合格后自动上传轨迹 JSON 到已连接的云盘，把永久 HTTPS 链接回填到任务 `trajectory` 字段，最后标记为可导出。
+每次 Codex 调用和 Claude 调用都创建新 Session。0-1 项目生成固定使用已登录的 Codex CLI，默认推理强度为 `high`，可通过 `GO_PIPELINE_CODEX_PROJECT_MODEL` 指定模型、通过 `GO_PIPELINE_PROJECT_GENERATOR_EFFORT` 调整强度；旧的 Claude/DeepSeek provider 覆盖会被拒绝。项目生成使用隔离临时目录、结构化完成结果、源码进度看门狗和分阶段检查点，项目外层校验失败也交给新的 Codex CLI Session 定向修复。一个生产作业在项目级阶段通过后，由四个互补分区并行建立自然 Bug 候选池，再通过一次批量复核统一完成去重、难度和证据确认；自然候选不足时由一次批量计划填满剩余注入槽位，最多同时准备 4 个独立 BUG_BASE。人工指定自然搜索恢复时可临时使用 `naturalBugOnly`：保留已通过的 BUG_BASE，并用新的 retry nonce 避免复用旧 Codex 输出；候选池为空或基础设施失败时不创建注入计划，阶段回到可重试的自然发现状态，候选不足由人工决定是否结束。全部 BUG_BASE 准备完成后，流程一次性进入 `waiting_review`，由人工在 Bug 工作台批量编辑并确认全部 `user_query`。未确认完之前不发布 main/BUG_BASE、不创建 Claude 修复任务，也不占用 Runner；最后一个题面确认后才发布基线。发布后同一项目最多同时运行 2 个独立 Bug worker，每个 worker 使用自己的 workspace、分支、Session、阶段状态和红绿证明；Git 发布与项目级最终状态仍串行合并。资源池已满时当前 worker 原地等待，不把项目退回中央调度，也不打断另一个 worker。轨迹失败时系统保留可用 checkpoint，并按失败类型只重试 Claude、Docker、Git 发布或云盘上传所需阶段。合格后自动上传轨迹 JSON 到已连接的云盘，把永久 HTTPS 链接回填到任务 `trajectory` 字段，最后标记为可导出。
 
-生产机推荐把 DeepSeek Key 保存在 macOS 钥匙串服务 `go-task-monitor.deepseek-project-generator`，然后用 `npm run api:deepseek` 启动 API。启动脚本只把钥匙串中的 Key 注入 API 进程，不写入源码、作业 JSON、日志或前端。
+生产机使用 `codex login` 的现有登录状态，并通过 `npm run api:codex` 启动 API。历史命令 `npm run api:deepseek` 仅作为兼容别名转到同一 Codex 启动脚本，不再读取或注入 DeepSeek Key。
 
 固定轨迹策略要求 Claude 在写入前先复现并定位；bugfix 禁止无依据反复试错、反复改撤、重引入故障或修改测试规避问题，但一次有证据的清理仅记录为警告。bugfix 必须有真实的修复前目标失败、最终补丁后的目标成功和全量测试成功；适用的静态检查是补充证据，不规定目标、全量与静态检查的唯一先后顺序。diagnosis 必须执行可重复的公开行为复现或读取已有日志/栈证据，并由系统外部写入审计证明全程零代码修改，不要求轨迹内出现固定 `diff` 命令。探索命令可以格式化输出，但不能作为最终验收；用于红、绿和全量结论的决定性命令必须保留真实退出码。已恢复的权限拒绝、短暂 API 重试和单次合理还原只记录为警告，最终会话不完整、决定性验证被掩盖、反复还原或未恢复错误仍判失败。该策略通过 Claude CLI 系统提示生效，不写入导出的原生 JSONL；轨迹只保留用户题面和真实执行过程。
 

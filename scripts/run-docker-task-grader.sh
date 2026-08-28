@@ -57,11 +57,22 @@ module_fingerprint="$( {
   [[ -f "$workspace/benzhi.Dockerfile" ]] && cat "$workspace/benzhi.Dockerfile"
 } | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
 module_fingerprint="${module_fingerprint:-no-modules}"
+workspace_fingerprint="$(
+  cd "$workspace"
+  find . -type f ! -path './.git/*' ! -path '*/node_modules/*' -exec shasum -a 256 {} \; \
+    | LC_ALL=C sort \
+    | shasum -a 256 \
+    | awk '{print substr($1, 1, 16)}'
+)"
+module_fingerprint="$(printf '%s|%s\n' "$module_fingerprint" "${workspace_fingerprint:-no-source}" \
+  | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
 image_stem="go-task-grader-go${go_version}-${module_fingerprint}"
 lock_root="${GO_PIPELINE_DOCKER_LOCK_ROOT:-$(cd "$task_dir/../../.." && pwd)/docker-cache/locks}"
 mkdir -p "$lock_root"
 refresh_images="${REFRESH_GRADER_IMAGES:-0}"
 docker_run_cpu_limit="${GO_PIPELINE_DOCKER_RUN_CPUS:-2}"
+startup_probe_seconds="${GO_PIPELINE_CONTAINER_STARTUP_PROBE_SECONDS:-3}"
+active_probe_container=""
 
 # The task images are public and do not need a registry credential.  Docker
 # Desktop's credential helper can hang while resolving an otherwise public
@@ -75,6 +86,9 @@ export DOCKER_CONFIG="$docker_config_dir"
 export BUILDX_CONFIG="${BUILDX_CONFIG:-$HOME/.docker/buildx}"
 
 cleanup() {
+  if [[ -n "$active_probe_container" ]]; then
+    docker rm -f "$active_probe_container" >/dev/null 2>&1 || true
+  fi
   rm -rf "$docker_config_dir"
 }
 trap cleanup EXIT
@@ -168,6 +182,42 @@ check_toolchain() {
     "$image_reference" bash -c 'command -v go >/dev/null && go version >/dev/null'
 }
 
+check_default_command() {
+  local platform="$1"
+  local image_reference="$2"
+  local platform_tag="${platform#linux/}"
+  local container_name="go-task-cmd-${module_fingerprint}-${platform_tag}-$$-$RANDOM"
+  local state status exit_code output
+  active_probe_container="$container_name"
+  if ! docker create --name "$container_name" --network none --platform "$platform" \
+    --cpus "$docker_run_cpu_limit" "$image_reference" >/dev/null; then
+    echo "cannot create image with its native CMD: $image_reference ($platform)" >&2
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+    active_probe_container=""
+    return 1
+  fi
+  if ! docker start "$container_name" >/dev/null; then
+    docker logs "$container_name" >&2 || true
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+    active_probe_container=""
+    return 1
+  fi
+  sleep "$startup_probe_seconds"
+  state="$(docker inspect --format '{{.State.Status}}|{{.State.ExitCode}}' "$container_name" 2>/dev/null || true)"
+  status="${state%%|*}"
+  exit_code="${state#*|}"
+  output="$(docker logs "$container_name" 2>&1 || true)"
+  docker rm -f "$container_name" >/dev/null 2>&1 || true
+  active_probe_container=""
+  if [[ "$status" == "running" || ( "$status" == "exited" && "$exit_code" == "0" ) ]]; then
+    echo "native CMD startup passed: status=$status exit_code=$exit_code"
+    return 0
+  fi
+  echo "native CMD startup failed: status=${status:-unknown} exit_code=${exit_code:-unknown}" >&2
+  [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+  return 1
+}
+
 run_diagnosis_baseline() {
   local platform="$1"
   local image_reference="$2"
@@ -205,6 +255,11 @@ for platform in "${platforms[@]}"; do
   if ! check_toolchain "$platform" "$image_reference"; then
     echo "FAILURE_CLASS=docker_toolchain" >&2
     exit 90
+  fi
+  echo "--- native CMD startup ($platform) ---"
+  if ! check_default_command "$platform" "$image_reference"; then
+    echo "FAILURE_CLASS=container_startup" >&2
+    exit 96
   fi
 
   echo "--- $compile_script ($platform) ---"

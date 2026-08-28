@@ -157,20 +157,20 @@ test('batch user-query review never preempts unfinished Bug discovery after a re
 });
 
 test('stage prerequisites gate only the services used by the next stage', () => {
-  assert.deepEqual(pipelineStageRequiredServices('project_generate'), ['claude']);
+  assert.deepEqual(pipelineStageRequiredServices('project_generate'), ['codex']);
   assert.deepEqual(pipelineStageRequiredServices('bug2_claude_fix'), ['claude']);
   assert.deepEqual(pipelineStageRequiredServices('bug2_test_author'), ['codex']);
   assert.deepEqual(pipelineStageRequiredServices('bug2_red_green'), ['docker']);
   assert.deepEqual(pipelineStageRequiredServices('bug2_docker_validation'), ['docker']);
   assert.deepEqual(pipelineStageRequiredServices('bug2_pre_verify'), ['claude', 'docker']);
   assert.deepEqual(pipelineStageRequiredServices('bug2_verification_coverage'), ['codex']);
-  const health = { updatedAt: '2026-08-15T12:00:00Z', services: { claude: { name: 'Claude CLI', status: 'offline' }, docker: { status: 'online' } } };
-  assert.deepEqual(pipelineStageHealthBlockers('project_generate', health, { nowMs: Date.parse('2026-08-15T12:01:00Z') }), ['Claude CLI 离线']);
+  const health = { updatedAt: '2026-08-15T12:00:00Z', services: { claude: { name: 'Claude CLI', status: 'online' }, codex: { name: 'Codex CLI', status: 'offline' }, docker: { status: 'online' } } };
+  assert.deepEqual(pipelineStageHealthBlockers('project_generate', health, { nowMs: Date.parse('2026-08-15T12:01:00Z') }), ['Codex CLI 离线']);
   assert.deepEqual(pipelineStageHealthBlockers('project_validate', health, { nowMs: Date.parse('2026-08-15T12:01:00Z') }), []);
 });
 
 test('dependency waits fall back to the service required by the failed stage', () => {
-  assert.equal(pipelineDependencyServiceForIncident({ stageId: 'project_generate', message: '系统健康状态过期' }), 'claude');
+  assert.equal(pipelineDependencyServiceForIncident({ stageId: 'project_generate', message: '系统健康状态过期' }), 'codex');
   assert.equal(pipelineDependencyServiceForIncident({ stageId: 'project_generate', failureCategory: 'snapshot_infrastructure', message: 'tar: lseek(SEEK_HOLE) failed' }), 'host');
   assert.equal(pipelineDependencyServiceForIncident({ stageId: 'project_validate', message: 'TLS handshake timeout' }), 'docker');
   assert.equal(pipelineDependencyServiceForIncident({ stageId: 'unknown', message: '系统健康状态过期' }), 'host');

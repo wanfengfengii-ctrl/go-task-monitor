@@ -1609,7 +1609,7 @@ if ! "$docker_grader" "$task_dir" "$docker_workspace" "$task_type" 2>&1 | tee -a
     else
       echo "REUSABLE_REPAIR_CHECKPOINT=1" >&2
     fi
-  elif /usr/bin/grep -Eq 'FAILURE_CLASS=(public_compile|hidden_target|public_target|public_full|public_static)' "$validation_log"; then
+  elif /usr/bin/grep -Eq 'FAILURE_CLASS=(public_compile|hidden_target|public_target|public_full|public_static|container_startup)' "$validation_log"; then
     # A broad deterministic gate proved that the repair itself is invalid.
     # Drop every downstream checkpoint so the next attempt starts from
     # pristine source instead of replaying the same broken workspace.
@@ -1619,8 +1619,8 @@ if ! "$docker_grader" "$task_dir" "$docker_workspace" "$task_type" 2>&1 | tee -a
     remove_writable_tree "$publish_checkpoint"
     retry_guidance_temporary="$retry_guidance_state.$$"
     {
-      printf '%s\n' 'The prior repair passed its issue-specific red/green test but failed ordinary public full tests.'
-      /usr/bin/grep -E -- '^(--- FAIL:|FAILURE_CLASS=)|[[:alnum:]_]+_test\.go:[0-9]+:|expected .* got | = .* want ' "$validation_log" \
+      printf '%s\n' 'The prior repair passed its issue-specific red/green test but failed public acceptance or the image native Docker CMD startup check. Repair the reported public failure or make zero-argument container startup remain running or exit successfully without relying on a command override.'
+      /usr/bin/grep -E -- '^(--- FAIL:|FAILURE_CLASS=|native CMD startup failed:)|[[:alnum:]_]+_test\.go:[0-9]+:|expected .* got | = .* want ' "$validation_log" \
         | tail -n 24 || true
     } >"$retry_guidance_temporary"
     mv -f "$retry_guidance_temporary" "$retry_guidance_state"

@@ -45,7 +45,7 @@ export function isInvalidRedVerificationTestFailure(value) {
 
 export const PIPELINE_PROJECT_STAGES = [
   ['project_plan', 'Sol 规划并扩写项目文档'],
-  ['project_generate', 'Claude 生成项目'],
+  ['project_generate', 'Codex CLI 生成项目'],
   ['project_validate', '项目与双架构 Docker 验证'],
   ['main_publish', '发布 Git main'],
 ];
@@ -61,7 +61,7 @@ export const PIPELINE_BUG_STAGES = [
 ];
 export const PIPELINE_V2_PROJECT_PREPARE_STAGES = [
   ['project_plan', 'Sol 规划并扩写项目文档'],
-  ['project_generate', 'Claude 生成项目'],
+  ['project_generate', 'Codex CLI 生成项目'],
   ['project_validate', '项目与双架构 Docker 验证'],
   ['main_freeze', '本地冻结初始 main commit'],
 ];

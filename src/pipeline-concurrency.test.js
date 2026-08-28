@@ -550,10 +550,10 @@ test('waiting stage transitions never regenerate an already validated project', 
   assert.equal(shouldRegenerateGeneratedProject(realFailure), true);
 });
 
-test('snapshot infrastructure failures do not regenerate the Claude project', () => {
+test('snapshot infrastructure failures do not regenerate the Codex project', () => {
   for (const error of [
     '生成前数据快照失败（exit=1）：tar: lseek(SEEK_HOLE) failed: Resource deadlock avoided',
-    '等待数据快照超时，拒绝启动 Claude 项目生成',
+    '等待数据快照超时，拒绝启动 Codex CLI 项目生成',
     'tar: (null)',
   ]) {
     const job = { currentStage: 'project_generate', status: 'failed', error };

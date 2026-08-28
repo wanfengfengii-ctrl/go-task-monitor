@@ -2756,6 +2756,7 @@ async function startPipelineJob(jobId, options = {}) {
         ...runnerEnvironment,
         GOTOOLCHAIN: process.env.GOTOOLCHAIN || 'local',
         GO_PIPELINE_CODEX_BIN: codexCliPath,
+        GO_PIPELINE_PROJECT_GENERATOR_PROVIDER: 'codex',
         GO_PIPELINE_CLAUDE_BIN: claudeCliPath,
         GO_PIPELINE_BUGFIX_MODEL: process.env.GO_PIPELINE_BUGFIX_MODEL || 'model_hub/glm-52-coding',
         GO_PIPELINE_EXECUTION_ROLE: pipelineNodeRole,

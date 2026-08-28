@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createPublicDockerEnvironment, parseArguments, runValidationCommand, validateTarget } from '../scripts/validate-go-package.mjs';
+import { createPublicDockerEnvironment, parseArguments, probeContainerDefaultCommand, runValidationCommand, validateTarget } from '../scripts/validate-go-package.mjs';
 
 test('package validator CLI enables Docker by default and supports static mode', () => {
   assert.deepEqual(parseArguments(['project']), {
@@ -60,6 +60,45 @@ test('package validator uses an anonymous Docker config for public base images',
   } finally {
     await runtime.cleanup();
   }
+});
+
+test('package validator accepts an image whose native CMD remains running', async () => {
+  const calls = [];
+  const commandRunner = async (_command, args) => {
+    calls.push(args);
+    if (args[0] === 'inspect') return { exitCode: 0, output: 'BENZHI_STATE=running|0\n' };
+    if (args[0] === 'logs') return { exitCode: 0, output: 'service ready\n' };
+    return { exitCode: 0, output: '' };
+  };
+  const result = await probeContainerDefaultCommand({
+    imageReference: 'sample:latest',
+    platform: 'linux/amd64',
+    cwd: process.cwd(),
+  }, { commandRunner, probeDelayMs: 0 });
+  assert.equal(result.accepted, true);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.status, 'running');
+  assert.equal(calls[0][0], 'create');
+  assert.equal(calls.at(-1)[0], 'rm');
+});
+
+test('package validator rejects an image whose native CMD exits non-zero', async () => {
+  const commandRunner = async (_command, args) => {
+    if (args[0] === 'inspect') return { exitCode: 0, output: 'BENZHI_STATE=exited|1\n' };
+    if (args[0] === 'logs') return { exitCode: 0, output: 'missing required configuration\n' };
+    return { exitCode: 0, output: '' };
+  };
+  const result = await probeContainerDefaultCommand({
+    imageReference: 'broken:latest',
+    platform: 'linux/arm64',
+    cwd: process.cwd(),
+  }, { commandRunner, probeDelayMs: 0 });
+  assert.equal(result.accepted, false);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.status, 'exited');
+  assert.equal(result.containerExitCode, 1);
+  assert.match(result.output, /missing required configuration/);
+  assert.match(result.output, /status=exited exit_code=1/);
 });
 
 test('package validator baseline mode accepts old issues and rejects new ones', async (context) => {

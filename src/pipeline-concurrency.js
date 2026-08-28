@@ -30,7 +30,7 @@ export function classifyPipelineFailure(job = {}) {
   if (/Claude 修复失败|轨迹完整性与原始性校验/.test(error) || stage.endsWith('_claude_fix') || stage.endsWith('_trajectory_validate') || stage.endsWith('_sol_quality')) return 'claude_trajectory';
   if (/Sol 返回的 Bug 记录不完整|找 Bug 必须明确|Bug record|Bug injection/.test(error) || stage.endsWith('_bug_discovery') || stage.endsWith('_bug_source_prepare')) return 'bug_record';
   if (/项目与双架构 Docker 校验失败|项目静态校验未通过/.test(error) || (failedStage && stage === 'project_validate')) return 'project_validation';
-  if (/ENOENT.*project.*go\.mod|Claude 项目生成|go\.mod 缺少 go 语言版本/.test(error) || (failedStage && stage === 'project_generate')) return 'project_generation';
+  if (/ENOENT.*project.*go\.mod|(?:Codex CLI|Claude) 项目生成|go\.mod 缺少 go 语言版本/.test(error) || (failedStage && stage === 'project_generate')) return 'project_generation';
   if (/(?:本地冻结|已发布) main (?:全量测试|静态检查)失败|main 基线不合格/.test(error) || (failedStage && stage === 'main_freeze')) return 'main_baseline_validation';
   if (/远端 main 已存在且不是本作业提交|Remote .* points to|远端 .* 已存在且指向|Local generated project must be frozen/.test(error)) return 'git_baseline_conflict';
   return 'other';
